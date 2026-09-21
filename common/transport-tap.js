@@ -36,7 +36,7 @@
  *
  * Nothing here touches `document`.
  *
- *   import { createTransportTap } from "../common/transport-tap.js";
+ *   import { createTransportTap } from "./common/transport-tap.js";
  */
 
 /**

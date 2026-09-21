@@ -26,7 +26,7 @@
  * callbacks are the whole of its outside world. Nothing here touches
  * `document` at import time.
  *
- *   import { createFactoryTestPanel } from "../common/factory-test-panel.js";
+ *   import { createFactoryTestPanel } from "./common/factory-test-panel.js";
  */
 
 import { el, downloadBlob } from "./ui-chrome.js";

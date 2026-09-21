@@ -31,7 +31,7 @@
  *
  * Nothing here touches `document` at import time.
  *
- *   import { createRtcDriftPanel } from "../common/rtc-drift-panel.js";
+ *   import { createRtcDriftPanel } from "./common/rtc-drift-panel.js";
  */
 
 import { el, downloadBlob, fmtDuration } from "./ui-chrome.js";

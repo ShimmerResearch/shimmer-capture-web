@@ -5,16 +5,16 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Split-Path -Parent $MyInvocation.MyCommand.Path)
-# Two targets, and the duplication is deliberate. `vendor` is the shared copy
-# every page and every module under common/ imports.
-# `shimmer-extension\vendor` belongs to the Chrome extension: only that folder
-# is packed for the store, and manifest.json lists vendor/shimmer-web-sdk.esm.js
-# as a web-accessible resource, so it cannot reach a copy outside itself. Both
-# must be written, or the extension silently ships an older SDK than the pages
-# beside it.
+# One target. `vendor` is the copy the page and every module under common/
+# imports, and the only one in this repository.
+#
+# In webBLEDemos this was a list of two, because the Chrome extension there
+# has to carry its own copy -- only that folder is packed for the store. The
+# extension stayed behind when this page split out. If you are porting a
+# change between the two scripts, that missing second target is the only
+# difference that matters.
 $vendorTargets = @(
-    (Join-Path $repoRoot "vendor"),
-    (Join-Path $repoRoot "shimmer-extension\vendor")
+    (Join-Path $repoRoot "vendor")
 )
 $sdkSourceConfigPath = Join-Path $repoRoot "sdk-source.json"
 

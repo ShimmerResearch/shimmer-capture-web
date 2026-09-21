@@ -13,12 +13,12 @@
  * Chart.js is NOT imported. It is read off the global `Chart`, which the page
  * loads first:
  *
- *     <script src="../common/vendor/chart.umd.min.js"></script>
+ *     <script src="./common/vendor/chart.umd.min.js"></script>
  *
  * The global is read lazily (inside `createStreamPlot`), so this module still
  * imports cleanly on a page that never loads the script.
  *
- *   import { createStreamPlot, groupForField } from "../common/plot.js";
+ *   import { createStreamPlot, groupForField } from "./common/plot.js";
  */
 
 import { onThemeChange } from "./theme.js";
@@ -212,7 +212,7 @@ export function createStreamPlot(host, opts = {}) {
   const ChartCtor = globalThis.Chart;
   if (!ChartCtor) {
     throw new Error(
-      'Chart.js is not loaded — add <script src="../common/vendor/chart.umd.min.js"></script> before importing common/plot.js',
+      'Chart.js is not loaded — add <script src="./common/vendor/chart.umd.min.js"></script> before importing common/plot.js',
     );
   }
 

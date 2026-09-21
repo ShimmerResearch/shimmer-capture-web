@@ -1,4 +1,4 @@
-# The ShimmerCapture verification pass, on every pull request and on main.
+# The Shimmer Capture verification pass, on every pull request and on main.
 #
 # `common/dev/verify.mjs` drives the real page in a real browser over CDP
 # against the ?mock=1 transport: ~290 checks over the connect handshake, the
@@ -12,7 +12,7 @@
 # lists what is known broken and why, a failure outside that list fails the
 # build, and a listed check that starts passing ALSO fails the build so the
 # list shrinks rather than rots. See the tail of verify.mjs.
-name: Verify ShimmerCapture
+name: Verify Shimmer Capture
 
 # `pull_request` covers the work; `push` is scoped to main and is not
 # redundant with it. A pull_request run tests the PREDICTED merge of the branch
@@ -105,9 +105,8 @@ jobs:
           echo "chrome: $CHROME"
           "$CHROME" --version
 
-          # Serves the REPO ROOT, not the demo folder: the cross-demo checks
-          # walk up from the demo to the root to police which files may import
-          # the extension's private SDK copy.
+          # Serves the repo root, which is also the page's own folder: the
+          # SDK-copy checks resolve every module's import against it.
           npx --yes http-server . -p 8129 -c-1 --silent > "$RUNNER_TEMP/http.log" 2>&1 &
           "$CHROME" $CHROME_FLAGS --remote-debugging-port=9333 \
             --user-data-dir="$RUNNER_TEMP/chrome-verify" \
@@ -115,7 +114,7 @@ jobs:
 
           up() { curl -fsS -o /dev/null "$1"; }
           for i in $(seq 1 60); do
-            if up http://localhost:8129/ShimmerCapture/ && up http://127.0.0.1:9333/json/version; then
+            if up http://localhost:8129/ && up http://127.0.0.1:9333/json/version; then
               ready=1; break
             fi
             sleep 1

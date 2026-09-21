@@ -7,8 +7,17 @@
         {
             "type": "chrome",
             "request": "launch",
-            "name": "Verisense (localhost)",
-            "url": "http://localhost:5500/Verisense/index.html",
+            "name": "Shimmer Capture (localhost)",
+            "url": "http://localhost:5500/index.html",
+            "webRoot": "${workspaceFolder}"
+        },
+        {
+            // Same page against the scripted sensor, for working with no
+            // hardware on the desk.
+            "type": "chrome",
+            "request": "launch",
+            "name": "Shimmer Capture (localhost, ?mock=1)",
+            "url": "http://localhost:5500/index.html?mock=1",
             "webRoot": "${workspaceFolder}"
         }
     ]

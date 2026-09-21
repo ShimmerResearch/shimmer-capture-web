@@ -8,7 +8,7 @@
  * as a *string* for the page to inline in <head>, and everything else runs
  * only when called.
  *
- *   import { THEME_BOOTSTRAP_SNIPPET, initThemeToggle } from "../common/theme.js";
+ *   import { THEME_BOOTSTRAP_SNIPPET, initThemeToggle } from "./common/theme.js";
  */
 
 /** localStorage key holding an explicit light/dark choice. */

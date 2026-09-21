@@ -1,0 +1,50 @@
+# Publishes the repository root to GitHub Pages.
+#
+# The whole root is the site: index.html is the page, and common/ and vendor/
+# are loaded by the browser exactly as they are checked in. There is no build
+# step to run first.
+#
+# webBLEDemos serves its Pages the legacy way, straight off the main branch.
+# This deploys through Actions instead, matching verisense-device-console, so
+# that the deploy is a run with a log and a URL rather than an invisible
+# branch-watcher -- and so the redirect left behind in webBLEDemos can be
+# checked against a deployment that actually happened.
+name: Deploy Shimmer Capture
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, newest wins: a superseded deploy is of no interest.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

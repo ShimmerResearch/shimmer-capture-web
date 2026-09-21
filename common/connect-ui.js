@@ -20,7 +20,7 @@
  *
  * No DOM access at import time.
  *
- *   import { createConnectController } from "../common/connect-ui.js";
+ *   import { createConnectController } from "./common/connect-ui.js";
  */
 
 /**

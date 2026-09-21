@@ -9,7 +9,7 @@
  * `tests/infomem/client.test.ts`): set an `onWrite` handler, inspect the
  * outgoing command, answer with `notify()`.
  *
- *     import { createMockShimmer3RTransport, mockEnabledFromUrl } from "../common/dev/mock-shimmer3r.js";
+ *     import { createMockShimmer3RTransport, mockEnabledFromUrl } from "./common/dev/mock-shimmer3r.js";
  *
  *     const transport = mockEnabledFromUrl() ? createMockShimmer3RTransport() : undefined;
  *     const client = new Shimmer3RClient({ transport });   // undefined → real link

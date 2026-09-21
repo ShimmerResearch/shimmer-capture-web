@@ -2,7 +2,7 @@
  * CSV recording for the webBLEDemos pages: turn a live ObjectCluster stream
  * into a file on the host.
  *
- * Generalised from ShimmerCapture/index.html, which built a header row from
+ * Generalised from index.html, which built a header row from
  * the chart's datasets (L248-261), pushed one joined row per frame (L389) and
  * dumped the whole thing through a Blob at the end (L366). Two changes to
  * that: cells go through the SDK's `csvCell` so a unit or a device name
@@ -17,7 +17,7 @@
  * ENDS there rather than quietly continuing into a second, partial file. See
  * `fail()`.
  *
- *   import { createCsvRecorder } from "../common/csv-recorder.js";
+ *   import { createCsvRecorder } from "./common/csv-recorder.js";
  *
  * No DOM access at import time.
  */

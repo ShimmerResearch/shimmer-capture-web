@@ -36,7 +36,7 @@
  *
  * Nothing here touches `document` at import time.
  *
- *   import { createConfigForm } from "../common/config-form.js";
+ *   import { createConfigForm } from "./common/config-form.js";
  */
 
 import { el } from "./ui-chrome.js";

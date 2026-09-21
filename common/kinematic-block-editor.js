@@ -14,7 +14,7 @@
  * bytes needs the SDK's codec for this encoding. So config-form takes an
  * `editorFor` hook and this is what a page hands it:
  *
- *   import { createKinematicBlockEditorFactory } from "../common/kinematic-block-editor.js";
+ *   import { createKinematicBlockEditorFactory } from "./common/kinematic-block-editor.js";
  *
  *   const editorFor = createKinematicBlockEditorFactory({
  *     fields: sdk.infoMemFieldsFor(generation),

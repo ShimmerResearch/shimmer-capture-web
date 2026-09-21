@@ -57,7 +57,7 @@
  *
  * Nothing here touches `document` at import time.
  *
- *   import { createCalibrationEditor } from "../common/calibration-editor.js";
+ *   import { createCalibrationEditor } from "./common/calibration-editor.js";
  */
 
 import { el, downloadBlob } from "./ui-chrome.js";

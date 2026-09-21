@@ -55,9 +55,9 @@
       })();
     </script>
 
-    <link rel="stylesheet" href="../common/theme.css" />
+    <link rel="stylesheet" href="./common/theme.css" />
     <!-- Defines the global `Chart`, which common/plot.js reads. Pinned 4.5.1. -->
-    <script src="../common/vendor/chart.umd.min.js"></script>
+    <script src="./common/vendor/chart.umd.min.js"></script>
 
     <style>
       /* Page-local layout only — everything visual comes from theme.css. */
@@ -1110,7 +1110,7 @@
     </section>
 
     <script type="module">
-      import { initThemeToggle } from "../common/theme.js";
+      import { initThemeToggle } from "./common/theme.js";
       import {
         $,
         el,
@@ -1121,11 +1121,11 @@
         downloadBlob,
         fmtBytes,
         fmtHz,
-      } from "../common/ui-chrome.js";
-      import { createConnectController } from "../common/connect-ui.js";
-      import { createTransportTap } from "../common/transport-tap.js";
-      import { createConfigForm, displayValue } from "../common/config-form.js";
-      import { createKinematicBlockEditorFactory } from "../common/kinematic-block-editor.js";
+      } from "./common/ui-chrome.js";
+      import { createConnectController } from "./common/connect-ui.js";
+      import { createTransportTap } from "./common/transport-tap.js";
+      import { createConfigForm, displayValue } from "./common/config-form.js";
+      import { createKinematicBlockEditorFactory } from "./common/kinematic-block-editor.js";
       import {
         describeShimmer3Caps,
         LIVE_OVERLAYS,
@@ -1134,24 +1134,24 @@
         SENSOR_GROUPS,
         SENSOR_LABELS,
         configKeysForDirtyFields,
-      } from "../common/shimmer3-config-schema.js";
-      import { createStreamPlot } from "../common/plot.js";
-      import { createStreamStats } from "../common/stream-stats.js";
-      import { createCsvRecorder } from "../common/csv-recorder.js";
-      import { createSdBrowser } from "../common/sd-browser.js";
-      import { createBrandEditor } from "../common/brand-editor.js";
-      import { createCalibrationEditor } from "../common/calibration-editor.js";
-      import { createFactoryTestPanel } from "../common/factory-test-panel.js";
-      import { createRtcDriftPanel } from "../common/rtc-drift-panel.js";
-      import { readDeviceRwc, canReadRwc } from "../common/device-clock.js";
+      } from "./common/shimmer3-config-schema.js";
+      import { createStreamPlot } from "./common/plot.js";
+      import { createStreamStats } from "./common/stream-stats.js";
+      import { createCsvRecorder } from "./common/csv-recorder.js";
+      import { createSdBrowser } from "./common/sd-browser.js";
+      import { createBrandEditor } from "./common/brand-editor.js";
+      import { createCalibrationEditor } from "./common/calibration-editor.js";
+      import { createFactoryTestPanel } from "./common/factory-test-panel.js";
+      import { createRtcDriftPanel } from "./common/rtc-drift-panel.js";
+      import { readDeviceRwc, canReadRwc } from "./common/device-clock.js";
       import {
         createMockShimmer3RTransport,
         mockEnabledFromUrl,
-      } from "../common/dev/mock-shimmer3r.js";
+      } from "./common/dev/mock-shimmer3r.js";
       /* The whole namespace, not destructured names: a vendored bundle that
                predates one of these exports then degrades to a warning instead of
                breaking the page's import. */
-      import * as sdk from "../vendor/shimmer-web-sdk.esm.js";
+      import * as sdk from "./vendor/shimmer-web-sdk.esm.js";
 
       // =====================================================================
       // Constants

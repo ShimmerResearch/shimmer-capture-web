@@ -27,7 +27,7 @@
  *
  * Nothing here touches `document` at import time.
  *
- *   import { createSdBrowser } from "../common/sd-browser.js";
+ *   import { createSdBrowser } from "./common/sd-browser.js";
  */
 
 import { el, fmtBytes as defaultFmtBytes } from "./ui-chrome.js";

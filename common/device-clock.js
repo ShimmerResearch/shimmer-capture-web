@@ -25,7 +25,7 @@
  *
  * Nothing here touches `document`.
  *
- *   import { readDeviceRwc, canReadRwc } from "../common/device-clock.js";
+ *   import { readDeviceRwc, canReadRwc } from "./common/device-clock.js";
  *
  *   if (canReadRwc(client)) {
  *     const { unixMs } = await readDeviceRwc(client, mode);

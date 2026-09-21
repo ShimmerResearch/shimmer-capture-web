@@ -24,7 +24,7 @@
  *   import {
  *     describeShimmer3Caps, LIVE_OVERLAYS, buildApplyPlan, EXG_MODES,
  *     SENSOR_GROUPS,
- *   } from "../common/shimmer3-config-schema.js";
+ *   } from "./common/shimmer3-config-schema.js";
  */
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@
  * Nothing here touches `document` at import time; every function does its
  * DOM work when called.
  *
- *   import { $, el, createLog, showToast } from "../common/ui-chrome.js";
+ *   import { $, el, createLog, showToast } from "./common/ui-chrome.js";
  */
 
 // ---------------------------------------------------------------------------

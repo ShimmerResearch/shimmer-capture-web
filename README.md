@@ -12,7 +12,44 @@ analysis: one sensor, one connection, one recording at a time. What it does
 show is that everything a Shimmer3R can be told over its Bluetooth or USB link
 is reachable from a page you can read in an afternoon.
 
-- Live demo: [https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/)
+- Live demo: [https://shimmerresearch.github.io/shimmer-capture-web/](https://shimmerresearch.github.io/shimmer-capture-web/)
+
+## Running and verifying it locally
+
+No build step, no bundler, no `npm install` — the browser loads what is checked
+in. It does need to be _served_, though, because Web Bluetooth and Web Serial
+are refused on a `file://` page:
+
+```bash
+npx http-server . -p 8129 -c-1
+```
+
+Then open <http://localhost:8129/>. Append `?mock=1` to drive the whole page
+against a scripted sensor with no hardware on the desk.
+
+`common/dev/verify.mjs` is the verification pass — around 290 checks driving
+the real page in a real browser over CDP against that mock. It runs in CI on
+every pull request, and gates on _change_ rather than on the total: see
+[`common/README.md`](./common/README.md) for how the known-failures baseline
+works before you add to it.
+
+```bash
+npx http-server . -p 8129 -c-1
+chrome --headless=new --remote-debugging-port=9333 --user-data-dir=<scratch dir>
+node common/dev/verify.mjs 9333
+```
+
+The SDK is vendored in `vendor/` and updated with `./sync-local-sdk.ps1` — see
+[`vendor/README.md`](./vendor/README.md). Never hand-copy it.
+
+## Where this came from
+
+This page was one demo among many in
+[`webBLEDemos`](https://github.com/ShimmerResearch/webBLEDemos), served from
+`…/webBLEDemos/ShimmerCapture/`, which now redirects here. Its history came
+with it, along with `common/` — the shared UI library that, by the time of the
+split, no other demo imported. The other demos, and the Chrome extension,
+stayed behind.
 
 ## The three ways to connect
 

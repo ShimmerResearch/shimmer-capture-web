@@ -30,7 +30,7 @@
  *
  * Nothing here touches `document` at import time.
  *
- *   import { createBrandEditor } from "../common/brand-editor.js";
+ *   import { createBrandEditor } from "./common/brand-editor.js";
  */
 
 import { el } from "./ui-chrome.js";

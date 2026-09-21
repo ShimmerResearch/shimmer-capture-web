@@ -5,20 +5,20 @@
  * and the "filesystem" the SD checks download into lives inside the page.
  *
  * It lives in the repo rather than beside it because a good half of what it
- * asserts is repo policy — which files may import the extension's private SDK
- * copy, and which busy flag every panel's refusal text has to be able to
- * name — and policy has to be able to change in the same commit as the code
- * it polices.
+ * asserts is repo policy — that every module reaches the SDK through the one
+ * vendored bundle, and which busy flag every panel's refusal text has to be
+ * able to name — and policy has to be able to change in the same commit as
+ * the code it polices.
  *
  * To run it, from the repo root:
  *
- *   npx http-server . -p 8129 -c-1          # serves the REPO ROOT, not the demo
+ *   npx http-server . -p 8129 -c-1
  *   chrome --headless=new --remote-debugging-port=9333 \
  *          --user-data-dir=<a scratch dir> --no-first-run --disable-gpu about:blank
  *   node common/dev/verify.mjs [port]       # port defaults to 9333
  *
- * Set VERIFY_BASE if the server is somewhere else; it must end in the demo's
- * folder, because the cross-demo checks walk up from it to the repo root.
+ * Set VERIFY_BASE if the server is somewhere else; it must end in a slash,
+ * because the SDK-copy checks resolve the repo's files against it.
  *
  * If a check ever does need a screenshot or a dump to look at afterwards, it
  * goes in os.tmpdir() — never in the working tree, which this pass has to be
@@ -27,7 +27,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 
 const PORT = process.argv.find((a) => /^\d+$/.test(a)) ?? "9333";
-const BASE = process.env.VERIFY_BASE ?? "http://localhost:8129/ShimmerCapture/";
+const BASE = process.env.VERIFY_BASE ?? "http://localhost:8129/";
 
 const targets = await (
   await fetch(`http://127.0.0.1:${PORT}/json/list`)
@@ -3539,30 +3539,25 @@ check(
 // UTC, which is where a CI box and most benches sit, so the checks run under
 // an emulated +09:00 where a double shift is nine hours wide.
 // ===========================================================================
-// The SDK is vendored twice on purpose -- the Chrome extension has to carry
-// its own copy, because only that folder is packed for the store -- so the one
-// thing that must never happen is a page loading BOTH. Two module instances
-// means two class identities, and `client.connect()` does
+// One SDK copy, reached one way. Two module instances means two class
+// identities, and `client.connect()` does
 // `if (t instanceof WebBluetoothTransport) this.device = t.device`, which then
-// silently stops matching. That is how this check found the harness importing
-// the extension's copy after the shared one moved to /vendor: nothing threw,
-// one instanceof just went quiet.
+// silently stops matching -- nothing throws, one instanceof just goes quiet.
+//
+// In webBLEDemos this rule was about the Chrome extension, which had to carry
+// a private copy because only its own folder is packed for the store, and the
+// check caught this harness importing THAT copy after the shared one moved to
+// /vendor. The extension stayed behind in webBLEDemos when this page split
+// out, so the specific trap is gone and the rule is not: there is exactly one
+// bundle here, and every import must land on it.
 // ===========================================================================
-console.log("\n--- one shared SDK copy, not the extension's ---");
-/* Checked over HTTP rather than on disk, so it tests what is actually served.
-   Extend this list when a demo is added -- and when one leaves. The standalone
-   drift page that used to sit here was folded into ShimmerCapture's Test tab
-   and deleted; the two panels that came out of it are shared modules now, and
-   they take its place in the list. */
+console.log("\n--- one SDK copy, reached one way ---");
+/* Checked over HTTP rather than on disk, so it tests what is actually served,
+   and by resolving each specifier rather than string-matching it, so a new way
+   of spelling a wrong path cannot slip past. Extend this list when something
+   starts importing the SDK -- and when something stops. */
 const SDK_CONSUMERS = [
-  "ShimmerCapture/index.html",
-  "Verisense/index.html",
-  "break-emg/index.html",
-  "break-gyro/index.html",
-  "brick/index.html",
-  "punch-highG/index.html",
-  "spell-gyro/index.html",
-  "video-ppg/index.html",
+  "index.html",
   "common/brand-editor.js",
   "common/calibration-editor.js",
   "common/csv-recorder.js",
@@ -3574,38 +3569,35 @@ const SDK_CONSUMERS = [
   "common/stream-stats.js",
   "common/dev/mock-shimmer3r.js",
 ];
-const ROOT = BASE.slice(0, BASE.indexOf("/ShimmerCapture/") + 1);
-const reachingIntoExtension = [];
+const THE_BUNDLE = new URL("vendor/shimmer-web-sdk.esm.js", BASE).href;
+const strayImports = [];
 for (const f of SDK_CONSUMERS) {
-  const text = await (await fetch(ROOT + f)).text();
-  if (text.includes("shimmer-extension/vendor")) reachingIntoExtension.push(f);
+  const text = await (await fetch(new URL(f, BASE))).text();
+  /* Doc-comment examples are matched too, on purpose: they are what the next
+     page copies from, so a stale one is a defect waiting to be pasted. */
+  for (const m of text.matchAll(
+    /from\s+["']([^"']*shimmer-web-sdk[^"']*)["']/g,
+  )) {
+    const resolved = new URL(m[1], new URL(f, BASE)).href;
+    if (resolved !== THE_BUNDLE) strayImports.push(`${f} -> ${m[1]}`);
+  }
 }
 check(
-  "nothing outside the extension imports the extension's private SDK copy",
-  reachingIntoExtension.length === 0,
-  reachingIntoExtension.length
-    ? reachingIntoExtension.join(", ")
+  "every SDK import resolves to the one vendored bundle",
+  strayImports.length === 0,
+  strayImports.length
+    ? strayImports.join(", ")
     : `${SDK_CONSUMERS.length} files checked`,
 );
 
-/* And the extension keeps its own, which is the other half of the rule. */
-const extensionCopy = await fetch(
-  ROOT + "shimmer-extension/vendor/shimmer-web-sdk.esm.js",
-);
-const sharedCopy = await fetch(ROOT + "vendor/shimmer-web-sdk.esm.js");
-/* Normalised, because this checkout has core.autocrlf=true and the two copies
-   reach the working tree by different routes -- a rebase checks one out, the
-   sync script writes the other. Git stores both blobs identically; only the
-   bytes on disk differ, by exactly one per line. Comparing raw text here
-   asserted the line-ending state of a developer's checkout, not the build. */
-const norm = (t) =>
-  t.split(String.fromCharCode(13, 10)).join(String.fromCharCode(10));
-const extText = norm(await extensionCopy.text());
-const shrText = norm(await sharedCopy.text());
+/* And that bundle is actually there to be reached. A consumer list that all
+   agrees on a path nobody serves would pass the check above. */
+const sharedCopy = await fetch(THE_BUNDLE);
+const sharedText = sharedCopy.ok ? await sharedCopy.text() : "";
 check(
-  "both copies are served and are the same build",
-  extensionCopy.ok && sharedCopy.ok && extText === shrText,
-  `extension ${extensionCopy.status}/${extText.length}B, shared ${sharedCopy.status}/${shrText.length}B (line endings normalised)`,
+  "the vendored bundle is served",
+  sharedCopy.ok && sharedText.includes("WebBluetoothTransport"),
+  `${sharedCopy.status}/${sharedText.length}B`,
 );
 
 // ===========================================================================
@@ -4800,7 +4792,7 @@ const clockGate = await evaluate(`
        the CLIENT. Pinned by call, not by reading the source. */
     modeIgnored: clock.canReadRwc(shapes.dock, 'ble') === clock.canReadRwc(shapes.dock, 'usb'),
     nothingConnected: clock.canReadRwc(null),
-    src: await (await fetch('/ShimmerCapture/index.html')).text(),
+    src: await (await fetch('/index.html')).text(),
   };
 `);
 const dockOnUsb = clockGate.rows.find(

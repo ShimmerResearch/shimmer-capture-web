@@ -7,7 +7,4 @@
 # touches **/*.html, so this file changes nothing for it; it exists to protect
 # these bundles from anyone running prettier over the repo by hand.
 common/vendor/chart.umd.min.js
-shimmer-extension/chart.min.js
-shimmer-extension/jszip.min.js
-shimmer-extension/vendor/
 vendor/

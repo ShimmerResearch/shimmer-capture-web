@@ -10,7 +10,7 @@
  * frame into the one `recordPacket` call the tracker wants, and to render the
  * snapshot.
  *
- *   import { createStreamStats } from "../common/stream-stats.js";
+ *   import { createStreamStats } from "./common/stream-stats.js";
  *
  * No DOM access at import time.
  */
