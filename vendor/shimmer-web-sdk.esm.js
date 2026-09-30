@@ -7010,9 +7010,14 @@ function calibrateGsrDataToResistanceFromAmplifierEq(gsrUncalibratedData, range)
  * any range can measure — the circuit cannot report below it whatever range it
  * switched to, but the upper end depends on which range that was, and the
  * per-sample range bits have already been used to pick the resistor. This
- * matches `SensorGSR.nudgeGsrResistance` (:415-421); an earlier version of this
- * function returned an auto-range value unclamped, which let the amplifier
- * equation report a few hundred ohms of skin resistance near full scale.
+ * matches `SensorGSR.nudgeGsrResistance` (:415-421).
+ *
+ * The auto-range floor never changes a real reading: range 0 at full scale
+ * already decodes to 8.04 kΩ. The only values under 8 kΩ are the negative ones
+ * that a code below the amplifier's reference produces, which is an open
+ * circuit, and the floor used to report those as 125 µS. `calibrateGsrSample`
+ * now decodes such a code as open before it gets here (DEV-1070), so the floor
+ * is only a backstop.
  *
  * @param gsrResistanceKOhms Calibrated resistance in kΩ.
  * @param gsrRangeSetting    Range 0–3 (fixed) or 4 (auto).
@@ -7454,12 +7459,16 @@ function gsrRangeForSample(rawSample, gsrRangeSetting) {
  */
 function calibrateGsrSample(rawSample, gsrRangeSetting) {
     const range = gsrRangeForSample(rawSample, gsrRangeSetting);
-    let adc12 = rawSample & 0x0fff;
-    // On the largest range the amplifier is non-linear below this count, and the
-    // firmware's own conversion floors it rather than extrapolating.
-    if (range === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3)
-        adc12 = GSR_UNCAL_LIMIT_RANGE3;
-    const resistanceKOhms = nudgeGsrResistance(calibrateGsrDataToResistanceFromAmplifierEq(adc12, range), gsrRangeSetting);
+    const adc12 = rawSample & 0x0fff;
+    // Below this count the amplifier output is at or under its 0.5 V reference,
+    // which no skin resistance can produce, so the electrodes are open. Range 3
+    // has long decoded such a count at the limit. The lower ranges see them too,
+    // as auto-range climbs through them after the electrodes come off, and now
+    // decode them the same way, as range 3 at the limit (DEV-1070). `range` still
+    // reports the resistor that was in circuit.
+    const resistanceKOhms = nudgeGsrResistance(adc12 < GSR_UNCAL_LIMIT_RANGE3
+        ? calibrateGsrDataToResistanceFromAmplifierEq(GSR_UNCAL_LIMIT_RANGE3, 3)
+        : calibrateGsrDataToResistanceFromAmplifierEq(adc12, range), gsrRangeSetting);
     return {
         range,
         resistanceKOhms,
@@ -21604,8 +21613,49 @@ const SMARTDOCK_BASE_CMD = Object.freeze({
 const SMARTDOCK_DEFAULTS = Object.freeze({
     RESPONSE_TIMEOUT_MS: 1000,
     SLOT_CHANGE_TIMEOUT_MS: 10000,
+    /**
+     * Settle after a WITHOUT-SD slot change, before the per-Shimmer UART is
+     * usable (`SLOT_CHANGEOVER_DELAY_WITHOUT_SD_CARD`, AbstractDock.java:96).
+     *
+     * The unqualified name is kept for compatibility; the qualified aliases
+     * below say which of the Java's three delays this actually is.
+     */
     SLOT_CHANGEOVER_DELAY_MS: 1500,
+    /** The same value, named for what it is. */
+    SLOT_CHANGEOVER_DELAY_WITHOUT_SD_MS: 1500,
+    /**
+     * Settle after a WITH-SD slot change, which has to wait for the host to
+     * mount the card as well as for the dock to re-route
+     * (`SLOT_CHANGEOVER_DELAY_WITH_SD_CARD_WIN`, AbstractDock.java:94).
+     *
+     * More than three times the without-SD delay, and the Java carries the note
+     * "2017-05-17 was 3000" against it — it had to be raised in the field.
+     */
+    SLOT_CHANGEOVER_DELAY_WITH_SD_WIN_MS: 5000,
+    /** As above on macOS/Linux (AbstractDock.java:95, selected by `getSDMountDelay()`). */
+    SLOT_CHANGEOVER_DELAY_WITH_SD_UNIX_MS: 6000,
     CMD_RETRY_ATTEMPTS: 2,
+    /**
+     * Attempts at the FIRST per-Shimmer read after a slot change
+     * (`READ_MAC_RETRY_ATTEMPTS`, AbstractDock.java:92, used by
+     * `readMacId()` at :1151-1165, which throws only on the last attempt).
+     *
+     * The settle delay above is **not** treated as sufficient on its own by the
+     * Java driver: it expects the first read after a re-route to fail sometimes
+     * and retries it. Observed here too — a Base 6 slot answered `BAD_CMD` to a
+     * `READ VER` immediately after a slot change and answered correctly on the
+     * next attempt.
+     */
+    READ_RETRY_ATTEMPTS: 2,
+    /**
+     * Wait between writing a docked Shimmer's configuration and reading it back
+     * (`SHIMMER_CONFIG_WRITE_READ_DELAY`, AbstractDock.java:90, applied at
+     * BasicDock.java:1039 between an InfoMem write and the re-read).
+     *
+     * A read-back issued immediately after a config write is not guaranteed to
+     * see the write.
+     */
+    CONFIG_WRITE_READ_DELAY_MS: 500,
 });
 /**
  * Base hardware IDs from the version response's hardware-version field
@@ -26870,7 +26920,17 @@ class SensorADC extends SensorBase {
     constructor() {
         super();
         this.LIMIT_MIN_VALID_USIEMENS = 0.03;
-        this.GSR_UNCAL_LIMIT_RANGE3_SR68 = 1134;
+        /**
+         * Range-3 codes below this are raised to it before calibration so that an
+         * open circuit reads as open, which only works if the limit is above the
+         * amplifier reference. 1138 is the first code above 0.5 V at the gen-2 1.8 V
+         * full scale (0.5 V = code 1137.5), so it also clears the 0.4986 V this decode
+         * divides by (code 1134.3). The Java driver divides by 0.5 V, and 1138 is
+         * correct under both. It was 1134, the last code below 0.4986 V: that decoded
+         * to a negative resistance, nudged to 8 kΩ, so an open circuit read 125 µS
+         * (DEV-1067).
+         */
+        this.GSR_UNCAL_LIMIT_RANGE3_SR68 = 1138;
         this.GSR_UNCAL_LIMIT_RANGE3_SR62 = 683;
         this.SHIMMER3_REF_KOHMS = [40.2, 287.0, 1000.0, 3300.0];
         this.SR68_REF_KOHMS = [21.0, 150.0, 562.0, 1740.0];
@@ -26914,7 +26974,7 @@ class SensorADC extends SensorBase {
      * resistors, 0.5 V GSR reference and range-3 uncal limit 683. Every other
      * GSR-capable board (SR61 >= 5, SR68 >= 5 — firmware
      * `ShimBrd_isGsrSupportedForHwVersion`) carries the second-generation DC
-     * front end: 1.8 V reference, 21/150/562/1740 kΩ, 0.4986 V, limit 1134.
+     * front end: 1.8 V reference, 21/150/562/1740 kΩ, 0.4986 V, limit 1138.
      *
      * Mirrors the firmware's `selectFeedbackResistorsFromHwVersion` (hal_gsr.c),
      * which keys the choice on the major revision alone (SR62 vs everything
@@ -26991,14 +27051,66 @@ class SensorADC extends SensorBase {
         }
         return rFeedback / (volts / gsrRefVoltage - 1.0);
     }
+    /** The front end's range-3 open-circuit limit: the first code above its amplifier reference. */
+    gsrUncalLimitRange3() {
+        return this.usesSr62GsrFrontEnd()
+            ? this.GSR_UNCAL_LIMIT_RANGE3_SR62
+            : this.GSR_UNCAL_LIMIT_RANGE3_SR68;
+    }
+    /**
+     * `calibrateGsrToKOhmsUsingAmplifierEq`, reading an open circuit as open on
+     * every range (DEV-1070).
+     *
+     * The equation has no positive solution at or below the amplifier's
+     * reference: no skin resistance can pull the output under it, so a code there
+     * means the electrodes are open. Range 3 has long raised such a code to its
+     * open-circuit limit, so that an open circuit decodes as hundreds of MΩ.
+     * Ranges 0-2 did not, and in auto-range they see these codes too: when the
+     * electrodes come off, the device climbs one range at a time and repeats the
+     * sample that triggered each switch through the 80 ms settling time, tagged
+     * with the range it was measured on. The equation gave those samples a
+     * negative resistance, which the nudge floored at 8 kΩ: 125 µS and
+     * `'Connected'` for an open circuit.
+     *
+     * So a code below the limit decodes as range 3 at the limit, whatever range
+     * it was measured on, and an open circuit reads the same on every range as the
+     * settled range 3 does. Codes at or above the limit decode on their own range,
+     * as before. The test compares codes, so it holds under both this decode's
+     * 0.4986 V and the Java driver's 0.5 V.
+     *
+     * @param adc12 The 12-bit code.
+     * @param range The resistor in circuit, 0-3.
+     */
+    calibrateGsrToKOhmsWithOpenCircuitLimit(adc12, range) {
+        const limit = this.gsrUncalLimitRange3();
+        if (adc12 < limit) {
+            return this.calibrateGsrToKOhmsUsingAmplifierEq(this.calibrateAdcToVolts(limit), 3);
+        }
+        return this.calibrateGsrToKOhmsUsingAmplifierEq(this.calibrateAdcToVolts(adc12), range);
+    }
+    /**
+     * Clamp a decoded resistance to what the circuit can measure. A fixed range
+     * clamps both ends, to that range's window. Auto-range only floors it at
+     * 8 kΩ, the smallest resistance any range can measure, and leaves the top
+     * open, as the Java driver's `SensorGSR.nudgeGsrResistance` and the C#
+     * `SensorGSR.NudgeGSRResistance` do (ASM-2156).
+     *
+     * `connectivity` depends on that open top. An open circuit on range 3
+     * decodes to about 536 MΩ on gen-2 hardware (0.0019 µS), far below the
+     * 0.03 µS threshold, but auto-range used to be capped at 4.7 MΩ too, which is
+     * 0.213 µS, so `connectivity` could never say `'Disconnected'` (DEV-1068).
+     * That cap was the first fix proposed under ASM-2156, withdrawn there for
+     * this reason.
+     */
     nudgeGsrResistance(kOhms) {
         const limitsByRange = {
             0: [8.0, 63.0],
             1: [63.0, 220.0],
             2: [220.0, 680.0],
             3: [680.0, 4700.0],
-            4: [8.0, 4700.0],
         };
+        if (this.gsrRangeSetting === 4)
+            return Math.max(kOhms, limitsByRange[0][0]);
         const lim = limitsByRange[this.gsrRangeSetting] ?? [8.0, 4700.0];
         return Math.min(Math.max(kOhms, lim[0]), lim[1]);
     }
@@ -27031,14 +27143,12 @@ class SensorADC extends SensorBase {
                 if (currentRange === 4)
                     currentRange = (gsrraw >> 14) & 0x03;
                 if (currentRange === 3) {
-                    const limit = this.usesSr62GsrFrontEnd()
-                        ? this.GSR_UNCAL_LIMIT_RANGE3_SR62
-                        : this.GSR_UNCAL_LIMIT_RANGE3_SR68;
+                    const limit = this.gsrUncalLimitRange3();
                     if (adc12 < limit)
                         adc12 = limit;
                 }
                 const volts = this.calibrateAdcToVolts(adc12);
-                let kOhms = this.calibrateGsrToKOhmsUsingAmplifierEq(volts, currentRange);
+                let kOhms = this.calibrateGsrToKOhmsWithOpenCircuitLimit(adc12, currentRange);
                 kOhms = this.nudgeGsrResistance(kOhms);
                 const uS = this.kOhmToUSiemens(kOhms);
                 const connectivity = uS > this.LIMIT_MIN_VALID_USIEMENS ? 'Connected' : 'Disconnected';
