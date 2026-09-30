@@ -49,7 +49,13 @@ $files = @(
     "shimmer-web-sdk.d.ts"
 )
 
-$sdkRoot = Resolve-Path (Join-Path $repoRoot $SdkRepoPath)
+# An absolute -SdkRepoPath (as AGENTS.md documents) must not be joined onto
+# the repo root; Join-Path would produce "repoRoot\C:\..." and fail.
+$sdkRoot = if ([System.IO.Path]::IsPathRooted($SdkRepoPath)) {
+    Resolve-Path $SdkRepoPath
+} else {
+    Resolve-Path (Join-Path $repoRoot $SdkRepoPath)
+}
 $distDir = Join-Path $sdkRoot "dist"
 
 if (-not (Test-Path $distDir)) {

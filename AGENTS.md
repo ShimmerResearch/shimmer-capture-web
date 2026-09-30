@@ -24,7 +24,11 @@ Update it with the scripts, which stamp `sdk-source.json`:
 ```
 ./sync-local-sdk.ps1      # sync only
 ./update-local-sdk.ps1    # build the SDK first, then sync
+./sync-local-sdk.ps1 -SdkRepoPath C:\wt\<ticket>-sdk   # from an SDK worktree
 ```
+
+`-SdkRepoPath` defaults to `..\shimmer-web-sdk`. A relative path is taken from this
+repository's root, not the current directory; an absolute path is used as given.
 
 `C:\dev\web\sync-all-vendors.ps1` does every consumer repo in one pass and is the
 better habit — the same bundle is vendored into `verisense-device-console` and
