@@ -25,7 +25,13 @@ $resolvedVersion = if ($version) { $version } else { "(none)" }
 Write-Host "SDK source config: sourceMode='$sourceMode', version='$resolvedVersion'"
 
 if (-not $SkipBuild -and $sourceMode -in @("local-repo", "local-version", "local-latest")) {
-    $sdkRoot = Resolve-Path (Join-Path $repoRoot $SdkRepoPath)
+    # An absolute -SdkRepoPath (as AGENTS.md documents) must not be joined
+    # onto the repo root; Join-Path would produce "repoRoot\C:\..." and fail.
+    $sdkRoot = if ([System.IO.Path]::IsPathRooted($SdkRepoPath)) {
+        Resolve-Path $SdkRepoPath
+    } else {
+        Resolve-Path (Join-Path $repoRoot $SdkRepoPath)
+    }
     if (-not (Test-Path (Join-Path $sdkRoot "package.json"))) {
         throw "Could not find package.json in SDK repo path: $sdkRoot"
     }
