@@ -1137,7 +1137,6 @@
       } from "./common/shimmer3-config-schema.js";
       import { createStreamPlot } from "./common/plot.js";
       import { createStreamStats } from "./common/stream-stats.js";
-      import { createCsvRecorder } from "./common/csv-recorder.js";
       import { createSdBrowser } from "./common/sd-browser.js";
       import { createBrandEditor } from "./common/brand-editor.js";
       import { createCalibrationEditor } from "./common/calibration-editor.js";
@@ -3581,8 +3580,9 @@
 
       const plot = createStreamPlot($("plots"), { windowSec: 10, maxFps: 30 });
       const stats = createStreamStats($("stats"), { windowMillis: 2000 });
-      const recorder = createCsvRecorder({
+      const recorder = sdk.createCsvRecorder({
         fileNameFn: () => recordFileName(),
+        download: downloadBlob,
         log,
         /* The recorder gave up on the file part way through — it has already
                  stopped itself and written the detail to the log. All that is left

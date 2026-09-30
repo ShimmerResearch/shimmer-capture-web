@@ -3560,7 +3560,6 @@ const SDK_CONSUMERS = [
   "index.html",
   "common/brand-editor.js",
   "common/calibration-editor.js",
-  "common/csv-recorder.js",
   "common/device-clock.js",
   "common/factory-test-panel.js",
   "common/kinematic-block-editor.js",
