@@ -7,7 +7,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.5.7';
+const SDK_VERSION = '0.5.8';
 
 /**
  * Container for a single decoded sensor frame.
@@ -11173,6 +11173,915 @@ function shimmer3ControlMessageLength(buf) {
 }
 
 /**
+ * Verisense Nordic Secure-DFU over USB CDC serial (Web Serial).
+ *
+ * The combined BLE+USB bootloader (v3) exposes Nordic's serial DFU transport
+ * on its own USB CDC port (VID 0x1915 / PID 0x521F, product "Verisense DFU"),
+ * carrying the same secure-DFU request handler as BLE — same signed `.zip`
+ * packages, same object/CRC/execute protocol — but framed with SLIP
+ * (RFC 1055) instead of GATT characteristics.
+ *
+ * This module is self-contained (no dependency on the vendored
+ * `web-bluetooth-dfu` scripts): SLIP codec, CRC-32, and the serial secure-DFU
+ * state machine. The byte transport is injected structurally and
+ * {@link WebSerialTransport} satisfies it directly. Package parsing stays with
+ * the vendored `SecureDfuPackage` (see `VerisenseDfuPackage` in `dfu.ts`) —
+ * the `initData`/`imageData` buffers it yields are exactly what
+ * {@link VerisenseSerialDfu.update} consumes.
+ *
+ * Flow (mirrors nrfutil's `dfu usb-serial`): ping → PRN 0 → MTU → command
+ * object (init packet) → data objects (firmware, `max_size` chunks, each
+ * CRC-validated before Execute). Writes carry no per-write response at PRN 0 —
+ * USB CDC is a reliable stream — so validation happens per object via CRC_GET.
+ * Interrupted transfers resume from the last completed object when the
+ * device-reported CRC matches ours.
+ */
+// ── SLIP framing (RFC 1055, as used by Nordic's serial DFU) ────────────────
+const SLIP_END = 0xc0;
+const SLIP_ESC = 0xdb;
+const SLIP_ESC_END = 0xdc;
+const SLIP_ESC_ESC = 0xdd;
+/** SLIP-encode one frame (terminating END appended; none prepended, matching
+ * Nordic's encoder). */
+function slipEncode(frame) {
+    const out = [];
+    for (const byte of frame) {
+        if (byte === SLIP_END)
+            out.push(SLIP_ESC, SLIP_ESC_END);
+        else if (byte === SLIP_ESC)
+            out.push(SLIP_ESC, SLIP_ESC_ESC);
+        else
+            out.push(byte);
+    }
+    out.push(SLIP_END);
+    return Uint8Array.from(out);
+}
+/**
+ * Streaming SLIP decoder: feed arbitrary chunks, get back completed frames.
+ * Empty frames (back-to-back ENDs) are dropped, matching Nordic's decoder.
+ */
+class SlipDecoder {
+    constructor() {
+        this._frame = [];
+        this._escaped = false;
+    }
+    /** Decode a chunk; returns every frame completed by it (possibly none). */
+    push(chunk) {
+        const frames = [];
+        for (const byte of chunk) {
+            if (this._escaped) {
+                this._escaped = false;
+                if (byte === SLIP_ESC_END)
+                    this._frame.push(SLIP_END);
+                else if (byte === SLIP_ESC_ESC)
+                    this._frame.push(SLIP_ESC);
+                // Invalid escape: RFC 1055 leaves the byte in place; keep it so a
+                // corrupt frame fails its response check rather than desyncing.
+                else
+                    this._frame.push(byte);
+            }
+            else if (byte === SLIP_ESC) {
+                this._escaped = true;
+            }
+            else if (byte === SLIP_END) {
+                if (this._frame.length > 0)
+                    frames.push(Uint8Array.from(this._frame));
+                this._frame = [];
+            }
+            else {
+                this._frame.push(byte);
+            }
+        }
+        return frames;
+    }
+    reset() {
+        this._frame = [];
+        this._escaped = false;
+    }
+}
+// ── CRC-32 (IEEE 802.3, the polynomial Nordic's DFU uses) ──────────────────
+const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++)
+            c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        table[n] = c >>> 0;
+    }
+    return table;
+})();
+/** CRC-32 of `data`, continuing from `seed` (pass a previous crc32 result to
+ * extend it). Returns an unsigned 32-bit value. */
+function crc32(data, seed = 0) {
+    let c = ~seed >>> 0;
+    for (let i = 0; i < data.length; i++) {
+        c = CRC32_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+    }
+    return ~c >>> 0;
+}
+// ── Serial secure-DFU protocol constants ────────────────────────────────────
+/** Request opcodes (identical to the BLE control-point opcodes; over serial,
+ * data writes are the explicit OBJECT_WRITE opcode instead of a second
+ * characteristic). */
+const SERIAL_DFU_OP = Object.freeze({
+    OBJECT_CREATE: 0x01,
+    RECEIPT_NOTIF_SET: 0x02,
+    CRC_GET: 0x03,
+    OBJECT_EXECUTE: 0x04,
+    OBJECT_SELECT: 0x06,
+    MTU_GET: 0x07,
+    OBJECT_WRITE: 0x08,
+    PING: 0x09,
+    RESPONSE: 0x60,
+});
+const SERIAL_DFU_OBJECT_TYPE = Object.freeze({
+    COMMAND: 0x01, // init packet
+    DATA: 0x02, // firmware image
+});
+/** Result codes carried in responses (nrf_dfu_response_t). */
+const SERIAL_DFU_RESULT_NAMES = Object.freeze({
+    0x00: 'Invalid opcode',
+    0x01: 'Success',
+    0x02: 'Opcode not supported',
+    0x03: 'Invalid parameter',
+    0x04: 'Insufficient resources',
+    0x05: 'Invalid object',
+    0x07: 'Unsupported object type',
+    0x08: 'Operation not permitted',
+    0x0a: 'Operation failed',
+    0x0b: 'Extended error',
+});
+/** Extended-error codes (nrf_dfu_ext_error_code_t) that follow result 0x0B. */
+const SERIAL_DFU_EXTENDED_ERROR_NAMES = Object.freeze({
+    0x00: 'No error',
+    0x01: 'Invalid error code',
+    0x02: 'Wrong command format',
+    0x03: 'Unknown command',
+    0x04: 'Init command invalid',
+    0x05: 'Firmware version too low',
+    0x06: 'Hardware version mismatch',
+    0x07: 'SoftDevice version mismatch',
+    0x08: 'Signature missing',
+    0x09: 'Wrong hash type',
+    0x0a: 'Hash calculation failed',
+    0x0b: 'Wrong signature type',
+    0x0c: 'Signature verification failed',
+    0x0d: 'Insufficient space',
+});
+/**
+ * The v3 bootloader's USB identity in DFU mode. Deliberately distinct from
+ * the application's CDC port (0x1915/0x520F) so a Web Serial picker — which
+ * can only filter on VID/PID — shows exactly the bootloader.
+ */
+const VERISENSE_USB_DFU_VID = 0x1915;
+const VERISENSE_USB_DFU_PID = 0x521f;
+/** `navigator.serial.requestPort()` filters for the bootloader's DFU port. */
+const VERISENSE_USB_DFU_PORT_FILTERS = Object.freeze([
+    Object.freeze({ usbVendorId: VERISENSE_USB_DFU_VID, usbProductId: VERISENSE_USB_DFU_PID }),
+]);
+/**
+ * After the firmware ACKs a `DFU_MODE` request received over USB it reboots
+ * ~300 ms later (the delay lets the ACK drain), the application port
+ * disappears, and the bootloader enumerates as 0x1915/0x521F. Give the OS a
+ * moment to enumerate before offering the picker.
+ */
+const VERISENSE_USB_DFU_REENUMERATION_DELAY_MS = 2000;
+/**
+ * True when a `DFU_MODE` property-write rejection means the unit cannot enter
+ * DFU mode from USB: firmware on a BLE-only (v2) bootloader NACKs the request
+ * (the reboot would strand the device off the bus until the bootloader's
+ * inactivity timeout). The caller should fall back to the BLE DFU flow.
+ *
+ * Keyed on the DFU_MODE property code (0x6) in the client's NACK message
+ * ("Device returned NACK command=0x.. property=0x6", unpadded hex — see
+ * `validatePendingResponse` in requestValidation.ts) so NACKs from unrelated
+ * requests are never misclassified as "USB DFU unsupported".
+ */
+function isUsbDfuUnsupportedError(error) {
+    return /NACK.*property=0x0?6\b/i.test(String(error));
+}
+const VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS = 15000;
+const VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS = 3;
+function u16le$1(value) {
+    return [value & 0xff, (value >>> 8) & 0xff];
+}
+function u32le(value) {
+    return [value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff];
+}
+function readU32le(bytes, offset) {
+    return ((bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16)) +
+        bytes[offset + 3] * 0x1000000);
+}
+function opcodeName(opcode) {
+    for (const [name, value] of Object.entries(SERIAL_DFU_OP)) {
+        if (value === opcode)
+            return name;
+    }
+    return `0x${opcode.toString(16)}`;
+}
+/**
+ * Nordic secure DFU over a SLIP-framed serial byte stream.
+ *
+ * One instance drives one transfer session; construct it around a connected
+ * transport whose port is the bootloader's DFU port (see
+ * {@link VERISENSE_USB_DFU_PORT_FILTERS}) and call {@link update} with the
+ * `initData`/`imageData` of each image in the package (base image first when
+ * present, application after — same ordering as `runVerisenseDfuUpdate`).
+ */
+class VerisenseSerialDfu {
+    constructor(transport, options = {}) {
+        this._decoder = new SlipDecoder();
+        this._pending = null;
+        this._unsubscribe = null;
+        this._mtu = 0;
+        this._transport = transport;
+        this._options = options;
+    }
+    /** Max unencoded bytes per OBJECT_WRITE frame: worst-case SLIP encoding
+     * doubles every byte, plus the terminating END, minus the opcode byte
+     * (matches nrfutil's `(mtu - 1) // 2 - 1`). */
+    get maxWriteSize() {
+        return Math.floor((this._mtu - 1) / 2) - 1;
+    }
+    /**
+     * Transfer one image (init packet + firmware binary). Resolves when the
+     * final Execute is acknowledged — for an application image that is the
+     * point where the bootloader resets to activate it, which also drops the
+     * serial port; the caller should expect the port to disappear.
+     */
+    async update(init, image) {
+        if (this._unsubscribe)
+            throw new Error('A transfer is already in progress');
+        this._decoder.reset();
+        this._unsubscribe = this._transport.onNotify((chunk) => this._onData(chunk));
+        try {
+            await this._handshake();
+            await this._transferInit(new Uint8Array(init));
+            await this._transferFirmware(new Uint8Array(image));
+        }
+        finally {
+            this._unsubscribe?.();
+            this._unsubscribe = null;
+            const pending = this._pending;
+            this._pending = null;
+            pending?.reject(new Error('Transfer closed'));
+        }
+    }
+    // ── protocol steps ────────────────────────────────────────────────────────
+    async _handshake() {
+        const pingId = Math.floor(Math.random() * 256);
+        const pong = await this._request(SERIAL_DFU_OP.PING, [pingId]);
+        if (pong.length < 1 || pong[0] !== pingId) {
+            throw new Error(`DFU ping mismatch (sent ${pingId}, got ${pong[0] ?? 'nothing'})`);
+        }
+        // PRN 0: no per-write receipts — USB CDC is reliable; objects are
+        // CRC-validated explicitly before Execute.
+        await this._request(SERIAL_DFU_OP.RECEIPT_NOTIF_SET, u16le$1(0));
+        const mtuRsp = await this._request(SERIAL_DFU_OP.MTU_GET);
+        if (mtuRsp.length < 2)
+            throw new Error('DFU MTU response too short');
+        this._mtu = mtuRsp[0] | (mtuRsp[1] << 8);
+        if (this.maxWriteSize < 1)
+            throw new Error(`DFU MTU unusable (${this._mtu})`);
+        this._options.onLog?.(`serial DFU ready: mtu=${this._mtu} maxWrite=${this.maxWriteSize}`);
+    }
+    async _transferInit(init) {
+        this._options.onStatus?.('Transferring init packet...');
+        const sel = await this._select(SERIAL_DFU_OBJECT_TYPE.COMMAND);
+        if (sel.offset === init.length && sel.crc === crc32(init)) {
+            // Same init packet already transferred (interrupted attempt): just
+            // (re-)execute it.
+            this._options.onLog?.('init packet already transferred; executing');
+            await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
+            return;
+        }
+        if (init.length > sel.maxSize) {
+            throw new Error(`Init packet too large (${init.length} > ${sel.maxSize})`);
+        }
+        await this._request(SERIAL_DFU_OP.OBJECT_CREATE, [
+            SERIAL_DFU_OBJECT_TYPE.COMMAND,
+            ...u32le(init.length),
+        ]);
+        await this._writeData(init, 'init', init.length, 0);
+        const { offset, crc } = await this._crcGet();
+        if (offset !== init.length || crc !== crc32(init)) {
+            throw new Error(`Init packet CRC mismatch (offset ${offset}/${init.length}, crc 0x${crc.toString(16)})`);
+        }
+        await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
+    }
+    async _transferFirmware(image) {
+        const sel = await this._select(SERIAL_DFU_OBJECT_TYPE.DATA);
+        const attempts = this._options.objectAttempts ?? VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS;
+        // Resume: trust the device-reported offset only when our CRC of that
+        // prefix matches. The write position cannot be rewound arbitrarily —
+        // OBJECT_CREATE always (re)creates at the device's current position, so
+        // only the current (unexecuted) object can be rolled back. That is also
+        // sufficient: executed objects were CRC-validated before Execute, and
+        // executing a *different* image's init packet resets the stored progress
+        // to zero, so a mismatch can only live in the unexecuted tail (any deeper
+        // corruption surfaces as an object CRC failure below).
+        let startOffset = 0;
+        if (sel.offset > 0 && sel.offset <= image.length) {
+            const prefixMatches = crc32(image.subarray(0, sel.offset)) === sel.crc;
+            if (prefixMatches && sel.offset === image.length) {
+                this._options.onLog?.('firmware already transferred; executing');
+                await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
+                return;
+            }
+            if (prefixMatches) {
+                // Partial object: re-create it from its boundary. Boundary offset:
+                // continue with the next object.
+                startOffset = sel.offset - (sel.offset % sel.maxSize);
+            }
+            else {
+                const remainder = sel.offset % sel.maxSize;
+                startOffset =
+                    sel.offset - (remainder !== 0 ? remainder : Math.min(sel.maxSize, sel.offset));
+                this._options.onLog?.(`device-reported firmware CRC mismatch at ${sel.offset}; rolling back to ${startOffset}`);
+            }
+            if (startOffset > 0) {
+                this._options.onStatus?.(`Resuming firmware transfer at ${startOffset} bytes...`);
+            }
+        }
+        this._options.onStatus?.('Transferring firmware image...');
+        this._options.onProgress?.({
+            object: 'firmware',
+            totalBytes: image.length,
+            currentBytes: startOffset,
+        });
+        for (let offset = startOffset; offset < image.length; offset += sel.maxSize) {
+            const chunk = image.subarray(offset, Math.min(offset + sel.maxSize, image.length));
+            let lastError = null;
+            let done = false;
+            for (let attempt = 1; attempt <= attempts && !done; attempt++) {
+                if (attempt > 1) {
+                    this._options.onLog?.(`re-sending object at ${offset} (attempt ${attempt} of ${attempts})`);
+                }
+                await this._request(SERIAL_DFU_OP.OBJECT_CREATE, [
+                    SERIAL_DFU_OBJECT_TYPE.DATA,
+                    ...u32le(chunk.length),
+                ]);
+                await this._writeData(chunk, 'firmware', image.length, offset);
+                const { offset: devOffset, crc } = await this._crcGet();
+                const expectedCrc = crc32(image.subarray(0, offset + chunk.length));
+                if (devOffset === offset + chunk.length && crc === expectedCrc) {
+                    await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
+                    done = true;
+                }
+                else {
+                    lastError = new Error(`Object CRC mismatch at ${offset} (device offset ${devOffset}, crc 0x${crc.toString(16)})`);
+                }
+            }
+            if (!done)
+                throw lastError ?? new Error(`Object transfer failed at ${offset}`);
+        }
+        this._options.onStatus?.('Firmware transfer complete.');
+    }
+    // ── plumbing ──────────────────────────────────────────────────────────────
+    async _writeData(data, object, totalBytes, baseOffset) {
+        const sliceSize = this.maxWriteSize;
+        for (let pos = 0; pos < data.length; pos += sliceSize) {
+            const slice = data.subarray(pos, Math.min(pos + sliceSize, data.length));
+            const frame = new Uint8Array(1 + slice.length);
+            frame[0] = SERIAL_DFU_OP.OBJECT_WRITE;
+            frame.set(slice, 1);
+            await this._transport.write(slipEncode(frame));
+            this._options.onProgress?.({
+                object,
+                totalBytes,
+                currentBytes: baseOffset + pos + slice.length,
+            });
+        }
+    }
+    async _select(objectType) {
+        const rsp = await this._request(SERIAL_DFU_OP.OBJECT_SELECT, [objectType]);
+        if (rsp.length < 12)
+            throw new Error('DFU select response too short');
+        return { maxSize: readU32le(rsp, 0), offset: readU32le(rsp, 4), crc: readU32le(rsp, 8) };
+    }
+    async _crcGet() {
+        const rsp = await this._request(SERIAL_DFU_OP.CRC_GET);
+        if (rsp.length < 8)
+            throw new Error('DFU CRC response too short');
+        return { offset: readU32le(rsp, 0), crc: readU32le(rsp, 4) };
+    }
+    _request(opcode, params = [], timeoutMs) {
+        if (this._pending) {
+            return Promise.reject(new Error('A DFU request is already pending'));
+        }
+        const effectiveTimeout = timeoutMs ?? this._options.requestTimeoutMs ?? VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS;
+        const frame = new Uint8Array(1 + params.length);
+        frame[0] = opcode;
+        frame.set(params instanceof Uint8Array ? params : Uint8Array.from(params), 1);
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this._pending = null;
+                reject(new Error(`DFU ${opcodeName(opcode)} timed out after ${effectiveTimeout}ms`));
+            }, effectiveTimeout);
+            this._pending = {
+                opcode,
+                resolve: (payload) => {
+                    clearTimeout(timer);
+                    this._pending = null;
+                    resolve(payload);
+                },
+                reject: (error) => {
+                    clearTimeout(timer);
+                    this._pending = null;
+                    reject(error);
+                },
+            };
+            this._transport.write(slipEncode(frame)).catch((error) => {
+                this._pending?.reject(new Error(`DFU ${opcodeName(opcode)} write failed: ${error}`));
+            });
+        });
+    }
+    _onData(chunk) {
+        for (const frame of this._decoder.push(chunk)) {
+            const pending = this._pending;
+            if (!pending) {
+                this._options.onLog?.(`unexpected DFU frame (${frame.length} bytes) with no request`);
+                continue;
+            }
+            if (frame.length < 3 || frame[0] !== SERIAL_DFU_OP.RESPONSE || frame[1] !== pending.opcode) {
+                this._options.onLog?.(`ignoring DFU frame [${Array.from(frame.slice(0, 4))
+                    .map((b) => `0x${b.toString(16)}`)
+                    .join(', ')}...] while waiting for ${opcodeName(pending.opcode)}`);
+                continue;
+            }
+            const result = frame[2];
+            if (result === 0x01) {
+                pending.resolve(frame.subarray(3));
+                continue;
+            }
+            let message = SERIAL_DFU_RESULT_NAMES[result] ?? `Unknown result 0x${result.toString(16)}`;
+            if (result === 0x0b && frame.length >= 4) {
+                const ext = frame[3];
+                message = `${SERIAL_DFU_EXTENDED_ERROR_NAMES[ext] ?? `Extended error 0x${ext.toString(16)}`}`;
+            }
+            pending.reject(new Error(`DFU ${opcodeName(pending.opcode)} failed: ${message}`));
+        }
+    }
+}
+
+/**
+ * Over-the-air firmware update of the Shimmer3R's Bluetooth module (DEV-1164).
+ *
+ * The Shimmer3R's radio is an Ezurio Vela IF820 (Infineon CYW20820) running
+ * EZ-Serial. Its firmware cannot be reflashed by the Shimmer3R's own MCU: the
+ * MCU is wired to the module's PUART, and the HCI UART that the module's
+ * serial download mode needs reaches only test pads. What the module does
+ * accept is Infineon's standard OTA firmware upgrade over BLE GATT — the
+ * service `WsOtaUpgrade.exe` drives — so a host updates it directly over the
+ * same BLE link the Shimmer3R is already connected on.
+ *
+ * Protocol (Infineon `wiced_bt_ota_firmware_upgrade`, as driven by Infineon's
+ * own peer apps — `btsdk-peer-apps-ota`: Windows `WsOtaDownloader.cpp`, iOS
+ * `UpgradeStateMachine.swift`). This is a clean implementation from that
+ * description, not a port of their code:
+ *
+ * 1. Subscribe to the control point (notify / indicate).
+ * 2. Control point ← `[PREPARE_DOWNLOAD]`; the module answers status `OK`.
+ * 3. Control point ← `[DOWNLOAD, len u32 LE]`; status `OK`.
+ * 4. Data characteristic ← the image, in chunks, each written with response.
+ * 5. Control point ← `[VERIFY, crc32 u32 LE]` (CRC-32/IEEE of the whole image);
+ *    status `OK` means the module has accepted the image. It then resets
+ *    itself onto the new firmware, which drops the link.
+ *
+ * Every control-point answer is one status byte ({@link IF820_OTA_STATUS}).
+ * Any non-`OK` answer aborts. The module only switches images after a good
+ * VERIFY, so an update interrupted at any earlier point leaves the old
+ * firmware running and the update can simply be run again.
+ *
+ * Like the Verisense DFU helpers this module does no DOM access: progress
+ * goes through callbacks and the GATT objects are structurally typed, so
+ * tests drive it with a fake.
+ *
+ * HARDWARE-VERIFY: written from the protocol as Infineon's peer apps drive
+ * it and exercised only against a fake GATT server. Not yet run against a
+ * Shimmer3R's IF820 — in particular, whether EZ-Serial exposes the OTA
+ * service while CYSPP is in use, the chunk size Chrome's negotiated MTU
+ * allows, and the module's behaviour after VERIFY (reset, BLE address kept).
+ */
+/** GATT UUIDs of the Infineon OTA firmware upgrade service. */
+const IF820_OTA = Object.freeze({
+    /** The (unsigned-image) OTA firmware upgrade service. */
+    SERVICE_UUID: 'ae5d1e47-5c13-43a0-8635-82ad38a1381f',
+    /** The secure (signed-image) variant. Same characteristics and commands. */
+    SECURE_SERVICE_UUID: 'c7261110-f425-447a-a1bd-9d7246768bd8',
+    /** Control point: commands in, one-byte status notifications out. */
+    CONTROL_POINT_UUID: 'a3dd50bf-f7a7-4e99-838e-570a086c661b',
+    /** Image data, written in chunks during the transfer. */
+    DATA_UUID: 'a2e86c7a-d961-4091-b74f-2409e72efe26',
+});
+/** Both OTA service UUIDs, for a Web Bluetooth `optionalServices` list. The
+ * service is not advertised, so it must be granted at `requestDevice` time
+ * for the update to run on an existing connection without a second picker. */
+const IF820_OTA_SERVICE_UUIDS = Object.freeze([
+    IF820_OTA.SERVICE_UUID,
+    IF820_OTA.SECURE_SERVICE_UUID,
+]);
+/** Control-point command opcodes. */
+const IF820_OTA_COMMAND = Object.freeze({
+    PREPARE_DOWNLOAD: 1,
+    DOWNLOAD: 2,
+    VERIFY: 3,
+    FINISH: 4,
+    GET_STATUS: 5,
+    CLEAR_STATUS: 6,
+    ABORT: 7,
+});
+/** Control-point status codes. */
+const IF820_OTA_STATUS = Object.freeze({
+    OK: 0,
+    UNSUPPORTED: 1,
+    ILLEGAL: 2,
+    VERIFICATION_FAILED: 3,
+    INVALID_IMAGE: 4,
+    INVALID_IMAGE_SIZE: 5,
+    MORE_DATA: 6,
+    INVALID_APP_ID: 7,
+    INVALID_VERSION: 8,
+    CONTINUE: 9,
+});
+const STATUS_TEXT = {
+    0: 'OK',
+    1: 'unsupported command',
+    2: 'illegal state',
+    3: 'image verification failed',
+    4: 'invalid image',
+    5: 'invalid image size',
+    6: 'more data',
+    7: 'invalid application id',
+    8: 'invalid version',
+    9: 'continue',
+};
+/** Human-readable text for a control-point status byte. */
+function if820OtaStatusText(status) {
+    return STATUS_TEXT[status] ?? `unknown status 0x${status.toString(16).padStart(2, '0')}`;
+}
+/**
+ * Data chunk size used first. 244 bytes fills one ATT write at the 247-byte
+ * MTU desktop and mobile stacks usually negotiate, and is what Infineon's iOS
+ * app uses. Web Bluetooth does not expose the MTU, so if the first chunk is
+ * refused the update restarts at {@link IF820_OTA_MIN_CHUNK_SIZE}, which fits
+ * the 23-byte default MTU every link supports.
+ */
+const IF820_OTA_DEFAULT_CHUNK_SIZE = 244;
+const IF820_OTA_MIN_CHUNK_SIZE = 20;
+/** Bound on each control-point command's status answer. */
+const IF820_OTA_RESPONSE_TIMEOUT_MS = 10000;
+/** Bound on VERIFY, which has the module CRC the whole stored image. */
+const IF820_OTA_VERIFY_TIMEOUT_MS = 30000;
+/**
+ * Transient BLE-stack errors: the same wording the Verisense DFU flow treats
+ * as retryable (Chrome-on-Windows reports most stack failures as
+ * NotSupportedError "unknown reason"). A protocol refusal from the module is
+ * never transient — retrying the same image gets the same answer.
+ */
+const IF820_OTA_TRANSIENT_ERROR_REGEX = /unreachable|networkerror|gatt server|disconnected|no longer in range|connection|unknown reason|notsupportederror|timed out/i;
+/** An OTA failure, with the module's status byte when it refused a command. */
+class If820OtaError extends Error {
+    constructor(message, opts = {}) {
+        super(message);
+        this.name = 'If820OtaError';
+        this.status = opts.status ?? null;
+        this.transient = opts.transient ?? false;
+    }
+}
+/** True when an error from {@link runIf820OtaUpdate} is worth retrying. */
+function isIf820OtaTransientError(error) {
+    if (error instanceof If820OtaError)
+        return error.transient;
+    if (error instanceof Error && error.name === 'AbortError')
+        return false;
+    return IF820_OTA_TRANSIENT_ERROR_REGEX.test(String(error));
+}
+// ── Implementation ──
+/** Internal: the first data write failed at a chunk size above the minimum. */
+class ChunkRefused extends Error {
+    constructor(inner) {
+        super('first data chunk refused');
+        this.inner = inner;
+    }
+}
+function abortError() {
+    const err = new Error('Bluetooth module update cancelled');
+    err.name = 'AbortError';
+    return err;
+}
+function throwIfAborted$1(signal) {
+    if (signal?.aborted)
+        throw abortError();
+}
+/** Queue of control-point status bytes, with promise-based waits. */
+class StatusQueue {
+    constructor() {
+        this._values = [];
+        this._waiter = null;
+    }
+    push(status) {
+        if (this._waiter) {
+            const w = this._waiter;
+            this._waiter = null;
+            w(status);
+        }
+        else {
+            this._values.push(status);
+        }
+    }
+    clear() {
+        this._values.length = 0;
+    }
+    /** Status bytes received without a waiter (e.g. during the transfer). */
+    drain() {
+        return this._values.splice(0, this._values.length);
+    }
+    next(timeoutMs, what, signal) {
+        if (this._values.length)
+            return Promise.resolve(this._values.shift());
+        return new Promise((resolve, reject) => {
+            const onAbort = () => {
+                cleanup();
+                reject(abortError());
+            };
+            const timer = setTimeout(() => {
+                cleanup();
+                reject(new If820OtaError(`Bluetooth module did not answer ${what} (timed out)`, {
+                    transient: true,
+                }));
+            }, timeoutMs);
+            const cleanup = () => {
+                clearTimeout(timer);
+                this._waiter = null;
+                signal?.removeEventListener('abort', onAbort);
+            };
+            this._waiter = (status) => {
+                cleanup();
+                resolve(status);
+            };
+            signal?.addEventListener('abort', onAbort, { once: true });
+        });
+    }
+}
+async function write(char, bytes) {
+    if (char.writeValueWithResponse)
+        await char.writeValueWithResponse(bytes);
+    else if (char.writeValue)
+        await char.writeValue(bytes);
+    else
+        throw new If820OtaError('OTA characteristic is not writable');
+}
+function command(op, param) {
+    if (param === undefined)
+        return new Uint8Array([op]);
+    const out = new Uint8Array(5);
+    out[0] = op;
+    new DataView(out.buffer).setUint32(1, param >>> 0, true);
+    return out;
+}
+function wrapGattError(e, what) {
+    if (e instanceof If820OtaError || (e instanceof Error && e.name === 'AbortError'))
+        return e;
+    const msg = e instanceof Error ? e.message || e.name : String(e);
+    return new If820OtaError(`${what} failed: ${msg}`, {
+        transient: IF820_OTA_TRANSIENT_ERROR_REGEX.test(`${e?.name ?? ''} ${msg}`),
+    });
+}
+async function resolveService(server, log) {
+    let lastError = null;
+    for (const uuid of IF820_OTA_SERVICE_UUIDS) {
+        try {
+            const service = await server.getPrimaryService(uuid);
+            log(`OTA service ${uuid} found`);
+            return { service, uuid };
+        }
+        catch (e) {
+            lastError = e;
+            log(`OTA service ${uuid} not available: ${String(e)}`);
+        }
+    }
+    const msg = String(lastError ?? '');
+    /* Web Bluetooth throws SecurityError when the service was not listed in
+     * optionalServices at requestDevice time — the fix is on the host side, so
+     * say so rather than "not found". */
+    if (/securityerror|optionalservices|not allowed|blocklist/i.test(msg)) {
+        throw new If820OtaError('The Bluetooth module update service was not granted for this connection. ' +
+            'Reconnect with the OTA service in optionalServices (IF820_OTA_SERVICE_UUIDS).');
+    }
+    throw new If820OtaError('This Bluetooth module does not expose the firmware update service.' + (msg ? ` (${msg})` : ''));
+}
+/**
+ * Update the IF820 module's firmware over BLE.
+ *
+ * `device` is the `BluetoothDevice` the Shimmer3R is connected as (or any
+ * object with its `gatt` server); the update runs on that same connection,
+ * which must have been opened with {@link IF820_OTA_SERVICE_UUIDS} in its
+ * `optionalServices`. `image` is the module's `.ota.bin`.
+ *
+ * Resolves once the module has verified the image. The module then resets
+ * onto the new firmware by itself, so expect the link to drop shortly after;
+ * the Shimmer3R's MCU reads the module version only at its own boot, so arm
+ * reboot-on-disconnect beforehand ({@link Shimmer3RClient.setRebootOnDisconnect})
+ * for the new version to be reported after reconnecting.
+ *
+ * If the first data write is refused (an MTU too small for the default
+ * chunk), the update is aborted and rerun once at
+ * {@link IF820_OTA_MIN_CHUNK_SIZE}.
+ */
+async function runIf820OtaUpdate(device, image, opts = {}) {
+    /* A private copy: the image cannot change under the CRC mid-transfer, and
+     * it is ArrayBuffer-backed, which the GATT write signature requires. */
+    const bytes = new Uint8Array(image.byteLength);
+    bytes.set(image instanceof Uint8Array ? image : new Uint8Array(image));
+    const onStatus = opts.onStatus ?? (() => { });
+    const log = opts.onLog ?? (() => { });
+    const signal = opts.signal;
+    const responseTimeoutMs = opts.responseTimeoutMs ?? IF820_OTA_RESPONSE_TIMEOUT_MS;
+    const verifyTimeoutMs = opts.verifyTimeoutMs ?? IF820_OTA_VERIFY_TIMEOUT_MS;
+    const firstChunk = Math.max(IF820_OTA_MIN_CHUNK_SIZE, Math.floor(opts.chunkSize ?? IF820_OTA_DEFAULT_CHUNK_SIZE));
+    if (bytes.length === 0)
+        throw new If820OtaError('Firmware image is empty');
+    throwIfAborted$1(signal);
+    const started = Date.now();
+    const server = device.gatt;
+    if (!server)
+        throw new If820OtaError('Device has no GATT server (not a BLE connection)');
+    try {
+        if (!server.connected) {
+            onStatus('Connecting to the Bluetooth module…');
+            await server.connect();
+        }
+    }
+    catch (e) {
+        throw wrapGattError(e, 'Connecting');
+    }
+    onStatus('Opening the Bluetooth module update service…');
+    const { service, uuid: serviceUuid } = await resolveService(server, log);
+    let control;
+    let data;
+    try {
+        control = await service.getCharacteristic(IF820_OTA.CONTROL_POINT_UUID);
+        data = await service.getCharacteristic(IF820_OTA.DATA_UUID);
+    }
+    catch (e) {
+        throw wrapGattError(e, 'Opening the update characteristics');
+    }
+    const statuses = new StatusQueue();
+    const onValue = (ev) => {
+        const target = (ev.target ?? control);
+        const v = target.value;
+        if (!v || v.byteLength === 0)
+            return;
+        const status = v.getUint8(0);
+        log(`control point ← status ${status} (${if820OtaStatusText(status)})`);
+        statuses.push(status);
+    };
+    control.addEventListener('characteristicvaluechanged', onValue);
+    const send = async (op, param, what) => {
+        log(`control point → ${what}`);
+        try {
+            await write(control, command(op, param));
+        }
+        catch (e) {
+            throw wrapGattError(e, what);
+        }
+    };
+    const expectOk = async (what, timeoutMs) => {
+        const status = await statuses.next(timeoutMs, what, signal);
+        if (status !== IF820_OTA_STATUS.OK) {
+            throw new If820OtaError(`Bluetooth module refused ${what}: ${if820OtaStatusText(status)}`, {
+                status,
+            });
+        }
+    };
+    const abortQuietly = async () => {
+        try {
+            await write(control, command(IF820_OTA_COMMAND.ABORT));
+            log('control point → ABORT');
+        }
+        catch {
+            /* Best effort: the link may already be gone. Without a VERIFY the
+             * module never switches images, so nothing depends on this landing. */
+        }
+    };
+    /** One full pass at a given chunk size. Throws {@link ChunkRefused} when the
+     * very first data write fails, so the caller can retry smaller. */
+    const pass = async (chunkSize) => {
+        statuses.clear();
+        onStatus('Preparing the Bluetooth module for the update…');
+        await send(IF820_OTA_COMMAND.PREPARE_DOWNLOAD, undefined, 'PREPARE_DOWNLOAD');
+        await expectOk('PREPARE_DOWNLOAD', responseTimeoutMs);
+        await send(IF820_OTA_COMMAND.DOWNLOAD, bytes.length, `DOWNLOAD (${bytes.length} bytes)`);
+        await expectOk('DOWNLOAD', responseTimeoutMs);
+        onStatus('Sending firmware to the Bluetooth module…');
+        let crc = 0;
+        let offset = 0;
+        opts.onProgress?.({ object: 'firmware', totalBytes: bytes.length, currentBytes: 0 });
+        while (offset < bytes.length) {
+            throwIfAborted$1(signal);
+            const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+            try {
+                await write(data, chunk);
+            }
+            catch (e) {
+                if (offset === 0 && chunkSize > IF820_OTA_MIN_CHUNK_SIZE)
+                    throw new ChunkRefused(e);
+                throw wrapGattError(e, `Writing firmware at offset ${offset}`);
+            }
+            crc = crc32(chunk, crc);
+            offset += chunk.length;
+            opts.onProgress?.({ object: 'firmware', totalBytes: bytes.length, currentBytes: offset });
+            /* The module does not answer data writes on the control point, except
+             * with flow-control hints (CONTINUE / MORE_DATA). Anything else mid
+             * transfer is a refusal. */
+            for (const status of statuses.drain()) {
+                if (status !== IF820_OTA_STATUS.CONTINUE && status !== IF820_OTA_STATUS.MORE_DATA) {
+                    throw new If820OtaError(`Bluetooth module stopped the transfer at ${offset} bytes: ${if820OtaStatusText(status)}`, { status });
+                }
+            }
+        }
+        onStatus('Verifying the firmware on the Bluetooth module…');
+        await send(IF820_OTA_COMMAND.VERIFY, crc, `VERIFY (crc32 0x${crc.toString(16).padStart(8, '0')})`);
+        await expectOk('VERIFY', verifyTimeoutMs);
+        return crc;
+    };
+    try {
+        try {
+            await control.startNotifications();
+        }
+        catch (e) {
+            throw wrapGattError(e, 'Subscribing to the update control point');
+        }
+        let chunkSize = firstChunk;
+        let crc;
+        for (;;) {
+            try {
+                crc = await pass(chunkSize);
+                break;
+            }
+            catch (e) {
+                if (e instanceof ChunkRefused) {
+                    log(`first ${chunkSize}-byte data write refused (${String(e.inner)}); retrying at ${IF820_OTA_MIN_CHUNK_SIZE}`);
+                    await abortQuietly();
+                    chunkSize = IF820_OTA_MIN_CHUNK_SIZE;
+                    continue;
+                }
+                throw e;
+            }
+        }
+        onStatus('Bluetooth module firmware accepted; the module is restarting.');
+        return {
+            bytes: bytes.length,
+            crc32: crc,
+            chunkSize,
+            serviceUuid,
+            durationMs: Date.now() - started,
+        };
+    }
+    catch (e) {
+        if (server.connected)
+            await abortQuietly();
+        throw e;
+    }
+    finally {
+        control.removeEventListener('characteristicvaluechanged', onValue);
+    }
+}
+// ── Version helpers ──
+/**
+ * Compare two dotted version strings numerically (`'1.4.16.16'` vs
+ * `'1.4.18.18'`). Missing fields count as 0. Returns <0, 0 or >0.
+ */
+function compareIf820Versions(a, b) {
+    const pa = a
+        .replace(/^v/i, '')
+        .split('.')
+        .map((n) => Number(n) || 0);
+    const pb = b
+        .replace(/^v/i, '')
+        .split('.')
+        .map((n) => Number(n) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+        if (d !== 0)
+            return d;
+    }
+    return 0;
+}
+/**
+ * True when the module reported by `readBtModuleVersion()` is an IF820
+ * (CYW20820) on an older firmware than `latest`. Anything else — another
+ * module family, or a version that was not reported — is false: a host must
+ * never offer this image to a module it cannot identify.
+ */
+function isIf820UpdateAvailable(current, latest) {
+    if (!current || current.family !== 'cyw20820' || !current.version)
+        return false;
+    return compareIf820Versions(current.version, latest) < 0;
+}
+
+/**
  * How to describe a link that supplied no device name, in the reader's own terms.
  *
  * A client that cannot name the device still has to say something, and what it
@@ -14698,6 +15607,10 @@ const DATA_RATE_TAIL_BYTES = 24;
 function withoutLeadingAck(msg) {
     return msg.length > 1 && msg[0] === OPCODES.ACK_COMMAND_PROCESSED ? msg.subarray(1) : msg;
 }
+/** True for an ACK (0xFF) or a NACK (0xFE): every reply to a command starts with one. */
+function isAckOrNack(b) {
+    return b === OPCODES.ACK_COMMAND_PROCESSED || b === OPCODES.NACK_COMMAND_PROCESSED;
+}
 /** A firmware version as the release tags spell it, e.g. `v1.00.011`. */
 function firmwareTag(major, minor, internal) {
     return `v${major}.${String(minor).padStart(2, '0')}.${String(internal).padStart(3, '0')}`;
@@ -15119,7 +16032,8 @@ class Shimmer3RClient extends BaseShimmerClient {
                 }
                 return;
             }
-            // 2) During streaming, all bytes are data-plane
+            // 2) During streaming, all bytes are data-plane, bar the bare ACKs and NACKs
+            //    the stream parser finds between packets
             if (this._streaming) {
                 this._rxBuf = concatU8(this._rxBuf, chunk);
             }
@@ -15302,6 +16216,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         this.forceTimestampFmt = opts.timestampFmt ?? 'u24';
         this._injectedTransport = opts.transport ?? null;
         this.emitCalibratedInertial = opts.emitCalibratedInertial ?? true;
+        this._extraOptionalServices = opts.optionalServices ?? [];
     }
     /**
      * The name the link reported, or `null` when it reported none. Never invented.
@@ -15351,7 +16266,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             rxFlowCharUUID: SHIMMER3R_DEFAULTS.CHAR_RX_FLOW_UUID,
             requestDeviceOptions: {
                 filters: [{ services: [this.serviceUUID] }],
-                optionalServices: [this.serviceUUID],
+                optionalServices: this.requestedOptionalServices(),
             },
             defaultWriteWithResponse: true,
             debug: this.debug,
@@ -15726,7 +16641,9 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._log('Serial rx len=', chunk.length, 'data=', chunk);
         // While a stream is live every byte is schema-defined stream data, whose
         // length this protocol layer cannot know — hand it straight to the parser,
-        // which accumulates and so is already fragmentation-proof.
+        // which accumulates and so is already fragmentation-proof. The parser also
+        // takes the bare ACKs and NACKs the firmware queues between packets
+        // (`_streamReplyLength`), though no reply with more in it.
         if (this._streaming) {
             this._rxBuf = concatU8(this._rxBuf, chunk);
             this._parseStreamIfPossible();
@@ -16358,6 +17275,63 @@ class Shimmer3RClient extends BaseShimmerClient {
         const parsed = parseBluetoothModuleVersion(payload);
         this._emitStatus(`Bluetooth module: ${parsed.label}`);
         return parsed;
+    }
+    /**
+     * The `optionalServices` this client requests when it opens the Web
+     * Bluetooth picker: the Shimmer3R service, the Bluetooth module's OTA
+     * update services, and any {@link Shimmer3RClientOptions.optionalServices}.
+     * A host that builds its own `requestDevice` options must request the same
+     * list, or {@link updateBtModuleFirmware} cannot run on that connection.
+     */
+    requestedOptionalServices() {
+        return [
+            ...new Set([this.serviceUUID, ...IF820_OTA_SERVICE_UUIDS, ...this._extraOptionalServices]),
+        ];
+    }
+    /**
+     * Update the Bluetooth module's (IF820) firmware over this BLE connection.
+     * `image` is the module's `.ota.bin`. See {@link runIf820OtaUpdate} for the
+     * protocol.
+     *
+     * Refused while streaming, and only possible over Web Bluetooth — the
+     * module is updated by its own GATT service, which a Bluetooth Classic or
+     * USB link cannot reach.
+     *
+     * By default reboot-on-disconnect is armed first: the module resets onto
+     * the new firmware once it has verified it, which drops the link, and the
+     * Shimmer3R's MCU only reads the module version at boot. With it armed the
+     * MCU reboots on that drop, so after reconnecting {@link readBtModuleVersion}
+     * reports the new version. Pass `rebootMcuOnDisconnect: false` to skip that
+     * (the version then updates at the next power-cycle). Firmware that NACKs
+     * the feature is not an error: the update still runs.
+     *
+     * Resolves once the module has accepted the image; expect a disconnect
+     * shortly after. Reconnect with a {@link WebBluetoothTransport} given the
+     * same {@link device} to avoid a second picker.
+     *
+     * HARDWARE-VERIFY: not yet run on a Shimmer3R — see the note in
+     * `if820Ota.ts`.
+     */
+    async updateBtModuleFirmware(image, opts = {}) {
+        const t = this._transport;
+        if (!t)
+            throw new Error('Not connected');
+        if (!(t instanceof WebBluetoothTransport) || !t.device) {
+            throw new Error('The Bluetooth module can only be updated over a BLE (Web Bluetooth) connection.');
+        }
+        if (this._streaming) {
+            throw new Error('Stop streaming before updating the Bluetooth module firmware.');
+        }
+        if (opts.rebootMcuOnDisconnect ?? true) {
+            try {
+                await this.setRebootOnDisconnect(true);
+            }
+            catch (e) {
+                this._log('reboot-on-disconnect not available; continuing', e);
+                opts.onLog?.(`reboot-on-disconnect not armed: ${String(e)}`);
+            }
+        }
+        return runIf820OtaUpdate(t.device, image, opts);
     }
     /**
      * Read from the daughter-card (expansion board) EEPROM memory. `offset` is a
@@ -18003,6 +18977,78 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
         return false;
     }
+    /**
+     * The length of the bare ACK or NACK at `buf[at]`, a whole reply with nothing
+     * in it but the acknowledgement: `1 +` the link CRC. `RESYNC` when `buf[at]`
+     * is not one, `NEED_MORE` when the buffer ends before that can be told.
+     *
+     * With a CRC on, the CRC is what tells. The firmware appends one over the
+     * whole reply (`ShimBt_sendRsp`, `Comms/shimmer_bt_uart.c`), so a bare ACK is
+     * `FF F4 65` and a bare NACK `FE C5 56`, each without its last byte under a
+     * 1-byte CRC. An ACK with a response behind it fails the check, since its CRC
+     * covers the response too, and no response can pass it either: no response
+     * opcode is 0xF4 in any Shimmer3 or Shimmer3R firmware.
+     *
+     * With no CRC, a NACK is always bare, because it replaces the whole reply. An
+     * ACK is bare when what follows it cannot be a response: the next packet, or
+     * another ACK or NACK.
+     *
+     * HARDWARE-VERIFY: derived from the firmware source (`ShimBt_sendRsp`, and
+     * replies sharing the transmit ring with the packets) and run against a
+     * scripted device only. No sensor has been streamed against it with a command
+     * in flight, in any CRC mode or over any link.
+     */
+    _streamReplyLength(buf, at) {
+        const op = buf[at];
+        if (!isAckOrNack(op))
+            return RESYNC;
+        const trailer = crcTrailerBytes(this._crcMode);
+        if (trailer > 0) {
+            if (buf.length < at + 1 + trailer)
+                return NEED_MORE;
+            return verifyCrc(buf.subarray(at, at + 1 + trailer), this._crcMode) ? 1 + trailer : RESYNC;
+        }
+        if (op === OPCODES.NACK_COMMAND_PROCESSED)
+            return 1;
+        if (buf.length < at + 2)
+            return NEED_MORE;
+        const after = buf[at + 1];
+        return after === OPCODES.DATA_PACKET || isAckOrNack(after) ? 1 : RESYNC;
+    }
+    /** How many bytes of bare replies run from `buf[at]`, each as {@link _streamReplyLength} measures it. */
+    _streamRepliesLength(buf, at) {
+        let end = at;
+        for (;;) {
+            const n = this._streamReplyLength(buf, end);
+            if (n === NEED_MORE)
+                return NEED_MORE;
+            if (n === RESYNC)
+                return end - at;
+            end += n;
+        }
+    }
+    /**
+     * Hand a bare ACK or NACK found between stream packets to the command waiting
+     * for it, as {@link _handleFramedChunk} does with one that arrives on its own.
+     * An ACK that no command is counting on is dropped, such as the one for
+     * {@link toggleLed}, which does not wait for it while streaming.
+     */
+    _takeStreamReply(op) {
+        if (op === OPCODES.NACK_COMMAND_PROCESSED) {
+            // _waitForAck rejects on it, and its caller gives the count back
+            this._log('NACK between stream packets');
+            this._emitTemp(new Uint8Array([op]));
+            return;
+        }
+        if (this._expectingAck <= 0) {
+            this._log('ACK between stream packets, with no command waiting for it; dropped');
+            return;
+        }
+        this._log('ACK between stream packets (expected)');
+        this._expectingAck--;
+        this._lastAckRemainder = null;
+        this._emitTemp(new Uint8Array([op]));
+    }
     _parseBySchema() {
         const sch = this.schema;
         const preamble = sch.dataPreambleByte;
@@ -18021,59 +19067,109 @@ class Shimmer3RClient extends BaseShimmerClient {
         let frames = 0;
         let drops = 0;
         let anomalies = 0;
-        while (buf.length >= wireBytes * 2) {
-            if (buf[0] === preamble && buf[wireBytes] === preamble) {
-                let ts1, ts2;
-                try {
-                    ts1 = tsBytes === 2 ? u16le$3(buf, 1) : u24le(buf, 1);
-                    ts2 = tsBytes === 2 ? u16le$3(buf, wireBytes + 1) : u24le(buf, wireBytes + 1);
-                }
-                catch {
-                    buf = buf.subarray(1);
-                    drops++;
+        for (;;) {
+            /* A bare ACK or NACK at a packet boundary. The firmware queues replies
+             * into the same transmit ring as the packets (protocol doc §6.3), so the
+             * reply to a command sent mid-stream lands between two of them. Taken
+             * here only where a boundary is known, after a packet or another reply,
+             * and never from bytes the parser has yet to place, which could be
+             * anything. A packet with replies behind it, below, leaves them here. */
+            if (this._streaming && this._streamAligned && isAckOrNack(buf[0])) {
+                const n = this._streamReplyLength(buf, 0);
+                if (n === NEED_MORE)
+                    break;
+                if (n !== RESYNC) {
+                    this._takeStreamReply(buf[0]);
+                    buf = buf.subarray(n);
                     continue;
                 }
-                const dt = (((ts2 - ts1) % TS_MOD) + TS_MOD) % TS_MOD;
-                if (dt === 0) {
-                    buf = buf.subarray(1);
-                    drops++;
-                    this._streamAligned = false;
-                    continue;
-                }
-                /* Two preambles a frame apart are not proof of alignment on a periodic
-                 * layout - see STREAM_ALIGN_MAX_SKIP. Until the device clock agrees,
-                 * keep sliding. Only the acquisition is gated: once aligned, a real gap
-                 * in the link must not be mistaken for a bad lock. */
-                /* Two tiers. While the expected interval is still credible a candidate
-                 * must match it; once every candidate has been rejected that many
-                 * times it is the expectation that is wrong, so the test drops to the
-                 * rate-free band rather than off altogether. Dropping it off
-                 * altogether is what used to let a wrong byte offset lock - its
-                 * "timestamp" stepping by millions of ticks - and then look for all the
-                 * world like a working stream. */
-                const strictTier = this._streamAlignRejects < STREAM_ALIGN_MAX_REJECTS;
-                if (!this._streamAligned &&
-                    !(strictTier
-                        ? this._plausibleFrameDelta(dt, expectedTicks)
-                        : this._frameDeltaInPlausibleBand(dt))) {
-                    buf = buf.subarray(1);
-                    drops++;
-                    if (strictTier) {
-                        this._streamAlignRejects++;
-                        if (this._streamAlignRejects === STREAM_ALIGN_MAX_REJECTS) {
-                            /* Said once, at full volume: the reported rate does not describe
-                             * what is arriving, and that is the thing to fix. */
-                            this._emitStatus(`Frame timing does not match the reported ${expectedTicks}-tick ` +
-                                `interval; accepting any interval a valid configuration could produce.`);
+            }
+            /* Where the next packet starts: straight after this one, or past the
+             * replies queued at this boundary. Replies used to fail the second
+             * preamble test, and took this packet with them.
+             *
+             * A reply whose own CRC checks out, behind a packet at a known boundary,
+             * says by itself where that packet ends, so the packet is taken without
+             * waiting for the next one: at the slowest rates that wait is a second,
+             * most of the reply's ACK timeout. With no CRC to check, or while
+             * acquiring, the next packet has to be found past the replies and its
+             * timestamp has to pass the test below. */
+            let next = wireBytes;
+            let vouched = false;
+            if (this._streaming &&
+                buf[0] === preamble &&
+                buf.length > wireBytes &&
+                buf[wireBytes] !== preamble) {
+                const vouchable = crcBytes > 0 && this._streamAligned;
+                const replies = vouchable
+                    ? this._streamReplyLength(buf, wireBytes)
+                    : this._streamRepliesLength(buf, wireBytes);
+                if (replies === NEED_MORE)
+                    break;
+                vouched = vouchable && replies !== RESYNC;
+                if (!vouched)
+                    next += replies;
+            }
+            if (!vouched && buf.length < Math.max(wireBytes * 2, next + 1 + tsBytes))
+                break;
+            if (buf[0] === preamble && (vouched || buf[next] === preamble)) {
+                if (!vouched) {
+                    let ts1, ts2;
+                    try {
+                        ts1 = tsBytes === 2 ? u16le$3(buf, 1) : u24le(buf, 1);
+                        ts2 = tsBytes === 2 ? u16le$3(buf, next + 1) : u24le(buf, next + 1);
+                    }
+                    catch {
+                        buf = buf.subarray(1);
+                        drops++;
+                        continue;
+                    }
+                    const dt = (((ts2 - ts1) % TS_MOD) + TS_MOD) % TS_MOD;
+                    if (dt === 0) {
+                        buf = buf.subarray(1);
+                        drops++;
+                        this._streamAligned = false;
+                        continue;
+                    }
+                    /* Two preambles a frame apart are not proof of alignment on a
+                     * periodic layout - see STREAM_ALIGN_MAX_SKIP. Until the device clock
+                     * agrees, keep sliding. Only the acquisition is gated: once aligned, a
+                     * real gap in the link must not be mistaken for a bad lock. The
+                     * exception is replies in between, which are tested even once
+                     * aligned: with no CRC on them, this timestamp is the only evidence
+                     * that they are replies and not a slip in the stream. */
+                    /* Two tiers. While the expected interval is still credible a
+                     * candidate must match it; once every candidate has been rejected
+                     * that many times it is the expectation that is wrong, so the test
+                     * drops to the rate-free band rather than off altogether. Dropping it
+                     * off altogether is what used to let a wrong byte offset lock - its
+                     * "timestamp" stepping by millions of ticks - and then look for all
+                     * the world like a working stream. */
+                    const strictTier = this._streamAlignRejects < STREAM_ALIGN_MAX_REJECTS;
+                    if ((!this._streamAligned || next > wireBytes) &&
+                        !(strictTier
+                            ? this._plausibleFrameDelta(dt, expectedTicks)
+                            : this._frameDeltaInPlausibleBand(dt))) {
+                        buf = buf.subarray(1);
+                        drops++;
+                        this._streamAligned = false;
+                        if (strictTier) {
+                            this._streamAlignRejects++;
+                            if (this._streamAlignRejects === STREAM_ALIGN_MAX_REJECTS) {
+                                /* Said once, at full volume: the reported rate does not
+                                 * describe what is arriving, and that is the thing to fix. */
+                                this._emitStatus(`Frame timing does not match the reported ${expectedTicks}-tick ` +
+                                    `interval; accepting any interval a valid configuration could produce.`);
+                            }
                         }
+                        if (this.debug && drops % 64 === 1) {
+                            this._log(strictTier
+                                ? `align: rejecting candidate, Δt=${dt} ticks is not ~1-${STREAM_ALIGN_MAX_SKIP}× ` +
+                                    `the ${expectedTicks}-tick frame interval`
+                                : `align: rejecting candidate, Δt=${dt} ticks is outside any valid frame interval`);
+                        }
+                        continue;
                     }
-                    if (this.debug && drops % 64 === 1) {
-                        this._log(strictTier
-                            ? `align: rejecting candidate, Δt=${dt} ticks is not ~1-${STREAM_ALIGN_MAX_SKIP}× ` +
-                                `the ${expectedTicks}-tick frame interval`
-                            : `align: rejecting candidate, Δt=${dt} ticks is outside any valid frame interval`);
-                    }
-                    continue;
                 }
                 const frame = buf.subarray(0, frameBytes);
                 /* Checked before decoding so a corrupt frame is reported as corrupt
@@ -18254,7 +19350,8 @@ class Shimmer3RClient extends BaseShimmerClient {
                 // that; "ACK timeout" a second and a half later reads as a dead link.
                 // Only reachable while a command is in flight — this handler is
                 // registered for exactly that window — so a stray 0xFE cannot fabricate
-                // one, and stream bytes never reach the control fan-out at all.
+                // one. Stream bytes reach the control fan-out only as a bare NACK the
+                // stream parser found at a packet boundary (`_streamReplyLength`).
                 if (chunk[0] === OPCODES.NACK_COMMAND_PROCESSED) {
                     clearTimeout(t);
                     off();
@@ -19082,9 +20179,11 @@ class Shimmer3RClient extends BaseShimmerClient {
      * `redLedOn` — which is what {@link setRedLed} uses to make "on"/"off" mean
      * something.
      *
-     * While streaming this writes without waiting for the ACK: every inbound byte
-     * belongs to the data plane then, so the ACK would be consumed by the schema
-     * parser and the wait would time out on a command the firmware did in fact run.
+     * While streaming this writes without waiting for the ACK. That began as a
+     * way round the stream parser, which used to drop the ACK as junk, along with
+     * the packet in front of it, so the wait timed out on a command the firmware
+     * did in fact run. The parser now takes the ACK between the two packets and
+     * keeps the packet, so the ACK the firmware sends costs nothing either way.
      *
      * HARDWARE-VERIFY: that the lower LED visibly lights, and that the flag really
      * does survive a disconnect, want confirming on a sensor.
@@ -29603,7 +30702,7 @@ class SensorVD6283 extends SensorBase {
 SensorVD6283.NUM_CHANNELS = 6;
 SensorVD6283.BYTES_PER_SAMPLE = 18;
 
-function u16le$1(bytes, off) {
+function u16le(bytes, off) {
     return (bytes[off] & 0xff) | ((bytes[off + 1] & 0xff) << 8);
 }
 /**
@@ -29638,9 +30737,9 @@ class SensorMAX32674 extends SensorBase {
                         i16le$1(sensorPayloadBytes, base + 4),
                     ],
                 },
-                hr: u16le$1(sensorPayloadBytes, base + 6),
+                hr: u16le(sensorPayloadBytes, base + 6),
                 hrConfidence: sensorPayloadBytes[base + 8] ?? 0,
-                spo2: u16le$1(sensorPayloadBytes, base + 9),
+                spo2: u16le(sensorPayloadBytes, base + 9),
                 spo2Confidence: sensorPayloadBytes[base + 11] ?? 0,
                 activityClass: sensorPayloadBytes[base + 12] ?? 0,
                 scdContactState: sensorPayloadBytes[base + 13] ?? 0,
@@ -32416,458 +33515,6 @@ async function runVerisenseDfuUpdate(dfu, device, dfuPackage, options = {}) {
 }
 
 /**
- * Verisense Nordic Secure-DFU over USB CDC serial (Web Serial).
- *
- * The combined BLE+USB bootloader (v3) exposes Nordic's serial DFU transport
- * on its own USB CDC port (VID 0x1915 / PID 0x521F, product "Verisense DFU"),
- * carrying the same secure-DFU request handler as BLE — same signed `.zip`
- * packages, same object/CRC/execute protocol — but framed with SLIP
- * (RFC 1055) instead of GATT characteristics.
- *
- * This module is self-contained (no dependency on the vendored
- * `web-bluetooth-dfu` scripts): SLIP codec, CRC-32, and the serial secure-DFU
- * state machine. The byte transport is injected structurally and
- * {@link WebSerialTransport} satisfies it directly. Package parsing stays with
- * the vendored `SecureDfuPackage` (see `VerisenseDfuPackage` in `dfu.ts`) —
- * the `initData`/`imageData` buffers it yields are exactly what
- * {@link VerisenseSerialDfu.update} consumes.
- *
- * Flow (mirrors nrfutil's `dfu usb-serial`): ping → PRN 0 → MTU → command
- * object (init packet) → data objects (firmware, `max_size` chunks, each
- * CRC-validated before Execute). Writes carry no per-write response at PRN 0 —
- * USB CDC is a reliable stream — so validation happens per object via CRC_GET.
- * Interrupted transfers resume from the last completed object when the
- * device-reported CRC matches ours.
- */
-// ── SLIP framing (RFC 1055, as used by Nordic's serial DFU) ────────────────
-const SLIP_END = 0xc0;
-const SLIP_ESC = 0xdb;
-const SLIP_ESC_END = 0xdc;
-const SLIP_ESC_ESC = 0xdd;
-/** SLIP-encode one frame (terminating END appended; none prepended, matching
- * Nordic's encoder). */
-function slipEncode(frame) {
-    const out = [];
-    for (const byte of frame) {
-        if (byte === SLIP_END)
-            out.push(SLIP_ESC, SLIP_ESC_END);
-        else if (byte === SLIP_ESC)
-            out.push(SLIP_ESC, SLIP_ESC_ESC);
-        else
-            out.push(byte);
-    }
-    out.push(SLIP_END);
-    return Uint8Array.from(out);
-}
-/**
- * Streaming SLIP decoder: feed arbitrary chunks, get back completed frames.
- * Empty frames (back-to-back ENDs) are dropped, matching Nordic's decoder.
- */
-class SlipDecoder {
-    constructor() {
-        this._frame = [];
-        this._escaped = false;
-    }
-    /** Decode a chunk; returns every frame completed by it (possibly none). */
-    push(chunk) {
-        const frames = [];
-        for (const byte of chunk) {
-            if (this._escaped) {
-                this._escaped = false;
-                if (byte === SLIP_ESC_END)
-                    this._frame.push(SLIP_END);
-                else if (byte === SLIP_ESC_ESC)
-                    this._frame.push(SLIP_ESC);
-                // Invalid escape: RFC 1055 leaves the byte in place; keep it so a
-                // corrupt frame fails its response check rather than desyncing.
-                else
-                    this._frame.push(byte);
-            }
-            else if (byte === SLIP_ESC) {
-                this._escaped = true;
-            }
-            else if (byte === SLIP_END) {
-                if (this._frame.length > 0)
-                    frames.push(Uint8Array.from(this._frame));
-                this._frame = [];
-            }
-            else {
-                this._frame.push(byte);
-            }
-        }
-        return frames;
-    }
-    reset() {
-        this._frame = [];
-        this._escaped = false;
-    }
-}
-// ── CRC-32 (IEEE 802.3, the polynomial Nordic's DFU uses) ──────────────────
-const CRC32_TABLE = (() => {
-    const table = new Uint32Array(256);
-    for (let n = 0; n < 256; n++) {
-        let c = n;
-        for (let k = 0; k < 8; k++)
-            c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-        table[n] = c >>> 0;
-    }
-    return table;
-})();
-/** CRC-32 of `data`, continuing from `seed` (pass a previous crc32 result to
- * extend it). Returns an unsigned 32-bit value. */
-function crc32(data, seed = 0) {
-    let c = ~seed >>> 0;
-    for (let i = 0; i < data.length; i++) {
-        c = CRC32_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
-    }
-    return ~c >>> 0;
-}
-// ── Serial secure-DFU protocol constants ────────────────────────────────────
-/** Request opcodes (identical to the BLE control-point opcodes; over serial,
- * data writes are the explicit OBJECT_WRITE opcode instead of a second
- * characteristic). */
-const SERIAL_DFU_OP = Object.freeze({
-    OBJECT_CREATE: 0x01,
-    RECEIPT_NOTIF_SET: 0x02,
-    CRC_GET: 0x03,
-    OBJECT_EXECUTE: 0x04,
-    OBJECT_SELECT: 0x06,
-    MTU_GET: 0x07,
-    OBJECT_WRITE: 0x08,
-    PING: 0x09,
-    RESPONSE: 0x60,
-});
-const SERIAL_DFU_OBJECT_TYPE = Object.freeze({
-    COMMAND: 0x01, // init packet
-    DATA: 0x02, // firmware image
-});
-/** Result codes carried in responses (nrf_dfu_response_t). */
-const SERIAL_DFU_RESULT_NAMES = Object.freeze({
-    0x00: 'Invalid opcode',
-    0x01: 'Success',
-    0x02: 'Opcode not supported',
-    0x03: 'Invalid parameter',
-    0x04: 'Insufficient resources',
-    0x05: 'Invalid object',
-    0x07: 'Unsupported object type',
-    0x08: 'Operation not permitted',
-    0x0a: 'Operation failed',
-    0x0b: 'Extended error',
-});
-/** Extended-error codes (nrf_dfu_ext_error_code_t) that follow result 0x0B. */
-const SERIAL_DFU_EXTENDED_ERROR_NAMES = Object.freeze({
-    0x00: 'No error',
-    0x01: 'Invalid error code',
-    0x02: 'Wrong command format',
-    0x03: 'Unknown command',
-    0x04: 'Init command invalid',
-    0x05: 'Firmware version too low',
-    0x06: 'Hardware version mismatch',
-    0x07: 'SoftDevice version mismatch',
-    0x08: 'Signature missing',
-    0x09: 'Wrong hash type',
-    0x0a: 'Hash calculation failed',
-    0x0b: 'Wrong signature type',
-    0x0c: 'Signature verification failed',
-    0x0d: 'Insufficient space',
-});
-/**
- * The v3 bootloader's USB identity in DFU mode. Deliberately distinct from
- * the application's CDC port (0x1915/0x520F) so a Web Serial picker — which
- * can only filter on VID/PID — shows exactly the bootloader.
- */
-const VERISENSE_USB_DFU_VID = 0x1915;
-const VERISENSE_USB_DFU_PID = 0x521f;
-/** `navigator.serial.requestPort()` filters for the bootloader's DFU port. */
-const VERISENSE_USB_DFU_PORT_FILTERS = Object.freeze([
-    Object.freeze({ usbVendorId: VERISENSE_USB_DFU_VID, usbProductId: VERISENSE_USB_DFU_PID }),
-]);
-/**
- * After the firmware ACKs a `DFU_MODE` request received over USB it reboots
- * ~300 ms later (the delay lets the ACK drain), the application port
- * disappears, and the bootloader enumerates as 0x1915/0x521F. Give the OS a
- * moment to enumerate before offering the picker.
- */
-const VERISENSE_USB_DFU_REENUMERATION_DELAY_MS = 2000;
-/**
- * True when a `DFU_MODE` property-write rejection means the unit cannot enter
- * DFU mode from USB: firmware on a BLE-only (v2) bootloader NACKs the request
- * (the reboot would strand the device off the bus until the bootloader's
- * inactivity timeout). The caller should fall back to the BLE DFU flow.
- *
- * Keyed on the DFU_MODE property code (0x6) in the client's NACK message
- * ("Device returned NACK command=0x.. property=0x6", unpadded hex — see
- * `validatePendingResponse` in requestValidation.ts) so NACKs from unrelated
- * requests are never misclassified as "USB DFU unsupported".
- */
-function isUsbDfuUnsupportedError(error) {
-    return /NACK.*property=0x0?6\b/i.test(String(error));
-}
-const VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS = 15000;
-const VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS = 3;
-function u16le(value) {
-    return [value & 0xff, (value >>> 8) & 0xff];
-}
-function u32le(value) {
-    return [value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff];
-}
-function readU32le(bytes, offset) {
-    return ((bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16)) +
-        bytes[offset + 3] * 0x1000000);
-}
-function opcodeName(opcode) {
-    for (const [name, value] of Object.entries(SERIAL_DFU_OP)) {
-        if (value === opcode)
-            return name;
-    }
-    return `0x${opcode.toString(16)}`;
-}
-/**
- * Nordic secure DFU over a SLIP-framed serial byte stream.
- *
- * One instance drives one transfer session; construct it around a connected
- * transport whose port is the bootloader's DFU port (see
- * {@link VERISENSE_USB_DFU_PORT_FILTERS}) and call {@link update} with the
- * `initData`/`imageData` of each image in the package (base image first when
- * present, application after — same ordering as `runVerisenseDfuUpdate`).
- */
-class VerisenseSerialDfu {
-    constructor(transport, options = {}) {
-        this._decoder = new SlipDecoder();
-        this._pending = null;
-        this._unsubscribe = null;
-        this._mtu = 0;
-        this._transport = transport;
-        this._options = options;
-    }
-    /** Max unencoded bytes per OBJECT_WRITE frame: worst-case SLIP encoding
-     * doubles every byte, plus the terminating END, minus the opcode byte
-     * (matches nrfutil's `(mtu - 1) // 2 - 1`). */
-    get maxWriteSize() {
-        return Math.floor((this._mtu - 1) / 2) - 1;
-    }
-    /**
-     * Transfer one image (init packet + firmware binary). Resolves when the
-     * final Execute is acknowledged — for an application image that is the
-     * point where the bootloader resets to activate it, which also drops the
-     * serial port; the caller should expect the port to disappear.
-     */
-    async update(init, image) {
-        if (this._unsubscribe)
-            throw new Error('A transfer is already in progress');
-        this._decoder.reset();
-        this._unsubscribe = this._transport.onNotify((chunk) => this._onData(chunk));
-        try {
-            await this._handshake();
-            await this._transferInit(new Uint8Array(init));
-            await this._transferFirmware(new Uint8Array(image));
-        }
-        finally {
-            this._unsubscribe?.();
-            this._unsubscribe = null;
-            const pending = this._pending;
-            this._pending = null;
-            pending?.reject(new Error('Transfer closed'));
-        }
-    }
-    // ── protocol steps ────────────────────────────────────────────────────────
-    async _handshake() {
-        const pingId = Math.floor(Math.random() * 256);
-        const pong = await this._request(SERIAL_DFU_OP.PING, [pingId]);
-        if (pong.length < 1 || pong[0] !== pingId) {
-            throw new Error(`DFU ping mismatch (sent ${pingId}, got ${pong[0] ?? 'nothing'})`);
-        }
-        // PRN 0: no per-write receipts — USB CDC is reliable; objects are
-        // CRC-validated explicitly before Execute.
-        await this._request(SERIAL_DFU_OP.RECEIPT_NOTIF_SET, u16le(0));
-        const mtuRsp = await this._request(SERIAL_DFU_OP.MTU_GET);
-        if (mtuRsp.length < 2)
-            throw new Error('DFU MTU response too short');
-        this._mtu = mtuRsp[0] | (mtuRsp[1] << 8);
-        if (this.maxWriteSize < 1)
-            throw new Error(`DFU MTU unusable (${this._mtu})`);
-        this._options.onLog?.(`serial DFU ready: mtu=${this._mtu} maxWrite=${this.maxWriteSize}`);
-    }
-    async _transferInit(init) {
-        this._options.onStatus?.('Transferring init packet...');
-        const sel = await this._select(SERIAL_DFU_OBJECT_TYPE.COMMAND);
-        if (sel.offset === init.length && sel.crc === crc32(init)) {
-            // Same init packet already transferred (interrupted attempt): just
-            // (re-)execute it.
-            this._options.onLog?.('init packet already transferred; executing');
-            await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
-            return;
-        }
-        if (init.length > sel.maxSize) {
-            throw new Error(`Init packet too large (${init.length} > ${sel.maxSize})`);
-        }
-        await this._request(SERIAL_DFU_OP.OBJECT_CREATE, [
-            SERIAL_DFU_OBJECT_TYPE.COMMAND,
-            ...u32le(init.length),
-        ]);
-        await this._writeData(init, 'init', init.length, 0);
-        const { offset, crc } = await this._crcGet();
-        if (offset !== init.length || crc !== crc32(init)) {
-            throw new Error(`Init packet CRC mismatch (offset ${offset}/${init.length}, crc 0x${crc.toString(16)})`);
-        }
-        await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
-    }
-    async _transferFirmware(image) {
-        const sel = await this._select(SERIAL_DFU_OBJECT_TYPE.DATA);
-        const attempts = this._options.objectAttempts ?? VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS;
-        // Resume: trust the device-reported offset only when our CRC of that
-        // prefix matches. The write position cannot be rewound arbitrarily —
-        // OBJECT_CREATE always (re)creates at the device's current position, so
-        // only the current (unexecuted) object can be rolled back. That is also
-        // sufficient: executed objects were CRC-validated before Execute, and
-        // executing a *different* image's init packet resets the stored progress
-        // to zero, so a mismatch can only live in the unexecuted tail (any deeper
-        // corruption surfaces as an object CRC failure below).
-        let startOffset = 0;
-        if (sel.offset > 0 && sel.offset <= image.length) {
-            const prefixMatches = crc32(image.subarray(0, sel.offset)) === sel.crc;
-            if (prefixMatches && sel.offset === image.length) {
-                this._options.onLog?.('firmware already transferred; executing');
-                await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
-                return;
-            }
-            if (prefixMatches) {
-                // Partial object: re-create it from its boundary. Boundary offset:
-                // continue with the next object.
-                startOffset = sel.offset - (sel.offset % sel.maxSize);
-            }
-            else {
-                const remainder = sel.offset % sel.maxSize;
-                startOffset =
-                    sel.offset - (remainder !== 0 ? remainder : Math.min(sel.maxSize, sel.offset));
-                this._options.onLog?.(`device-reported firmware CRC mismatch at ${sel.offset}; rolling back to ${startOffset}`);
-            }
-            if (startOffset > 0) {
-                this._options.onStatus?.(`Resuming firmware transfer at ${startOffset} bytes...`);
-            }
-        }
-        this._options.onStatus?.('Transferring firmware image...');
-        this._options.onProgress?.({
-            object: 'firmware',
-            totalBytes: image.length,
-            currentBytes: startOffset,
-        });
-        for (let offset = startOffset; offset < image.length; offset += sel.maxSize) {
-            const chunk = image.subarray(offset, Math.min(offset + sel.maxSize, image.length));
-            let lastError = null;
-            let done = false;
-            for (let attempt = 1; attempt <= attempts && !done; attempt++) {
-                if (attempt > 1) {
-                    this._options.onLog?.(`re-sending object at ${offset} (attempt ${attempt} of ${attempts})`);
-                }
-                await this._request(SERIAL_DFU_OP.OBJECT_CREATE, [
-                    SERIAL_DFU_OBJECT_TYPE.DATA,
-                    ...u32le(chunk.length),
-                ]);
-                await this._writeData(chunk, 'firmware', image.length, offset);
-                const { offset: devOffset, crc } = await this._crcGet();
-                const expectedCrc = crc32(image.subarray(0, offset + chunk.length));
-                if (devOffset === offset + chunk.length && crc === expectedCrc) {
-                    await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
-                    done = true;
-                }
-                else {
-                    lastError = new Error(`Object CRC mismatch at ${offset} (device offset ${devOffset}, crc 0x${crc.toString(16)})`);
-                }
-            }
-            if (!done)
-                throw lastError ?? new Error(`Object transfer failed at ${offset}`);
-        }
-        this._options.onStatus?.('Firmware transfer complete.');
-    }
-    // ── plumbing ──────────────────────────────────────────────────────────────
-    async _writeData(data, object, totalBytes, baseOffset) {
-        const sliceSize = this.maxWriteSize;
-        for (let pos = 0; pos < data.length; pos += sliceSize) {
-            const slice = data.subarray(pos, Math.min(pos + sliceSize, data.length));
-            const frame = new Uint8Array(1 + slice.length);
-            frame[0] = SERIAL_DFU_OP.OBJECT_WRITE;
-            frame.set(slice, 1);
-            await this._transport.write(slipEncode(frame));
-            this._options.onProgress?.({
-                object,
-                totalBytes,
-                currentBytes: baseOffset + pos + slice.length,
-            });
-        }
-    }
-    async _select(objectType) {
-        const rsp = await this._request(SERIAL_DFU_OP.OBJECT_SELECT, [objectType]);
-        if (rsp.length < 12)
-            throw new Error('DFU select response too short');
-        return { maxSize: readU32le(rsp, 0), offset: readU32le(rsp, 4), crc: readU32le(rsp, 8) };
-    }
-    async _crcGet() {
-        const rsp = await this._request(SERIAL_DFU_OP.CRC_GET);
-        if (rsp.length < 8)
-            throw new Error('DFU CRC response too short');
-        return { offset: readU32le(rsp, 0), crc: readU32le(rsp, 4) };
-    }
-    _request(opcode, params = [], timeoutMs) {
-        if (this._pending) {
-            return Promise.reject(new Error('A DFU request is already pending'));
-        }
-        const effectiveTimeout = timeoutMs ?? this._options.requestTimeoutMs ?? VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS;
-        const frame = new Uint8Array(1 + params.length);
-        frame[0] = opcode;
-        frame.set(params instanceof Uint8Array ? params : Uint8Array.from(params), 1);
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                this._pending = null;
-                reject(new Error(`DFU ${opcodeName(opcode)} timed out after ${effectiveTimeout}ms`));
-            }, effectiveTimeout);
-            this._pending = {
-                opcode,
-                resolve: (payload) => {
-                    clearTimeout(timer);
-                    this._pending = null;
-                    resolve(payload);
-                },
-                reject: (error) => {
-                    clearTimeout(timer);
-                    this._pending = null;
-                    reject(error);
-                },
-            };
-            this._transport.write(slipEncode(frame)).catch((error) => {
-                this._pending?.reject(new Error(`DFU ${opcodeName(opcode)} write failed: ${error}`));
-            });
-        });
-    }
-    _onData(chunk) {
-        for (const frame of this._decoder.push(chunk)) {
-            const pending = this._pending;
-            if (!pending) {
-                this._options.onLog?.(`unexpected DFU frame (${frame.length} bytes) with no request`);
-                continue;
-            }
-            if (frame.length < 3 || frame[0] !== SERIAL_DFU_OP.RESPONSE || frame[1] !== pending.opcode) {
-                this._options.onLog?.(`ignoring DFU frame [${Array.from(frame.slice(0, 4))
-                    .map((b) => `0x${b.toString(16)}`)
-                    .join(', ')}...] while waiting for ${opcodeName(pending.opcode)}`);
-                continue;
-            }
-            const result = frame[2];
-            if (result === 0x01) {
-                pending.resolve(frame.subarray(3));
-                continue;
-            }
-            let message = SERIAL_DFU_RESULT_NAMES[result] ?? `Unknown result 0x${result.toString(16)}`;
-            if (result === 0x0b && frame.length >= 4) {
-                const ext = frame[3];
-                message = `${SERIAL_DFU_EXTENDED_ERROR_NAMES[ext] ?? `Extended error 0x${ext.toString(16)}`}`;
-            }
-            pending.reject(new Error(`DFU ${opcodeName(pending.opcode)} failed: ${message}`));
-        }
-    }
-}
-
-/**
  * Verisense calibration defaults, hardware/firmware gating, and timestamp helpers.
  *
  * The byte-level codec lives in `calibration.ts`; this module is the host-side
@@ -34344,5 +34991,5 @@ function shimmerFactoryTestReportToCsvRows(parsed, meta = {}) {
     return factoryTestReportToCsvRows(parsed, meta);
 }
 
-export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID$1 as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID$1 as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_LINK_CRC_MIN_FIRMWARE, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE, SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER3_STATUS_PAYLOAD_BYTES, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadCsvBlob, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isBmp581PresentPerSrNumber, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, keepsLinkCrcWhenSensingStops, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsBatteryRequest, shimmer3SupportsExg, shimmer3SupportsStatusRequest, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, statusPayloadBytesFor, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, twoByteCrcOverrunsStatusPush, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, IF820_OTA, IF820_OTA_COMMAND, IF820_OTA_DEFAULT_CHUNK_SIZE, IF820_OTA_MIN_CHUNK_SIZE, IF820_OTA_RESPONSE_TIMEOUT_MS, IF820_OTA_SERVICE_UUIDS, IF820_OTA_STATUS, IF820_OTA_TRANSIENT_ERROR_REGEX, IF820_OTA_VERIFY_TIMEOUT_MS, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID$1 as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID$1 as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, If820OtaError, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_LINK_CRC_MIN_FIRMWARE, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE, SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER3_STATUS_PAYLOAD_BYTES, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareIf820Versions, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadCsvBlob, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, hasSensorBit, hhmmToMinutesSinceMidnight, if820OtaStatusText, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isBmp581PresentPerSrNumber, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isIf820OtaTransientError, isIf820UpdateAvailable, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, keepsLinkCrcWhenSensingStops, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runIf820OtaUpdate, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsBatteryRequest, shimmer3SupportsExg, shimmer3SupportsStatusRequest, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, statusPayloadBytesFor, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, twoByteCrcOverrunsStatusPush, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map
