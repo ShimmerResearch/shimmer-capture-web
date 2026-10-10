@@ -3559,6 +3559,7 @@ console.log("\n--- one SDK copy, reached one way ---");
 const SDK_CONSUMERS = [
   "index.html",
   "common/brand-editor.js",
+  "common/bt-module-update.js",
   "common/calibration-editor.js",
   "common/device-clock.js",
   "common/factory-test-panel.js",
@@ -4297,6 +4298,7 @@ const MUST_EXPLAIN = {
     "brandBusy",
     "calibBusy",
     "testBusy",
+    "otaBusy",
   ],
   sdUnavailableReason: [
     "streaming",
@@ -4305,6 +4307,7 @@ const MUST_EXPLAIN = {
     "brandBusy",
     "calibBusy",
     "testBusy",
+    "otaBusy",
   ],
   brandUnavailableReason: [
     "streaming",
@@ -4313,6 +4316,7 @@ const MUST_EXPLAIN = {
     "sdBusy",
     "calibBusy",
     "testBusy",
+    "otaBusy",
   ],
   calibLinkHeldReason: [
     "streaming",
@@ -4321,6 +4325,7 @@ const MUST_EXPLAIN = {
     "sdBusy",
     "brandBusy",
     "testBusy",
+    "otaBusy",
   ],
   /* The self-test is the sixth holder, and the first that outlives its own
      Cancel: the firmware has no abort, so testBusy stays up while the sensor
@@ -4333,11 +4338,25 @@ const MUST_EXPLAIN = {
     "sdBusy",
     "brandBusy",
     "calibBusy",
+    "otaBusy",
   ],
   /* The drift monitor is the one panel that waits instead of closing, so its
      skip reason has to name every holder INCLUDING the self-test it shares a
      tab with -- a silent skip is indistinguishable from a dead monitor. */
   driftSampleSkipReason: [
+    "streaming",
+    "sdLogging",
+    "linkTesting",
+    "sdBusy",
+    "brandBusy",
+    "calibBusy",
+    "testBusy",
+    "otaBusy",
+  ],
+  /* The Bluetooth module update is the seventh holder. It names every other
+     one, and every other one names it, because it owns the link for the
+     longest of any of them: through the module's restart and the reconnect. */
+  btUpdateHeldReason: [
     "streaming",
     "sdLogging",
     "linkTesting",
@@ -5671,6 +5690,148 @@ check(
     wrap.deviceMs > 0,
   `sensor ${new Date(wrap.unixMs).toISOString()}, ` +
     `${((wrap.unixMs - wrap.hostMs) / 1000).toFixed(1)} s ahead of this host`,
+);
+
+// ===========================================================================
+console.log("\n--- Bluetooth module update (DEV-1164) ---");
+/* The mock link is not Web Bluetooth, so the page swaps the client's module
+   update for one that runs the SDK's real OTA protocol against a scripted
+   OTA service (`createMockIf820OtaDevice`). What this pass proves is the
+   page's side: when it offers the update, that the bundled image reaches the
+   module intact, and that the reconnect after the module's restart confirms
+   the new version. */
+const btLine = (v) =>
+  encodeURIComponent(
+    `CYW20820 app=v${v}, stack=0x00000000, protocol=0x0103, hardware=0x00`,
+  );
+const BT_PANEL = `
+  const P = () => document.getElementById('btUpdatePanel');
+  const waitFor = async (fn, ms) => {
+    for (let i = 0; i < ms / 100 && !fn(); i++)
+      await new Promise((r) => setTimeout(r, 100));
+    return fn();
+  };
+`;
+
+await goto(`${BASE}?mock=1`);
+check(
+  "connect with a current Bluetooth module",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btCurrent = await evaluate(`
+  ${BT_PANEL}
+  await new Promise((r) => setTimeout(r, 500));
+  return P().textContent;
+`);
+check(
+  "a module already on the bundled version is offered nothing",
+  btCurrent === "",
+  btCurrent.slice(0, 80) || "(panel empty)",
+);
+
+await goto(`${BASE}?mock=1&framed=0&btVersion=${btLine("01.04.16.16")}`);
+check(
+  "connect an older module over a serial-like link",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btSerial = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button'), 3000);
+  return { text: P().textContent, button: P().querySelector('button')?.textContent ?? null };
+`);
+check(
+  "off BLE, the update is offered as a reconnect over BLE",
+  /v1\.4\.18\.18/.test(btSerial.text) &&
+    /v1\.4\.16\.16/.test(btSerial.text) &&
+    /Reconnect over BLE/.test(btSerial.button ?? ""),
+  `${btSerial.button} | ${btSerial.text.slice(0, 90)}`,
+);
+
+await goto(`${BASE}?mock=1&btVersion=${btLine("01.04.16.16")}`);
+check("connect an older module over BLE", (await evaluate(CONNECT)) === "mock");
+const btRun = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary'), 3000);
+  const offered = P().textContent;
+  const manifest = await (await fetch('firmware/if820/manifest.json')).json();
+  const image = new Uint8Array(
+    await (await fetch('firmware/if820/' + manifest.file)).arrayBuffer(),
+  );
+  // The reconnect builds a new scripted module, so hold on to this one.
+  const dev = window.mockOtaDevice;
+  P().querySelector('button.primary').click();
+  let sawProgress = false;
+  let applyDuring = null;
+  await waitFor(() => {
+    if (P().querySelector('progress')) {
+      sawProgress = true;
+      if (applyDuring === null) applyDuring = document.getElementById('btnRefreshDevice').disabled;
+    }
+    return P().querySelector('.banner.ok, .banner.err');
+  }, 30000);
+  const got = dev.received();
+  let same = got.length === image.length;
+  for (let i = 0; same && i < got.length; i++) same = got[i] === image[i];
+  await new Promise((r) => setTimeout(r, 300));
+  return {
+    offered,
+    sawProgress,
+    refreshDisabledDuring: applyDuring,
+    result: P().textContent,
+    ok: !!P().querySelector('.banner.ok'),
+    same,
+    bytes: got.length,
+    commands: dev.commands.map((c) => c[0]),
+    idBt: document.getElementById('idBtModule').textContent,
+    pill: document.getElementById('connPill').textContent,
+  };
+`);
+check(
+  "an older module over BLE is offered the bundled version",
+  /available/.test(btRun.offered) && /v1\.4\.18\.18/.test(btRun.offered),
+  btRun.offered.slice(0, 90),
+);
+check(
+  "the update shows progress and holds the rest of the page off the link",
+  btRun.sawProgress && btRun.refreshDisabledDuring === true,
+  `progress ${btRun.sawProgress}, Refresh disabled ${btRun.refreshDisabledDuring}`,
+);
+check(
+  "the module receives the bundled image byte for byte, then VERIFY",
+  btRun.same && btRun.commands.join(",") === "1,2,3",
+  `${btRun.bytes} bytes, commands ${btRun.commands.join(",")}`,
+);
+check(
+  "after the restart the page reconnects and confirms the new version",
+  btRun.ok && /v1\.4\.18\.18/.test(btRun.idBt) && /mock/.test(btRun.pill),
+  `${btRun.result.slice(0, 60)} | ${btRun.idBt} | ${btRun.pill}`,
+);
+
+await goto(`${BASE}?mock=1&otaFail=1&btVersion=${btLine("01.04.16.16")}`);
+check(
+  "connect an older module whose update will fail",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btFail = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary'), 3000);
+  P().querySelector('button.primary').click();
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 30000);
+  return {
+    text: P().textContent,
+    err: !!P().querySelector('.banner.err'),
+    idBt: document.getElementById('idBtModule').textContent,
+    pill: document.getElementById('connPill').textContent,
+    refresh: document.getElementById('btnRefreshDevice').disabled,
+  };
+`);
+check(
+  "a refused image is reported, the old version stays, and the link is free again",
+  btFail.err &&
+    /verification failed/.test(btFail.text) &&
+    /v1\.4\.16\.16/.test(btFail.idBt) &&
+    btFail.refresh === false,
+  `${btFail.text.slice(0, 70)} | ${btFail.idBt} | Refresh disabled ${btFail.refresh}`,
 );
 
 // ===========================================================================

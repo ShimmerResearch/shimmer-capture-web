@@ -1,0 +1,9 @@
+{
+  "version": "1.4.18.18",
+  "file": "20251116_ezserial_app_VELA-IF820-INT-ANT-EVK_141818_v1.4.18.18.ota.bin",
+  "bytes": 103228,
+  "crc32": "0xeddcaf10",
+  "module": "Ezurio Vela IF820 (Infineon CYW20820), EZ-Serial",
+  "variant": "INT-ANT",
+  "released": "2025-11-16"
+}

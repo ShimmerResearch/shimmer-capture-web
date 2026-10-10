@@ -40,6 +40,7 @@ import {
   parseBrandRecord,
   sdCrc16,
   appendCrc,
+  crc32,
 } from "../../vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------
@@ -2824,4 +2825,159 @@ function concat(a, b) {
 /** `len` bytes of `buf` from `at`, as ASCII — how card paths arrive. */
 function ascii(buf, at, len) {
   return String.fromCharCode(...buf.subarray(at, at + len));
+}
+
+// ---------------------------------------------------------------------------
+// The Bluetooth module's OTA service (DEV-1164)
+// ---------------------------------------------------------------------------
+
+/* Infineon's OTA firmware upgrade GATT service, as the module answers it.
+   Repeated here, like the LiteProtocol constants above, so this file reads as
+   the device side of the wire. */
+const IF820_OTA_UUID = Object.freeze({
+  SERVICE: "ae5d1e47-5c13-43a0-8635-82ad38a1381f",
+  CONTROL_POINT: "a3dd50bf-f7a7-4e99-838e-570a086c661b",
+  DATA: "a2e86c7a-d961-4091-b74f-2409e72efe26",
+});
+const OTA_CMD = Object.freeze({ PREPARE: 1, DOWNLOAD: 2, VERIFY: 3, ABORT: 7 });
+const OTA_STATUS = Object.freeze({ OK: 0, UNSUPPORTED: 1, VERIFY_FAILED: 3 });
+
+/**
+ * A stand-in for the `BluetoothDevice` a real BLE link would carry, exposing
+ * only the module's OTA service — enough for `runIf820OtaUpdate` to run end to
+ * end against the mock sensor.
+ *
+ * The mock link itself is a LoopbackTransport, not Web Bluetooth, so the
+ * SDK's own `updateBtModuleFirmware` refuses it; the page swaps that method
+ * for one that drives this device instead (see `setUpMock` in index.html).
+ *
+ * @param {object} [opts]
+ * @param {number} [opts.byteDelayMs=0] pause per data write, so a progress
+ *   bar is visible while developing
+ * @param {boolean} [opts.failVerify=false] answer VERIFY with
+ *   VERIFICATION_FAILED, which is how a corrupt transfer looks
+ * @param {(image: Uint8Array) => void} [opts.onVerified] called after a good
+ *   VERIFY, which is when a real module resets onto the new image
+ * @returns {{gatt: object, received: () => Uint8Array, commands: number[][]}}
+ */
+export function createMockIf820OtaDevice(opts = {}) {
+  const commands = [];
+  let received = [];
+  let expected = 0;
+  let connected = true;
+  const listeners = new Set();
+
+  const control = {
+    value: null,
+    async startNotifications() {
+      return control;
+    },
+    addEventListener(_t, l) {
+      listeners.add(l);
+    },
+    removeEventListener(_t, l) {
+      listeners.delete(l);
+    },
+    async writeValueWithResponse(value) {
+      const bytes = new Uint8Array(
+        value.buffer ?? value,
+        value.byteOffset ?? 0,
+        value.byteLength,
+      );
+      commands.push([...bytes]);
+      const answer = (status) =>
+        setTimeout(() => {
+          control.value = new DataView(Uint8Array.of(status).buffer);
+          for (const l of listeners) l({ target: control });
+        }, 0);
+      const param =
+        bytes.length >= 5
+          ? new DataView(bytes.buffer, bytes.byteOffset).getUint32(1, true)
+          : 0;
+      switch (bytes[0]) {
+        case OTA_CMD.PREPARE:
+          received = [];
+          answer(OTA_STATUS.OK);
+          break;
+        case OTA_CMD.DOWNLOAD:
+          expected = param;
+          answer(OTA_STATUS.OK);
+          break;
+        case OTA_CMD.VERIFY: {
+          const image = Uint8Array.from(received);
+          const ok =
+            !opts.failVerify &&
+            image.length === expected &&
+            crc32(image) >>> 0 === param;
+          answer(ok ? OTA_STATUS.OK : OTA_STATUS.VERIFY_FAILED);
+          if (ok) setTimeout(() => opts.onVerified?.(image), 20);
+          break;
+        }
+        case OTA_CMD.ABORT:
+          received = [];
+          break;
+        default:
+          answer(OTA_STATUS.UNSUPPORTED);
+      }
+    },
+  };
+
+  const data = {
+    value: null,
+    async startNotifications() {
+      return data;
+    },
+    addEventListener() {},
+    removeEventListener() {},
+    async writeValueWithResponse(value) {
+      const bytes = new Uint8Array(
+        value.buffer ?? value,
+        value.byteOffset ?? 0,
+        value.byteLength,
+      );
+      if (opts.byteDelayMs)
+        await new Promise((r) => setTimeout(r, opts.byteDelayMs));
+      received.push(...bytes);
+    },
+  };
+
+  const gatt = {
+    get connected() {
+      return connected;
+    },
+    async connect() {
+      connected = true;
+      return gatt;
+    },
+    async getPrimaryService(uuid) {
+      if (uuid !== IF820_OTA_UUID.SERVICE) {
+        const e = new Error("No Services matching UUID found in Device.");
+        e.name = "NotFoundError";
+        throw e;
+      }
+      return {
+        async getCharacteristic(c) {
+          if (c === IF820_OTA_UUID.CONTROL_POINT) return control;
+          if (c === IF820_OTA_UUID.DATA) return data;
+          throw new Error(`no characteristic ${c}`);
+        },
+      };
+    },
+  };
+
+  return { gatt, commands, received: () => Uint8Array.from(received) };
+}
+
+/**
+ * The line the Shimmer3R firmware composes for GET_BT_VERSION_STR from a
+ * dotted module version (`1.4.18.18` → `CYW20820 app=v01.04.18.18, …`), so a
+ * mock module can report the image it was just "updated" to.
+ *
+ * @param {string} version
+ */
+export function mockCyw20820VersionLine(version) {
+  const parts = String(version)
+    .split(".")
+    .map((n) => String(Number(n) || 0).padStart(2, "0"));
+  return `CYW20820 app=v${parts.join(".")}, stack=0x00000000, protocol=0x0000, hardware=0x00`;
 }

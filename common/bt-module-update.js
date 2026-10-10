@@ -1,0 +1,517 @@
+/**
+ * Bluetooth module update: offer the one IF820 firmware this site carries to
+ * a Shimmer3R whose module is older, and run it over BLE (DEV-1164).
+ *
+ * Deliberately narrow. The site holds exactly one image, described by
+ * `firmware/if820/manifest.json`; there is no version picker and no file
+ * picker, so a customer can only ever move a module forward to the release
+ * we chose. Bench work with other images (downgrades, Infineon test builds)
+ * stays on WsOtaUpgrade.
+ *
+ * How the update reaches the module: the Shimmer3R's MCU cannot reflash it,
+ * so the page talks to the module's own OTA service over the BLE connection
+ * the sensor is already on (`Shimmer3RClient.updateBtModuleFirmware`). That
+ * service is only reachable over BLE, so on a Classic Bluetooth or USB link
+ * the panel offers to reconnect over BLE instead — one device-picker click.
+ *
+ * What happens at the end: once the module has verified the image it resets
+ * onto it, and the link drops. The SDK arms reboot-on-disconnect first, so
+ * the MCU reboots on that drop too and re-reads the module version, which it
+ * only reads at boot. The panel then reconnects to the same BluetoothDevice
+ * without a picker, and the page's normal post-connect read confirms the new
+ * version.
+ *
+ * An update that is interrupted before the module verifies the image leaves
+ * the old firmware running, so a failure is never a dead sensor; the prompt
+ * simply comes back on the next connect.
+ *
+ * Nothing here touches `document` at import time.
+ *
+ *   import { createBtModuleUpdate } from "./common/bt-module-update.js";
+ */
+
+import { el } from "./ui-chrome.js";
+/* The whole namespace, so a vendored bundle that predates the OTA exports
+   degrades to a panel that never offers anything, instead of an import error
+   that takes the page down. */
+import * as sdk from "../vendor/shimmer-web-sdk.esm.js";
+
+/** Where the one bundled image is described. Relative to the page. */
+export const BT_MODULE_MANIFEST_URL = "firmware/if820/manifest.json";
+
+/** After VERIFY the module resets on its own; give it this long to drop the
+ * link before the page drops it itself. */
+const DROP_WAIT_MS = 15000;
+/** Then let the module and the MCU boot before the first reconnect. */
+const BOOT_WAIT_MS = 3000;
+const RECONNECT_ATTEMPTS = 5;
+const RECONNECT_GAP_MS = 3000;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function asGetter(value, fallback = null) {
+  if (typeof value === "function") return value;
+  return () => value ?? fallback;
+}
+
+/**
+ * Load and sanity-check the manifest. Resolves null when the site carries no
+ * image (404) so a deployment without one simply never prompts.
+ *
+ * @param {string} url
+ * @returns {Promise<{version: string, file: string, bytes: number, crc32: number, url: string}|null>}
+ */
+export async function loadBtModuleManifest(url = BT_MODULE_MANIFEST_URL) {
+  const res = await fetch(url, { cache: "no-cache" });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`manifest ${url}: HTTP ${res.status}`);
+  const m = await res.json();
+  const crc =
+    typeof m.crc32 === "string" ? Number.parseInt(m.crc32, 16) : m.crc32;
+  if (
+    typeof m.version !== "string" ||
+    !/^\d+(\.\d+){3}$/.test(m.version) ||
+    typeof m.file !== "string" ||
+    !Number.isInteger(m.bytes) ||
+    !Number.isInteger(crc)
+  ) {
+    throw new Error(`manifest ${url} is missing version, file, bytes or crc32`);
+  }
+  return {
+    ...m,
+    crc32: crc >>> 0,
+    url: new URL(m.file, new URL(url, location.href)).href,
+  };
+}
+
+/**
+ * Mount the panel inside `host`. It stays empty (and so invisible) until
+ * {@link check} finds an older IF820.
+ *
+ * @param {HTMLElement} host
+ * @param {object} opts
+ * @param {() => object|null} opts.client getter for the connected client
+ * @param {() => string|null} opts.mode getter: `"ble"`, `"rfcomm"` or `"usb"`
+ * @param {{log: Function, warn: Function, error: Function}} opts.log
+ * @param {(message: string, kind?: string) => void} [opts.toast]
+ * @param {() => string|null} opts.linkHeldReason the page's reason the link
+ *   cannot be given to an update right now (streaming, another panel busy),
+ *   or null
+ * @param {(busy: boolean) => void} opts.onBusyChange raises the page's busy
+ *   flag for the whole update, reconnect included
+ * @param {() => Promise<boolean>} opts.switchToBle disconnect the current
+ *   (non-BLE) link and connect over BLE with the device picker
+ * @param {(device: BluetoothDevice|null) => Promise<boolean>} opts.reconnectBle
+ *   connect over BLE to `device` without a picker (null on the mock link,
+ *   which has no BluetoothDevice and reconnects its own way)
+ * @param {() => Promise<void>} opts.disconnect close the live link
+ * @param {string} [opts.manifestUrl]
+ */
+export function createBtModuleUpdate(host, opts) {
+  const getClient = asGetter(opts.client);
+  const getMode = asGetter(opts.mode);
+  const log = opts.log ?? console;
+  const toast = opts.toast ?? (() => {});
+  const manifestUrl = opts.manifestUrl ?? BT_MODULE_MANIFEST_URL;
+  const supported =
+    typeof sdk.isIf820UpdateAvailable === "function" &&
+    typeof sdk.crc32 === "function";
+
+  /** @type {Awaited<ReturnType<typeof loadBtModuleManifest>>|undefined} */
+  let manifest;
+  let manifestError = null;
+  /** The image, fetched once and CRC-checked against the manifest. */
+  let imageCache = null;
+  /**
+   * idle | available | updating | restarting | done | failed
+   * `restarting` survives the disconnect the update itself causes.
+   */
+  let phase = "idle";
+  let current = null;
+  let enabled = true;
+  let busy = false;
+  let abort = null;
+  let progress = { currentBytes: 0, totalBytes: 0 };
+  let statusText = "";
+  let failure = "";
+  /** The BluetoothDevice the update ran on, for the picker-less reconnect. */
+  let device = null;
+  /** The whole image is sent, so a drop from here on is most likely the
+   * module restarting on it rather than a failure. */
+  let transferDone = false;
+  /** Resolves when the link drops after VERIFY. */
+  let dropped = null;
+  let markDropped = null;
+
+  function setBusy(on) {
+    if (busy === on) return;
+    busy = on;
+    opts.onBusyChange?.(on);
+  }
+
+  async function ensureManifest() {
+    if (manifest !== undefined) return manifest;
+    try {
+      manifest = await loadBtModuleManifest(manifestUrl);
+    } catch (e) {
+      manifest = null;
+      manifestError = e?.message ?? String(e);
+      log.warn?.(`Bluetooth module update unavailable: ${manifestError}`);
+    }
+    return manifest;
+  }
+
+  async function loadImage() {
+    if (imageCache) return imageCache;
+    const res = await fetch(manifest.url, { cache: "no-cache" });
+    if (!res.ok) throw new Error(`firmware image: HTTP ${res.status}`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const crc = sdk.crc32(bytes) >>> 0;
+    if (bytes.length !== manifest.bytes || crc !== manifest.crc32) {
+      throw new Error(
+        `firmware image does not match its manifest (${bytes.length} bytes, ` +
+          `crc32 0x${crc.toString(16).padStart(8, "0")}) — not sent`,
+      );
+    }
+    imageCache = bytes;
+    return bytes;
+  }
+
+  // -------------------------------------------------------------------------
+  // Rendering
+  // -------------------------------------------------------------------------
+
+  function render() {
+    host.replaceChildren();
+    if (phase === "idle") return;
+    const target = manifest?.version;
+    const from = current?.version;
+
+    if (phase === "available") {
+      const onBle = getMode() === "ble";
+      const held = opts.linkHeldReason?.() ?? null;
+      const button = onBle
+        ? el(
+            "button",
+            {
+              type: "button",
+              class: "primary",
+              disabled: !enabled || !!held || null,
+              title: held ?? null,
+              onclick: () => void runUpdate(),
+            },
+            "Update Bluetooth firmware",
+          )
+        : el(
+            "button",
+            {
+              type: "button",
+              disabled: !enabled || !!held || null,
+              title: held ?? null,
+              onclick: () => void switchLink(),
+            },
+            "Reconnect over BLE to update",
+          );
+      host.append(
+        el(
+          "div",
+          { class: "banner info bt-update" },
+          el(
+            "div",
+            {},
+            el("strong", {}, "A Bluetooth firmware update is available"),
+            ` — v${target} (this sensor has v${from}).`,
+          ),
+          el(
+            "div",
+            { class: "muted" },
+            onBle
+              ? "Takes about a minute. Keep the sensor close and charged; it restarts at the end and this page reconnects to it."
+              : "The Bluetooth module can only be updated over BLE. Reconnecting opens the device picker once.",
+          ),
+          held ? el("div", { class: "muted" }, held) : null,
+          el("div", { class: "row" }, button),
+        ),
+      );
+      return;
+    }
+
+    if (phase === "updating" || phase === "restarting") {
+      const pct = progress.totalBytes
+        ? Math.floor((100 * progress.currentBytes) / progress.totalBytes)
+        : 0;
+      host.append(
+        el(
+          "div",
+          { class: "banner warn bt-update" },
+          el(
+            "div",
+            {},
+            el("strong", {}, "Updating the Bluetooth module"),
+            ` to v${target} — do not close this page or switch the sensor off.`,
+          ),
+          el("progress", {
+            class: "sd-progress",
+            max: "100",
+            value: String(phase === "restarting" ? 100 : pct),
+          }),
+          el("div", { class: "muted", id: "btUpdateStatus" }, statusText),
+          phase === "updating"
+            ? el(
+                "div",
+                { class: "row" },
+                el(
+                  "button",
+                  { type: "button", onclick: () => abort?.abort() },
+                  "Cancel",
+                ),
+              )
+            : null,
+        ),
+      );
+      return;
+    }
+
+    if (phase === "done") {
+      host.append(
+        el(
+          "div",
+          { class: "banner ok bt-update" },
+          `Bluetooth module updated to v${current?.version ?? target}.`,
+        ),
+      );
+      return;
+    }
+
+    if (phase === "failed") {
+      host.append(
+        el(
+          "div",
+          { class: "banner err bt-update" },
+          el(
+            "div",
+            {},
+            el("strong", {}, "Bluetooth module update failed: "),
+            failure,
+          ),
+          el(
+            "div",
+            { class: "muted" },
+            "The module keeps its previous firmware until an update completes, so the sensor still works. Reconnect over BLE to try again.",
+          ),
+        ),
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Actions
+  // -------------------------------------------------------------------------
+
+  async function switchLink() {
+    log.log?.("Bluetooth module update: reconnecting over BLE");
+    await opts.switchToBle();
+  }
+
+  async function runUpdate() {
+    const client = getClient();
+    if (!client || phase !== "available" || busy) return;
+    if (getMode() !== "ble") return;
+    const held = opts.linkHeldReason?.();
+    if (held) {
+      toast(held, "warn");
+      return;
+    }
+    if (typeof client.updateBtModuleFirmware !== "function") {
+      toast("This SDK bundle cannot update the Bluetooth module", "err");
+      return;
+    }
+
+    phase = "updating";
+    progress = { currentBytes: 0, totalBytes: manifest.bytes };
+    statusText = "Downloading the firmware image…";
+    failure = "";
+    transferDone = false;
+    device = client.device ?? null;
+    abort = new AbortController();
+    dropped = new Promise((r) => (markDropped = r));
+    setBusy(true);
+    render();
+
+    const started = performance.now();
+    try {
+      const image = await loadImage();
+      log.log?.(
+        `Bluetooth module update: v${current?.version} → v${manifest.version} ` +
+          `(${manifest.file}, ${image.length} bytes)`,
+      );
+      const result = await client.updateBtModuleFirmware(image, {
+        signal: abort.signal,
+        onStatus: (m) => {
+          statusText = m;
+          log.log?.(`Bluetooth module update: ${m}`);
+          render();
+        },
+        onLog: (m) => log.log?.(`[if820 ota] ${m}`),
+        onProgress: (p) => {
+          progress = p;
+          transferDone = p.totalBytes > 0 && p.currentBytes >= p.totalBytes;
+          const bar = host.querySelector("progress");
+          if (bar && p.totalBytes) {
+            bar.value = Math.floor((100 * p.currentBytes) / p.totalBytes);
+          }
+        },
+      });
+      log.log?.(
+        `Bluetooth module accepted the image in ` +
+          `${((performance.now() - started) / 1000).toFixed(1)} s ` +
+          `(${result.chunkSize}-byte chunks, crc32 0x${result.crc32.toString(16)})`,
+      );
+    } catch (e) {
+      abort = null;
+      device = null;
+      const cancelled = e?.name === "AbortError";
+      failure = cancelled ? "cancelled" : (e?.message ?? String(e));
+      log[cancelled ? "warn" : "error"]?.(
+        `Bluetooth module update ${cancelled ? "cancelled" : "failed"}: ${failure}`,
+      );
+      phase = cancelled ? "available" : "failed";
+      setBusy(false);
+      render();
+      return;
+    }
+
+    abort = null;
+    phase = "restarting";
+    statusText = "The module is restarting on the new firmware…";
+    render();
+    await restartAndReconnect();
+  }
+
+  async function restartAndReconnect() {
+    /* The module resets itself after VERIFY. If the link is somehow still up
+       after a generous wait, drop it from this side: the MCU's
+       reboot-on-disconnect needs a disconnect either way. */
+    const timedOut = await Promise.race([
+      dropped.then(() => false),
+      sleep(DROP_WAIT_MS).then(() => true),
+    ]);
+    if (timedOut && getClient()) {
+      log.warn?.(
+        "the module did not drop the link after the update; disconnecting",
+      );
+      await opts.disconnect();
+    }
+    await sleep(BOOT_WAIT_MS);
+
+    for (let i = 1; i <= RECONNECT_ATTEMPTS && phase === "restarting"; i++) {
+      statusText = `Reconnecting to the sensor (attempt ${i} of ${RECONNECT_ATTEMPTS})…`;
+      render();
+      /* The page's afterConnect runs inside this and calls check(), which is
+         what moves the phase on to done or failed. `device` is the sensor the
+         update ran on; the page reconnects to it without the picker. */
+      if (await opts.reconnectBle(device)) {
+        /* check() is not awaited by the page, so give it a moment to land. */
+        for (let w = 0; w < 50 && phase === "restarting"; w++) await sleep(100);
+        break;
+      }
+      await sleep(RECONNECT_GAP_MS);
+    }
+    if (phase === "restarting") {
+      failure =
+        "the sensor did not come back after the update. Switch it off and on, then reconnect over BLE — the new version shows once it has restarted.";
+      phase = "failed";
+      render();
+    }
+    device = null;
+    setBusy(false);
+  }
+
+  // -------------------------------------------------------------------------
+  // Page hooks
+  // -------------------------------------------------------------------------
+
+  /**
+   * Decide what to show for a freshly read module version. Called from the
+   * page's post-connect identity read, including the reconnect after an
+   * update, which is how a finished update is confirmed.
+   *
+   * @param {object|null} btModule `readBtModuleVersion()`'s result
+   */
+  async function check(btModule) {
+    current = btModule ?? null;
+    if (!supported) return;
+    const m = await ensureManifest();
+
+    if (phase === "restarting") {
+      if (m && current?.family === "cyw20820" && current.version) {
+        const newer = sdk.compareIf820Versions(current.version, m.version) >= 0;
+        phase = newer ? "done" : "failed";
+        if (newer) {
+          log.log?.(`Bluetooth module now reports v${current.version}`);
+          toast(`Bluetooth module updated to v${current.version}`, "ok");
+        } else {
+          failure =
+            `the module accepted the update but the sensor still reports v${current.version}. ` +
+            "Switch the sensor off and on; it reads the module version only when it starts.";
+        }
+      } else {
+        phase = "failed";
+        failure =
+          "the sensor did not report its Bluetooth module version after restarting";
+      }
+      render();
+      return;
+    }
+
+    if (busy) return;
+    phase =
+      m && sdk.isIf820UpdateAvailable(current, m.version)
+        ? "available"
+        : "idle";
+    if (phase === "available") {
+      log.log?.(
+        `Bluetooth module firmware v${m.version} is available (sensor has v${current.version})`,
+      );
+    }
+    render();
+  }
+
+  /** The link went away. An update's own restart is expected and kept. */
+  function onDisconnected() {
+    markDropped?.();
+    if (phase === "restarting") return;
+    if (phase === "updating") {
+      /* The SDK call rejects on its own when the link drops; this just
+         stops a stale "available" from being shown meanwhile. */
+      return;
+    }
+    if (phase !== "failed" && phase !== "done") phase = "idle";
+    current = null;
+    render();
+  }
+
+  return {
+    check,
+    onDisconnected,
+    /** Page-level floor (connected, not streaming, no other panel busy). */
+    setEnabled(on) {
+      enabled = !!on;
+      if (phase === "available") render();
+    },
+    get busy() {
+      return busy;
+    },
+    get phase() {
+      return phase;
+    },
+    /** True when a link drop now is the expected end of an update: the
+     * module restarting on the image it has just been sent. */
+    get restartExpected() {
+      return phase === "restarting" || (phase === "updating" && transferDone);
+    },
+    get manifestError() {
+      return manifestError;
+    },
+  };
+}
