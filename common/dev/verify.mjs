@@ -5858,6 +5858,33 @@ check(
   btStall.errToast ? "a 'disconnected' toast was shown" : "no disconnect toast",
 );
 
+/* The bench case: the first reconnect after the update reaches a sensor
+   whose MCU has not rebooted onto the module yet, so it still reports the
+   old version. The panel must keep asking, not fail on the first answer. */
+await goto(`${BASE}?mock=1&otaLate=1&btVersion=${btLine("01.04.16.16")}`);
+check(
+  "connect an older module whose sensor restarts late",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btLate = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary'), 3000);
+  P().querySelector('button.primary').click();
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 60000);
+  const lines = [...document.querySelectorAll('#log .log-line')].map((l) => l.textContent);
+  return {
+    ok: !!P().querySelector('.banner.ok'),
+    text: P().textContent,
+    waited: lines.some((l) => /still reports Bluetooth module v1\.4\.16\.16; waiting/.test(l)),
+    idBt: document.getElementById('idBtModule').textContent,
+  };
+`);
+check(
+  "a sensor that first reports the old version is waited for, not failed",
+  btLate.ok && btLate.waited && /v1\.4\.18\.18/.test(btLate.idBt),
+  `${btLate.text.slice(0, 50)} | waited ${btLate.waited} | ${btLate.idBt}`,
+);
+
 await goto(`${BASE}?mock=1&otaFail=1&btVersion=${btLine("01.04.16.16")}`);
 check(
   "connect an older module whose update will fail",

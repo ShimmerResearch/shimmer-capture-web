@@ -1619,6 +1619,12 @@
        * a real module's new firmware does.
        */
       let mockBtVersionAfterUpdate = null;
+      /**
+       * Mock link only, `&otaLate=1`: connects still to report the OLD module
+       * version after an update, as a real sensor does while its MCU has not
+       * yet rebooted onto the module (bench, 2026-10-11).
+       */
+      let mockConnectsBeforeNewVersion = 0;
 
       // =====================================================================
       // Small helpers
@@ -4814,6 +4820,10 @@
           return;
         }
         await tryDevice("enable the link CRC", () => client.setCrcMode(want));
+        /* The link can drop while this waits - a sensor restarting under a
+           reconnect does exactly that - and the disconnect handler clears
+           `client`; there is then nothing to read back. */
+        if (!client) return;
         /* Read back from the client rather than from the call: `crcMode` only
                  advances on a successful ACK, so this cannot end up expecting bytes
                  the device is not sending. */
@@ -5370,7 +5380,10 @@
             factoryTest,
             rtc,
             srBoard,
-            btVersion: mockBtVersionAfterUpdate ?? btVersion,
+            btVersion:
+              mockBtVersionAfterUpdate && mockConnectsBeforeNewVersion-- <= 0
+                ? mockBtVersionAfterUpdate
+                : btVersion,
             pressure,
             sensors,
             debug: params.get("debug") === "1",
@@ -5426,6 +5439,8 @@
               await fetch("firmware/if820/manifest.json")
             ).json();
             mockBtVersionAfterUpdate = mockCyw20820VersionLine(m.version);
+            mockConnectsBeforeNewVersion =
+              params.get("otaLate") === "1" ? 1 : 0;
             return result;
           };
           btn.disabled = true;

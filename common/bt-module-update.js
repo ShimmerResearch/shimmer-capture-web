@@ -48,8 +48,19 @@ const DROP_WAIT_MS = 15000;
 /** Then let the module switch images and the MCU reboot and set it up again
  * (about 10-20 s on the bench) before the first reconnect. */
 const BOOT_WAIT_MS = 8000;
-const RECONNECT_ATTEMPTS = 10;
+/**
+ * How long to keep reconnecting until the sensor reports the new version.
+ * On the bench (Chrome, 2026-10-11) the module was back and advertising before
+ * the MCU had rebooted onto it, so the first reconnect reached a sensor whose
+ * MCU could not answer yet, and the MCU's reboot then dropped that link: one
+ * successful connect is not the end of it. Firmware without DEV-1164 never
+ * reboots by itself, and then this runs out and the panel asks for a
+ * power-cycle.
+ */
+const RECONNECT_BUDGET_MS = 90000;
 const RECONNECT_GAP_MS = 4000;
+/** After a reconnect, how long the page's identity read may take to land. */
+const VERSION_WAIT_MS = 8000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -160,6 +171,8 @@ export function createBtModuleUpdate(host, opts) {
   let dropWaiters = [];
   /** Stop listening for drops on the update's BluetoothDevice. */
   let unlistenDevice = null;
+  /** The module version the sensor last reported while restarting. */
+  let lastSeenVersion = null;
 
   function noteDrop() {
     drops++;
@@ -366,6 +379,7 @@ export function createBtModuleUpdate(host, opts) {
     failure = "";
     transferDone = false;
     linkMayDrop = true;
+    lastSeenVersion = null;
     drops = 0;
     retryDrops = 0;
     dropWaiters = [];
@@ -469,22 +483,42 @@ export function createBtModuleUpdate(host, opts) {
     }
     await sleep(BOOT_WAIT_MS);
 
-    for (let i = 1; i <= RECONNECT_ATTEMPTS && phase === "restarting"; i++) {
-      statusText = `Reconnecting to the sensor (attempt ${i} of ${RECONNECT_ATTEMPTS})…`;
+    const deadline = Date.now() + RECONNECT_BUDGET_MS;
+    for (let i = 1; phase === "restarting" && Date.now() < deadline; i++) {
+      statusText = `Reconnecting to the sensor (attempt ${i})…`;
       render();
-      /* The page's afterConnect runs inside this and calls check(), which is
-         what moves the phase on to done or failed. `device` is the sensor the
-         update ran on; the page reconnects to it without the picker. */
+      /* The page's afterConnect runs inside this and calls check(), which
+         moves the phase on to done once the new version is reported. `device`
+         is the sensor the update ran on; the page reconnects to it without
+         the picker. */
       if (await opts.reconnectBle(device)) {
-        /* check() is not awaited by the page, so give it a moment to land. */
-        for (let w = 0; w < 50 && phase === "restarting"; w++) await sleep(100);
-        break;
+        /* check() is not awaited by the page, so give it time to land. */
+        for (
+          let w = 0;
+          w < VERSION_WAIT_MS / 100 && phase === "restarting";
+          w++
+        ) {
+          await sleep(100);
+        }
+        if (phase !== "restarting") break;
+        /* Connected, but the new version was not read: the MCU had not
+           rebooted onto the module yet (it may not answer at all, or still
+           report the old version), or the link dropped mid-read. Let go and
+           ask again shortly. */
+        if (getClient()) await opts.disconnect();
+        statusText = lastSeenVersion
+          ? `The sensor still reports v${lastSeenVersion}; waiting for it to restart…`
+          : "Waiting for the sensor to finish restarting…";
+        render();
       }
       await sleep(RECONNECT_GAP_MS);
     }
     if (phase === "restarting") {
-      failure =
-        "the sensor did not come back after the update. Switch it off and on, then reconnect over BLE — the new version shows once it has restarted.";
+      failure = lastSeenVersion
+        ? `the module accepted the update, but the sensor still reports v${lastSeenVersion}. ` +
+          "Switch it off and on: it reads the module version only when it starts. " +
+          "If it still reports the old version after that, run the update again."
+        : "the sensor did not come back after the update. Switch it off and on, then reconnect over BLE — the new version shows once it has restarted.";
       phase = "failed";
       render();
     }
@@ -509,23 +543,22 @@ export function createBtModuleUpdate(host, opts) {
     const m = await ensureManifest();
 
     if (phase === "restarting") {
+      /* Only the new version ends the wait. An old one, or none, is a sensor
+         that has not rebooted onto the module yet; restartAndReconnect keeps
+         asking until its budget runs out. */
       if (m && current?.family === "cyw20820" && current.version) {
-        const newer = sdk.compareIf820Versions(current.version, m.version) >= 0;
-        phase = newer ? "done" : "failed";
-        if (newer) {
+        if (sdk.compareIf820Versions(current.version, m.version) >= 0) {
+          phase = "done";
           log.log?.(`Bluetooth module now reports v${current.version}`);
           toast(`Bluetooth module updated to v${current.version}`, "ok");
-        } else {
-          failure =
-            `the module accepted the update but the sensor still reports v${current.version}. ` +
-            "Switch the sensor off and on; it reads the module version only when it starts.";
+          render();
+          return;
         }
-      } else {
-        phase = "failed";
-        failure =
-          "the sensor did not report its Bluetooth module version after restarting";
+        lastSeenVersion = current.version;
+        log.log?.(
+          `the sensor still reports Bluetooth module v${current.version}; waiting for it to restart`,
+        );
       }
-      render();
       return;
     }
 
