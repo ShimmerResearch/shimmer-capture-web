@@ -191,10 +191,14 @@ decides when to offer it.
   the reconnect, as `otaBusy`. Every other panel's refusal reason names it,
   and `btUpdateHeldReason` names all of theirs. The verify pass checks both.
 - **The end of an update is a disconnect.** The module resets onto the new
-  image once it has verified it. The SDK arms reboot-on-disconnect first, so
-  the MCU reboots too and re-reads the module version, which it only reads at
-  boot. The panel reconnects to the same `BluetoothDevice` without the picker,
-  and the normal post-connect read confirms the new version.
+  image once it has verified it. Shimmer3R firmware with DEV-1164 then
+  reboots its MCU once the module is back, which re-reads the module version
+  (it is only read at boot). The panel reconnects to the same
+  `BluetoothDevice` without the picker, and the normal post-connect read
+  confirms the new version; older firmware needs a power-cycle first.
+  Nothing arms reboot-on-disconnect: rebooting the MCU on the post-VERIFY
+  drop cuts the module's power while it is switching images, and it comes back
+  on the old one.
 - **Large writes first.** The SDK starts at 512-byte writes (about 8 s per
   image) and, if the module does not answer the first one, drops and re-opens
   the link and carries on at 63 bytes (about 30 s). The panel watches the

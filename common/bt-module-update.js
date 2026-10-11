@@ -15,11 +15,14 @@
  * the panel offers to reconnect over BLE instead — one device-picker click.
  *
  * What happens at the end: once the module has verified the image it resets
- * onto it, and the link drops. The SDK arms reboot-on-disconnect first, so
- * the MCU reboots on that drop too and re-reads the module version, which it
- * only reads at boot. The panel then reconnects to the same BluetoothDevice
- * without a picker, and the page's normal post-connect read confirms the new
- * version.
+ * onto it, and the link drops. Shimmer3R firmware with DEV-1164 then reboots
+ * its MCU once the module is back, which re-reads the module version (it is
+ * only read at boot); the panel reconnects to the same BluetoothDevice without
+ * a picker, and the page's normal post-connect read confirms the new version.
+ * Older firmware needs a power-cycle first, which the panel says when the
+ * sensor does not come back or still reports the old version. Nothing arms
+ * reboot-on-disconnect: rebooting the MCU on the post-VERIFY drop cuts the
+ * module's power mid image switch and leaves it on the old image.
  *
  * An update that is interrupted before the module verifies the image leaves
  * the old firmware running, so a failure is never a dead sensor; the prompt
@@ -42,10 +45,11 @@ export const BT_MODULE_MANIFEST_URL = "firmware/if820/manifest.json";
 /** After VERIFY the module resets on its own; give it this long to drop the
  * link before the page drops it itself. */
 const DROP_WAIT_MS = 15000;
-/** Then let the module and the MCU boot before the first reconnect. */
-const BOOT_WAIT_MS = 3000;
-const RECONNECT_ATTEMPTS = 5;
-const RECONNECT_GAP_MS = 3000;
+/** Then let the module switch images and the MCU reboot and set it up again
+ * (about 10-20 s on the bench) before the first reconnect. */
+const BOOT_WAIT_MS = 8000;
+const RECONNECT_ATTEMPTS = 10;
+const RECONNECT_GAP_MS = 4000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -448,9 +452,9 @@ export function createBtModuleUpdate(host, opts) {
   }
 
   async function restartAndReconnect() {
-    /* The module resets itself after VERIFY. If the link is somehow still up
-       after a generous wait, drop it from this side: the MCU's
-       reboot-on-disconnect needs a disconnect either way. */
+    /* The module resets itself after VERIFY, which drops the link. If it is
+       somehow still up after a generous wait, drop it from this side so the
+       reconnect below starts from a clean link. */
     const timedOut = await Promise.race([
       moduleRestartDrop().then(() => false),
       sleep(DROP_WAIT_MS).then(() => true),
