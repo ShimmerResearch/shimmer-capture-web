@@ -255,7 +255,7 @@ export function createBtModuleUpdate(host, opts) {
             "div",
             { class: "muted" },
             onBle
-              ? "Takes about a minute. Keep the sensor close and charged; it restarts at the end and this page reconnects to it."
+              ? "Usually 10–40 seconds. Keep the sensor close and charged; it restarts at the end and this page reconnects to it."
               : "The Bluetooth module can only be updated over BLE. Reconnecting opens the device picker once.",
           ),
           held ? el("div", { class: "muted" }, held) : null,

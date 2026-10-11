@@ -550,11 +550,15 @@
             <div id="idLink">–</div>
           </div>
           <div class="flags" id="statusFlags">–</div>
-          <!-- Empty, and so invisible, unless the Bluetooth module is older
-               than the one image this site carries (common/bt-module-update.js). -->
-          <div id="btUpdatePanel"></div>
         </aside>
       </div>
+
+      <!-- The Bluetooth module update (common/bt-module-update.js): full width
+           under the link and device row, where it has room for its progress
+           bar and is seen before any tab. Empty, and so taking no space,
+           unless this sensor's module is older than the one image the site
+           carries. -->
+      <div id="btUpdatePanel" class="bt-update-host"></div>
 
       <!-- ===================================================== Tabs ====== -->
       <!-- General first, as in the Verisense device console: the one-shot
