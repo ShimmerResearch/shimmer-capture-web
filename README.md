@@ -681,7 +681,10 @@ against Consensys reading the same sensor, in this order:
   obvious the moment you compare it with the Device panel's clock.
 - **The sensor rules**, by writing an image that breaks one and reading it back:
   the device should correct exactly what the banner predicted.
-- **The Bluetooth module update.** Run end to end only against the mock's
-  scripted OTA service. Unproven on a sensor: that the module exposes the
-  service while it is connected as a Shimmer3R, that the 244-byte chunks fit
-  the link, and that the sensor comes back reporting the new version.
+- **The Bluetooth module update.** The protocol has been run on a real
+  Shimmer3R from a Python host. The module exposes the update service next to
+  the Shimmer one and takes data writes of at most 63 bytes, and it comes back
+  on the new image at the same address. The page itself has run end to end
+  only against the mock. Still to see on a sensor: the run from Chrome, and the
+  MCU rebooting on its own afterwards, which it must because the module can
+  come back on factory UART settings.
