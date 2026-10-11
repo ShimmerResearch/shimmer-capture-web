@@ -11663,8 +11663,9 @@ class VerisenseSerialDfu {
  * this same sequence): EZ-Serial exposes the OTA service alongside CYSPP,
  * PREPARE / DOWNLOAD / data / VERIFY are accepted, the module resets onto
  * the new image and keeps its BLE address. The module may come back on
- * factory UART settings, so the Shimmer3R MCU must reboot afterwards to
- * re-provision it — see {@link Shimmer3RClient.updateBtModuleFirmware}.
+ * different UART settings, so the Shimmer3R MCU must reboot afterwards to
+ * re-provision it - but only once the module has finished switching images
+ * (see {@link Shimmer3RClient.updateBtModuleFirmware}).
  *
  * HARDWARE-VERIFY: this TypeScript, under Chrome's Web Bluetooth, has not
  * yet run against a real module — only the protocol has.
@@ -11915,10 +11916,11 @@ async function resolveService(server, log) {
  * `optionalServices`. `image` is the module's `.ota.bin`.
  *
  * Resolves once the module has verified the image. The module then resets
- * onto the new firmware by itself, so expect the link to drop shortly after;
- * the Shimmer3R's MCU reads the module version only at its own boot, so arm
- * reboot-on-disconnect beforehand ({@link Shimmer3RClient.setRebootOnDisconnect})
- * for the new version to be reported after reconnecting.
+ * onto the new firmware by itself, so expect the link to drop shortly after.
+ * Do NOT arm the Shimmer3R's reboot-on-disconnect for it: rebooting the MCU
+ * on that drop cuts the module's power while it is still switching images,
+ * and it comes back on the old one (see
+ * {@link Shimmer3RClient.updateBtModuleFirmware}).
  *
  * Starts at {@link IF820_OTA_FAST_CHUNK_SIZE}. If the first data write is
  * refused, the update is aborted and rerun at the next size down; if it goes
@@ -17417,13 +17419,16 @@ class Shimmer3RClient extends BaseShimmerClient {
      * module is updated by its own GATT service, which a Bluetooth Classic or
      * USB link cannot reach.
      *
-     * By default reboot-on-disconnect is armed first: the module resets onto
-     * the new firmware once it has verified it, which drops the link, and the
-     * Shimmer3R's MCU only reads the module version at boot. With it armed the
-     * MCU reboots on that drop, so after reconnecting {@link readBtModuleVersion}
-     * reports the new version. Pass `rebootMcuOnDisconnect: false` to skip that
-     * (the version then updates at the next power-cycle). Firmware that NACKs
-     * the feature is not an error: the update still runs.
+     * Deliberately does NOT arm reboot-on-disconnect. After VERIFY the module
+     * resets and spends a moment switching to the new image; on the transparent
+     * data path (every fielded v1.4.16.16 module) the MCU sees that reset as a
+     * disconnect at once, and an armed reboot then cuts the module's power
+     * mid-switch, so it comes back on the OLD image although VERIFY succeeded
+     * (bench, 15BC, SWO-logged, 2026-10-11). Firmware with DEV-1164's
+     * unexpected-module-boot handling reboots the MCU itself once the module
+     * has come back, and so reports the new version; older firmware keeps the
+     * old version string, and possibly a dead module link, until the sensor is
+     * power-cycled.
      *
      * Resolves once the module has accepted the image; expect a disconnect
      * shortly after. Reconnect with a {@link WebBluetoothTransport} given the
@@ -17441,15 +17446,6 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
         if (this._streaming) {
             throw new Error('Stop streaming before updating the Bluetooth module firmware.');
-        }
-        if (opts.rebootMcuOnDisconnect ?? true) {
-            try {
-                await this.setRebootOnDisconnect(true);
-            }
-            catch (e) {
-                this._log('reboot-on-disconnect not available; continuing', e);
-                opts.onLog?.(`reboot-on-disconnect not armed: ${String(e)}`);
-            }
         }
         return runIf820OtaUpdate(t.device, image, opts);
     }
