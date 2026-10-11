@@ -46,8 +46,10 @@ export const BT_MODULE_MANIFEST_URL = "firmware/if820/manifest.json";
  * link before the page drops it itself. */
 const DROP_WAIT_MS = 15000;
 /** Then let the module switch images and the MCU reboot and set it up again
- * (about 10-20 s on the bench) before the first reconnect. */
-const BOOT_WAIT_MS = 8000;
+ * before the first reconnect. Chrome bench run, 2026-10-11: the MCU rebooted
+ * ~5 s after the drop and finished setting up the module ~18 s after it; a
+ * reconnect at 8 s reached the module mid-setup and was dropped. */
+const BOOT_WAIT_MS = 20000;
 /**
  * How long to keep reconnecting until the sensor reports the new version.
  * On the bench (Chrome, 2026-10-11) the module was back and advertising before
@@ -59,6 +61,10 @@ const BOOT_WAIT_MS = 8000;
  */
 const RECONNECT_BUDGET_MS = 90000;
 const RECONNECT_GAP_MS = 4000;
+/** The progress bar's split: the transfer takes this much, the restart the
+ * rest, paced against the restart's usual length on the bench (~30-45 s). */
+const TRANSFER_SHARE = 75;
+const EXPECTED_RESTART_MS = 45000;
 /** After a reconnect, how long the page's identity read may take to land. */
 const VERSION_WAIT_MS = 8000;
 
@@ -147,6 +153,9 @@ export function createBtModuleUpdate(host, opts) {
   let busy = false;
   let abort = null;
   let progress = { currentBytes: 0, totalBytes: 0 };
+  /** When the module's restart began, for the second half of the bar. */
+  let restartStartedAt = 0;
+  let restartTicker = null;
   let statusText = "";
   let failure = "";
   /** The BluetoothDevice the update ran on, for the picker-less reconnect. */
@@ -227,6 +236,30 @@ export function createBtModuleUpdate(host, opts) {
   // Rendering
   // -------------------------------------------------------------------------
 
+  /**
+   * One bar for the whole job, so the restart and reconnect that follow the
+   * transfer are visibly progress too, not a full bar that seems stuck:
+   * the transfer fills the first {@link TRANSFER_SHARE} percent, the restart
+   * the rest, by elapsed time against {@link EXPECTED_RESTART_MS} - easing
+   * towards 99 % rather than stopping if it runs long. 100 % only once the
+   * new version is confirmed.
+   */
+  function overallPercent() {
+    if (phase === "done") return 100;
+    if (phase === "restarting") {
+      const t = (Date.now() - restartStartedAt) / EXPECTED_RESTART_MS;
+      const eased = t <= 1 ? 0.85 * t : 0.85 + 0.14 * (1 - Math.exp(-(t - 1)));
+      return Math.min(
+        99,
+        Math.floor(TRANSFER_SHARE + (100 - TRANSFER_SHARE) * eased),
+      );
+    }
+    if (!progress.totalBytes) return 0;
+    return Math.floor(
+      (TRANSFER_SHARE * progress.currentBytes) / progress.totalBytes,
+    );
+  }
+
   function render() {
     host.replaceChildren();
     if (phase === "idle") return;
@@ -283,9 +316,7 @@ export function createBtModuleUpdate(host, opts) {
     }
 
     if (phase === "updating" || phase === "restarting") {
-      const pct = progress.totalBytes
-        ? Math.floor((100 * progress.currentBytes) / progress.totalBytes)
-        : 0;
+      const pct = overallPercent();
       host.append(
         el(
           "div",
@@ -299,7 +330,7 @@ export function createBtModuleUpdate(host, opts) {
           el("progress", {
             class: "sd-progress",
             max: "100",
-            value: String(phase === "restarting" ? 100 : pct),
+            value: String(pct),
           }),
           el("div", { class: "muted", id: "btUpdateStatus" }, statusText),
           phase === "updating"
@@ -432,9 +463,7 @@ export function createBtModuleUpdate(host, opts) {
           if (p.currentBytes > 0) linkMayDrop = false;
           transferDone = p.totalBytes > 0 && p.currentBytes >= p.totalBytes;
           const bar = host.querySelector("progress");
-          if (bar && p.totalBytes) {
-            bar.value = Math.floor((100 * p.currentBytes) / p.totalBytes);
-          }
+          if (bar) bar.value = overallPercent();
         },
       });
       log.log?.(
@@ -460,6 +489,11 @@ export function createBtModuleUpdate(host, opts) {
 
     abort = null;
     phase = "restarting";
+    restartStartedAt = Date.now();
+    restartTicker = setInterval(() => {
+      const bar = host.querySelector("progress");
+      if (bar && phase === "restarting") bar.value = overallPercent();
+    }, 500);
     statusText = "The module is restarting on the new firmware…";
     render();
     await restartAndReconnect();
@@ -522,6 +556,8 @@ export function createBtModuleUpdate(host, opts) {
       phase = "failed";
       render();
     }
+    clearInterval(restartTicker);
+    restartTicker = null;
     device = null;
     setBusy(false);
   }
@@ -549,6 +585,11 @@ export function createBtModuleUpdate(host, opts) {
       if (m && current?.family === "cyw20820" && current.version) {
         if (sdk.compareIf820Versions(current.version, m.version) >= 0) {
           phase = "done";
+          /* Hand the link back now: the page's post-connect reads that follow
+             this one (the calibration dump among them) refuse while the
+             update holds it. */
+          device = null;
+          setBusy(false);
           log.log?.(`Bluetooth module now reports v${current.version}`);
           toast(`Bluetooth module updated to v${current.version}`, "ok");
           render();

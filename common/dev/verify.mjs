@@ -5768,7 +5768,17 @@ const btRun = await evaluate(`
       if (applyDuring === null) applyDuring = document.getElementById('btnRefreshDevice').disabled;
     }
     return P().querySelector('.banner.ok, .banner.err');
-  }, 30000);
+  }, 60000);
+  /* The confirming reconnect builds a fresh mock sensor; the page's
+     post-connect reads must reach its calibration dump (0x9A on the wire)
+     rather than be refused because the update still held the link. */
+  await waitFor(
+    () =>
+      window.mockTransport !== undefined &&
+      window.mockOtaDevice !== dev &&
+      window.mockTransport.writes.some((w) => w.bytes[0] === 0x9a),
+    10000,
+  );
   const got = dev.received();
   let same = got.length === image.length;
   for (let i = 0; same && i < got.length; i++) same = got[i] === image[i];
@@ -5783,6 +5793,11 @@ const btRun = await evaluate(`
     bytes: got.length,
     commands: dev.commands.map((c) => c[0]),
     firstWrite: dev.writes[0],
+    calAfter: {
+      read:
+        window.mockOtaDevice !== dev &&
+        window.mockTransport.writes.some((w) => w.bytes[0] === 0x9a),
+    },
     idBt: document.getElementById('idBtModule').textContent,
     pill: document.getElementById('connPill').textContent,
   };
@@ -5809,6 +5824,13 @@ check(
 );
 
 check(
+  "the reconnect after the update reads the calibration, not refused by the update",
+  btRun.calAfter.read,
+  btRun.calAfter.read
+    ? "GET_CALIB_DUMP sent on the confirming reconnect"
+    : "no calibration read after the update",
+);
+check(
   "the update starts with 512-byte writes",
   btRun.firstWrite === 512,
   `first data write ${btRun.firstWrite} bytes`,
@@ -5827,7 +5849,7 @@ const btStall = await evaluate(`
   await waitFor(() => P().querySelector('button.primary'), 3000);
   const dev = window.mockOtaDevice;
   P().querySelector('button.primary').click();
-  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 45000);
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 75000);
   const lines = [...document.querySelectorAll('#log .log-line')].map((l) => l.textContent);
   return {
     ok: !!P().querySelector('.banner.ok'),
@@ -5870,7 +5892,7 @@ const btLate = await evaluate(`
   ${BT_PANEL}
   await waitFor(() => P().querySelector('button.primary'), 3000);
   P().querySelector('button.primary').click();
-  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 60000);
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 90000);
   const lines = [...document.querySelectorAll('#log .log-line')].map((l) => l.textContent);
   return {
     ok: !!P().querySelector('.banner.ok'),
@@ -5894,7 +5916,7 @@ const btFail = await evaluate(`
   ${BT_PANEL}
   await waitFor(() => P().querySelector('button.primary'), 3000);
   P().querySelector('button.primary').click();
-  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 30000);
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 60000);
   return {
     text: P().textContent,
     err: !!P().querySelector('.banner.err'),
