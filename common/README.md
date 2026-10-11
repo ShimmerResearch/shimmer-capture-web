@@ -151,6 +151,9 @@ reconnect it reports the version the image carried.
   older version, so the update is offered.
 - `otaFail=1` has the module refuse the image at VERIFY.
 - `otaMs=5` pauses each chunk, so the progress bar can be watched.
+- `otaStall=1` leaves data writes over 63 bytes unanswered, as the real module
+  does on a link whose packet airtime only fits 63 bytes. The SDK then drops
+  and re-opens the link and carries on at 63, which is the path this exercises.
 
 `transport.emitDisconnect()` simulates a dropped link,
 `transport.writes` is every command the page sent,
@@ -192,6 +195,12 @@ decides when to offer it.
   the MCU reboots too and re-reads the module version, which it only reads at
   boot. The panel reconnects to the same `BluetoothDevice` without the picker,
   and the normal post-connect read confirms the new version.
+- **Large writes first.** The SDK starts at 512-byte writes (about 8 s per
+  image) and, if the module does not answer the first one, drops and re-opens
+  the link and carries on at 63 bytes (about 30 s). The panel watches the
+  `BluetoothDevice` for drops, discounting the one the SDK caused, so that
+  reconnect is neither reported as a lost sensor nor taken for the module's
+  restart.
 - **Interruption is safe.** The module switches images only after a good
   VERIFY. A failure or a cancel leaves the old firmware running, and the
   prompt comes back on the next connect.

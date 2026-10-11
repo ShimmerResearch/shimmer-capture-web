@@ -139,9 +139,38 @@ export function createBtModuleUpdate(host, opts) {
   /** The whole image is sent, so a drop from here on is most likely the
    * module restarting on it rather than a failure. */
   let transferDone = false;
-  /** Resolves when the link drops after VERIFY. */
-  let dropped = null;
-  let markDropped = null;
+  /**
+   * No chunk has landed yet in the current attempt. The SDK starts at large
+   * writes, and on a link that stalls on them it drops and re-opens the link
+   * itself before carrying on smaller - a disconnect that is part of the
+   * update, not the end of it.
+   */
+  let linkMayDrop = false;
+  /**
+   * Link drops seen during the update, and how many of them the SDK caused by
+   * re-opening a stalled link. The module's own restart after VERIFY is the
+   * drop beyond those.
+   */
+  let drops = 0;
+  let retryDrops = 0;
+  let dropWaiters = [];
+  /** Stop listening for drops on the update's BluetoothDevice. */
+  let unlistenDevice = null;
+
+  function noteDrop() {
+    drops++;
+    const ready = dropWaiters.filter((w) => drops > w.after);
+    dropWaiters = dropWaiters.filter((w) => drops <= w.after);
+    for (const w of ready) w.resolve();
+  }
+
+  /** Resolves on the drop that follows every one the SDK caused itself. */
+  function moduleRestartDrop() {
+    return new Promise((resolve) => {
+      if (drops > retryDrops) resolve();
+      else dropWaiters.push({ after: retryDrops, resolve });
+    });
+  }
 
   function setBusy(on) {
     if (busy === on) return;
@@ -332,9 +361,22 @@ export function createBtModuleUpdate(host, opts) {
     statusText = "Downloading the firmware image…";
     failure = "";
     transferDone = false;
+    linkMayDrop = true;
+    drops = 0;
+    retryDrops = 0;
+    dropWaiters = [];
     device = client.device ?? null;
+    /* Watched on the device itself: once the page has torn its session down
+       after the first drop, it hears no later ones, and the module's restart
+       is exactly the drop this has to see. The mock link has no device, and
+       is counted through onDisconnected instead. */
+    if (typeof device?.addEventListener === "function") {
+      const onGattDrop = () => noteDrop();
+      device.addEventListener("gattserverdisconnected", onGattDrop);
+      unlistenDevice = () =>
+        device?.removeEventListener("gattserverdisconnected", onGattDrop);
+    }
     abort = new AbortController();
-    dropped = new Promise((r) => (markDropped = r));
     setBusy(true);
     render();
 
@@ -353,8 +395,23 @@ export function createBtModuleUpdate(host, opts) {
           render();
         },
         onLog: (m) => log.log?.(`[if820 ota] ${m}`),
+        onRetry: ({ fromChunkSize, toChunkSize, reconnecting }) => {
+          log.warn?.(
+            `Bluetooth module update: ${fromChunkSize}-byte writes ` +
+              `${reconnecting ? "stalled the link" : "were refused"}; ` +
+              `continuing with ${toChunkSize}-byte writes` +
+              (reconnecting ? " after reconnecting" : ""),
+          );
+          linkMayDrop = true;
+          /* The SDK drops and re-opens the link on the device itself, which
+             the device listener counts as a drop. The mock re-opens a
+             scripted device the page never sees, so there is nothing to
+             discount there. */
+          if (reconnecting && unlistenDevice) retryDrops++;
+        },
         onProgress: (p) => {
           progress = p;
+          if (p.currentBytes > 0) linkMayDrop = false;
           transferDone = p.totalBytes > 0 && p.currentBytes >= p.totalBytes;
           const bar = host.querySelector("progress");
           if (bar && p.totalBytes) {
@@ -369,6 +426,8 @@ export function createBtModuleUpdate(host, opts) {
       );
     } catch (e) {
       abort = null;
+      unlistenDevice?.();
+      unlistenDevice = null;
       device = null;
       const cancelled = e?.name === "AbortError";
       failure = cancelled ? "cancelled" : (e?.message ?? String(e));
@@ -393,9 +452,11 @@ export function createBtModuleUpdate(host, opts) {
        after a generous wait, drop it from this side: the MCU's
        reboot-on-disconnect needs a disconnect either way. */
     const timedOut = await Promise.race([
-      dropped.then(() => false),
+      moduleRestartDrop().then(() => false),
       sleep(DROP_WAIT_MS).then(() => true),
     ]);
+    unlistenDevice?.();
+    unlistenDevice = null;
     if (timedOut && getClient()) {
       log.warn?.(
         "the module did not drop the link after the update; disconnecting",
@@ -479,7 +540,8 @@ export function createBtModuleUpdate(host, opts) {
 
   /** The link went away. An update's own restart is expected and kept. */
   function onDisconnected() {
-    markDropped?.();
+    // Counted here only when the device itself is not being watched.
+    if (busy && !unlistenDevice) noteDrop();
     if (phase === "restarting") return;
     if (phase === "updating") {
       /* The SDK call rejects on its own when the link drops; this just
@@ -505,10 +567,14 @@ export function createBtModuleUpdate(host, opts) {
     get phase() {
       return phase;
     },
-    /** True when a link drop now is the expected end of an update: the
-     * module restarting on the image it has just been sent. */
+    /** True when a link drop now is part of an update: the module restarting
+     * on the image it has just been sent, or the SDK re-opening a link that
+     * stalled on large writes. */
     get restartExpected() {
-      return phase === "restarting" || (phase === "updating" && transferDone);
+      return (
+        phase === "restarting" ||
+        (phase === "updating" && (transferDone || linkMayDrop))
+      );
     },
     get manifestError() {
       return manifestError;

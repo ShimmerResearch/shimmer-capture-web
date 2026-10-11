@@ -5405,10 +5405,14 @@
                    refuses it. Swapped for one that drives a scripted OTA service end
                    to end, which "restarts" the sensor on the new version the way a
                    real module does: `&otaFail=1` fails it at VERIFY, `&otaMs=5`
-                   slows each chunk so the progress bar can be watched. */
+                   slows each chunk so the progress bar can be watched, and
+                   `&otaStall=1` leaves writes over 63 bytes unanswered, as the
+                   module does on a slow-airtime link, so the SDK's reconnect
+                   and fallback run. */
           const otaDevice = createMockIf820OtaDevice({
             failVerify: params.get("otaFail") === "1",
             byteDelayMs: Number(params.get("otaMs")) || 0,
+            stallAbove: params.get("otaStall") === "1" ? 63 : undefined,
             onVerified: () => transport.emitDisconnect(),
           });
           window.mockOtaDevice = otaDevice;

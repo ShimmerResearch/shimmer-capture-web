@@ -5782,6 +5782,7 @@ const btRun = await evaluate(`
     same,
     bytes: got.length,
     commands: dev.commands.map((c) => c[0]),
+    firstWrite: dev.writes[0],
     idBt: document.getElementById('idBtModule').textContent,
     pill: document.getElementById('connPill').textContent,
   };
@@ -5805,6 +5806,56 @@ check(
   "after the restart the page reconnects and confirms the new version",
   btRun.ok && /v1\.4\.18\.18/.test(btRun.idBt) && /mock/.test(btRun.pill),
   `${btRun.result.slice(0, 60)} | ${btRun.idBt} | ${btRun.pill}`,
+);
+
+check(
+  "the update starts with 512-byte writes",
+  btRun.firstWrite === 512,
+  `first data write ${btRun.firstWrite} bytes`,
+);
+
+/* A link whose packet airtime only fits 63-byte writes: the real module never
+   answers a larger one. The SDK drops and re-opens the link and carries on at
+   63; the page must see an update that succeeds, not a disconnect. */
+await goto(`${BASE}?mock=1&otaStall=1&btVersion=${btLine("01.04.16.16")}`);
+check(
+  "connect an older module on a slow-airtime link",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btStall = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary'), 3000);
+  const dev = window.mockOtaDevice;
+  P().querySelector('button.primary').click();
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 45000);
+  const lines = [...document.querySelectorAll('#log .log-line')].map((l) => l.textContent);
+  return {
+    ok: !!P().querySelector('.banner.ok'),
+    text: P().textContent,
+    writes: [...new Set(dev.writes)],
+    disconnects: dev.disconnects,
+    connects: dev.connects,
+    retryLine: lines.some((l) => /512-byte writes stalled the link; continuing with 63-byte/.test(l)),
+    errToast: [...document.querySelectorAll('.toast')].some((t) => /disconnected/i.test(t.textContent)),
+    idBt: document.getElementById('idBtModule').textContent,
+  };
+`);
+check(
+  "a stalled 512-byte write reconnects and finishes at 63 bytes",
+  btStall.ok &&
+    btStall.writes[0] === 512 &&
+    btStall.writes.includes(63) &&
+    btStall.writes.slice(1).every((n) => n <= 63) &&
+    btStall.disconnects === 1 &&
+    btStall.connects === 1 &&
+    btStall.retryLine &&
+    /v1\.4\.18\.18/.test(btStall.idBt),
+  `${btStall.text.slice(0, 50)} | writes ${btStall.writes} | drop ${btStall.disconnects}/${btStall.connects} | ${btStall.idBt}`,
+);
+check(
+  "and the page does not report that reconnect as a lost sensor",
+  !btStall.errToast,
+  btStall.errToast ? "a 'disconnected' toast was shown" : "no disconnect toast",
 );
 
 await goto(`${BASE}?mock=1&otaFail=1&btVersion=${btLine("01.04.16.16")}`);

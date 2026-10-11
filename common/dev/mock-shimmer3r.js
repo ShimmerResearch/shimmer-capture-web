@@ -2856,12 +2856,20 @@ const OTA_STATUS = Object.freeze({ OK: 0, UNSUPPORTED: 1, VERIFY_FAILED: 3 });
  *   bar is visible while developing
  * @param {boolean} [opts.failVerify=false] answer VERIFY with
  *   VERIFICATION_FAILED, which is how a corrupt transfer looks
+ * @param {number} [opts.stallAbove] never answer a data write longer than
+ *   this, which is how the real module behaves on a link whose packet airtime
+ *   only fits 63-byte writes (bench, 2026-10-11). The SDK then drops the link
+ *   and reconnects to carry on smaller.
  * @param {(image: Uint8Array) => void} [opts.onVerified] called after a good
  *   VERIFY, which is when a real module resets onto the new image
  * @returns {{gatt: object, received: () => Uint8Array, commands: number[][]}}
  */
 export function createMockIf820OtaDevice(opts = {}) {
   const commands = [];
+  /** Length of every data write, answered or not. */
+  const writes = [];
+  let connects = 0;
+  let disconnects = 0;
   let received = [];
   let expected = 0;
   let connected = true;
@@ -2935,6 +2943,10 @@ export function createMockIf820OtaDevice(opts = {}) {
         value.byteOffset ?? 0,
         value.byteLength,
       );
+      writes.push(bytes.length);
+      if (opts.stallAbove !== undefined && bytes.length > opts.stallAbove) {
+        return new Promise(() => {});
+      }
       if (opts.byteDelayMs)
         await new Promise((r) => setTimeout(r, opts.byteDelayMs));
       received.push(...bytes);
@@ -2947,7 +2959,12 @@ export function createMockIf820OtaDevice(opts = {}) {
     },
     async connect() {
       connected = true;
+      connects++;
       return gatt;
+    },
+    disconnect() {
+      connected = false;
+      disconnects++;
     },
     async getPrimaryService(uuid) {
       if (uuid !== IF820_OTA_UUID.SERVICE) {
@@ -2965,7 +2982,18 @@ export function createMockIf820OtaDevice(opts = {}) {
     },
   };
 
-  return { gatt, commands, received: () => Uint8Array.from(received) };
+  return {
+    gatt,
+    commands,
+    writes,
+    received: () => Uint8Array.from(received),
+    get connects() {
+      return connects;
+    },
+    get disconnects() {
+      return disconnects;
+    },
+  };
 }
 
 /**
