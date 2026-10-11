@@ -5830,6 +5830,19 @@ check(
     ? "GET_CALIB_DUMP sent on the confirming reconnect"
     : "no calibration read after the update",
 );
+const btDismiss = await evaluate(`
+  const P = () => document.getElementById('btUpdatePanel');
+  const x = P().querySelector('.bt-update-dismiss');
+  x?.click();
+  return { hadX: !!x, left: P().textContent };
+`);
+check(
+  "the finished update's banner has a dismiss x that clears it",
+  btDismiss.hadX && btDismiss.left === "",
+  btDismiss.hadX
+    ? `after click: "${btDismiss.left.slice(0, 40)}"`
+    : "no dismiss button",
+);
 check(
   "the update starts with 512-byte writes",
   btRun.firstWrite === 512,

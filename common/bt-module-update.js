@@ -260,6 +260,27 @@ export function createBtModuleUpdate(host, opts) {
     );
   }
 
+  /** The × on a finished update's banner. Dismissing only clears the
+   * message: a module still on an older version is offered the update again
+   * the next time the sensor connects. */
+  function dismissButton() {
+    return el(
+      "button",
+      {
+        type: "button",
+        class: "bt-update-dismiss",
+        title: "Dismiss",
+        "aria-label": "Dismiss",
+        onclick: () => {
+          phase = "idle";
+          failure = "";
+          render();
+        },
+      },
+      "×",
+    );
+  }
+
   function render() {
     host.replaceChildren();
     if (phase === "idle") return;
@@ -355,6 +376,7 @@ export function createBtModuleUpdate(host, opts) {
           "div",
           { class: "banner ok bt-update" },
           `Bluetooth module updated to v${current?.version ?? target}.`,
+          dismissButton(),
         ),
       );
       return;
@@ -376,6 +398,7 @@ export function createBtModuleUpdate(host, opts) {
             { class: "muted" },
             "The module keeps its previous firmware until an update completes, so the sensor still works. Reconnect over BLE to try again.",
           ),
+          dismissButton(),
         ),
       );
     }

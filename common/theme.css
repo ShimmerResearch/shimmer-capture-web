@@ -1408,6 +1408,7 @@ input.cal-cell.faint {
 }
 
 .bt-update {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1428,4 +1429,30 @@ input.cal-cell.faint {
 
 .bt-update progress {
   flex: 1 1 100%;
+}
+
+/* The dismiss x on a finished update's banner: top right, out of the text's
+   way, quiet until hovered. */
+.bt-update:has(.bt-update-dismiss) {
+  padding-right: 36px;
+}
+
+.bt-update-dismiss {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.bt-update-dismiss:hover,
+.bt-update-dismiss:focus-visible {
+  color: var(--ink);
 }
