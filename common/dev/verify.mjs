@@ -5932,6 +5932,65 @@ check(
   `${btLate.text.slice(0, 50)} | waited ${btLate.waited} | ${btLate.idBt}`,
 );
 
+/* Cancel mid-transfer: the module must be told to ABORT, never asked to
+   VERIFY, so it keeps the old image; the page must offer the update again on
+   a link that still works, and a second run must go through. Each chunk is
+   slowed (`otaMs`) so there is a transfer in progress to cancel. */
+await goto(`${BASE}?mock=1&otaMs=40&btVersion=${btLine("01.04.16.16")}`);
+check(
+  "connect an older module for a cancelled update",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btCancel = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
+  const dev = window.mockOtaDevice;
+  P().querySelector('button.primary').click();
+  await waitFor(() => dev.writes.length >= 2, 10000);
+  const cancel = [...P().querySelectorAll('button')].find((b) => b.textContent === 'Cancel');
+  cancel?.click();
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 10000);
+  const afterCancel = {
+    hadCancel: !!cancel,
+    commands: dev.commands.map((c) => c[0]),
+    partial: dev.writes.length,
+    offeredAgain: !!P().querySelector('button.primary:not([disabled])'),
+    idBt: document.getElementById('idBtModule').textContent,
+    pill: document.getElementById('connPill').textContent,
+    refresh: document.getElementById('btnRefreshDevice').disabled,
+  };
+  P().querySelector('button.primary').click();
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 60000);
+  return {
+    ...afterCancel,
+    retryOk: !!P().querySelector('.banner.ok'),
+    retryCommands: dev.commands.map((c) => c[0]),
+    idBtAfter: document.getElementById('idBtModule').textContent,
+  };
+`);
+check(
+  "Cancel mid-transfer sends ABORT and never VERIFY",
+  btCancel.hadCancel &&
+    btCancel.commands.join(",") === "1,2,7" &&
+    btCancel.partial >= 2,
+  `cancel button ${btCancel.hadCancel}, commands ${btCancel.commands.join(",")}, ${btCancel.partial} writes before cancel`,
+);
+check(
+  "after a cancel the old version stays and the link is free to use",
+  btCancel.offeredAgain &&
+    /v1\.4\.16\.16/.test(btCancel.idBt) &&
+    /mock/.test(btCancel.pill) &&
+    btCancel.refresh === false,
+  `${btCancel.idBt} | ${btCancel.pill} | Refresh disabled ${btCancel.refresh}`,
+);
+check(
+  "and the update runs to completion on the same link afterwards",
+  btCancel.retryOk &&
+    btCancel.retryCommands.join(",") === "1,2,7,1,2,3" &&
+    /v1\.4\.18\.18/.test(btCancel.idBtAfter),
+  `${btCancel.retryCommands.join(",")} | ${btCancel.idBtAfter}`,
+);
+
 await goto(`${BASE}?mock=1&otaFail=1&btVersion=${btLine("01.04.16.16")}`);
 check(
   "connect an older module whose update will fail",
