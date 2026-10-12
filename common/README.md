@@ -180,8 +180,10 @@ decides when to offer it.
   module older than it is offered the update. Anything else, including a
   module that did not report a version, is offered nothing. There is no
   version picker and no file picker. Bench work with other images stays on
-  WsOtaUpgrade. To ship a new release, replace the image and regenerate the
-  manifest in the same commit; see `firmware/if820/README.md`.
+  WsOtaUpgrade. No image is bundled yet, so the feature is off on the deployed
+  page; `?mock=1` uses a synthetic image under `common/dev/if820-mock/`. To ship
+  a release, add the image and its manifest in one commit; see
+  `firmware/if820/README.md`.
 - **BLE only.** The OTA service is a GATT service, so a Classic Bluetooth or
   USB link cannot reach it. Off BLE, the panel offers to reconnect over BLE,
   which costs one device-picker click. The page grants the OTA services in

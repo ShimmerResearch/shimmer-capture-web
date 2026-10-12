@@ -681,10 +681,10 @@ against Consensys reading the same sensor, in this order:
   obvious the moment you compare it with the Device panel's clock.
 - **The sensor rules**, by writing an image that breaks one and reading it back:
   the device should correct exactly what the banner predicted.
-- **The Bluetooth module update.** The protocol has been run on a real
-  Shimmer3R from a Python host. The module exposes the update service next to
-  the Shimmer one and takes data writes of at most 63 bytes, and it comes back
-  on the new image at the same address. The page itself has run end to end
-  only against the mock. Still to see on a sensor: the run from Chrome, and the
-  MCU rebooting on its own afterwards, which it must because the module can
-  come back on factory UART settings.
+- **The Bluetooth module update.** Run end to end on a Shimmer3R from Chrome on
+  Windows: v1.4.16.16 to v1.4.18.18 in 31 s, confirmed on the first reconnect,
+  with sensor firmware that reboots itself after the module restarts
+  (shimmer3r-firmware DEV-1164). Not yet seen on hardware from Chrome: the
+  fallback that reconnects and carries on with 63-byte writes when the link
+  stalls on 512-byte ones (the mock and the SDK's tests cover it). No module
+  image is bundled yet, so the deployed page offers no update.

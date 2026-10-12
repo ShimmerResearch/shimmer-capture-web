@@ -1,0 +1,9 @@
+{
+  "version": "1.4.18.18",
+  "file": "mock-module.ota.bin",
+  "bytes": 20000,
+  "crc32": "0x5b9e1713",
+  "module": "Synthetic image for ?mock=1 only - not module firmware",
+  "variant": "MOCK",
+  "released": "2026-10-12"
+}

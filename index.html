@@ -1709,7 +1709,15 @@
       /* Mounted here, ahead of regate(), which reads it. Everything it is
                handed is looked up when called, so the connect controller further
                down can be referenced before it exists. */
+      /* The image the site offers. The mock link uses a synthetic one under
+               common/dev/, so the update can be exercised with no module image in
+               the deployable tree at all - which is how the feature ships switched
+               off until a release is chosen (firmware/if820/README.md). */
+      const BT_MODULE_MANIFEST = mockEnabledFromUrl()
+        ? "common/dev/if820-mock/manifest.json"
+        : "firmware/if820/manifest.json";
       const btUpdate = createBtModuleUpdate($("btUpdatePanel"), {
+        manifestUrl: BT_MODULE_MANIFEST,
         client: () => client,
         mode: () => mode,
         log,
@@ -4183,6 +4191,12 @@
        * null. Every other holder is named, as the verify pass requires.
        */
       function btUpdateHeldReason() {
+        /* A command still waiting for its answer - the post-connect reads
+                 among them. The update writes straight to the module, so starting
+                 it now would interleave with that exchange. */
+        if (busy) {
+          return "The sensor is still answering another command — try again in a moment.";
+        }
         if (streaming || sdLogging) {
           return "The sensor is sensing. Stop the stream (or the SD recording) before updating the Bluetooth module — the sensor restarts at the end of the update.";
         }
@@ -5435,9 +5449,7 @@
           window.mockOtaDevice = otaDevice;
           mockClient.updateBtModuleFirmware = async (image, o = {}) => {
             const result = await sdk.runIf820OtaUpdate(otaDevice, image, o);
-            const m = await (
-              await fetch("firmware/if820/manifest.json")
-            ).json();
+            const m = await (await fetch(BT_MODULE_MANIFEST)).json();
             mockBtVersionAfterUpdate = mockCyw20820VersionLine(m.version);
             mockConnectsBeforeNewVersion =
               params.get("otaLate") === "1" ? 1 : 0;

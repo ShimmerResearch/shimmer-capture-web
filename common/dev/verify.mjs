@@ -4364,6 +4364,7 @@ const MUST_EXPLAIN = {
     "brandBusy",
     "calibBusy",
     "testBusy",
+    "busy",
   ],
 };
 
@@ -5694,6 +5695,17 @@ check(
 
 // ===========================================================================
 console.log("\n--- Bluetooth module update (DEV-1164) ---");
+/* Until a module release is chosen the deployable tree carries no image, and
+   with no manifest the page never offers an update. When one is added, this
+   check goes with it. */
+const btShipped = await (
+  await fetch(`${BASE}firmware/if820/manifest.json`)
+).status;
+check(
+  "the deployable tree carries no module image yet, so nothing is offered",
+  btShipped === 404,
+  `firmware/if820/manifest.json: HTTP ${btShipped}`,
+);
 /* The mock link is not Web Bluetooth, so the page swaps the client's module
    update for one that runs the SDK's real OTA protocol against a scripted
    OTA service (`createMockIf820OtaDevice`). What this pass proves is the
@@ -5751,11 +5763,11 @@ await goto(`${BASE}?mock=1&btVersion=${btLine("01.04.16.16")}`);
 check("connect an older module over BLE", (await evaluate(CONNECT)) === "mock");
 const btRun = await evaluate(`
   ${BT_PANEL}
-  await waitFor(() => P().querySelector('button.primary'), 3000);
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
   const offered = P().textContent;
-  const manifest = await (await fetch('firmware/if820/manifest.json')).json();
+  const manifest = await (await fetch('common/dev/if820-mock/manifest.json')).json();
   const image = new Uint8Array(
-    await (await fetch('firmware/if820/' + manifest.file)).arrayBuffer(),
+    await (await fetch('common/dev/if820-mock/' + manifest.file)).arrayBuffer(),
   );
   // The reconnect builds a new scripted module, so hold on to this one.
   const dev = window.mockOtaDevice;
@@ -5859,7 +5871,7 @@ check(
 );
 const btStall = await evaluate(`
   ${BT_PANEL}
-  await waitFor(() => P().querySelector('button.primary'), 3000);
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
   const dev = window.mockOtaDevice;
   P().querySelector('button.primary').click();
   await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 75000);
@@ -5903,7 +5915,7 @@ check(
 );
 const btLate = await evaluate(`
   ${BT_PANEL}
-  await waitFor(() => P().querySelector('button.primary'), 3000);
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
   P().querySelector('button.primary').click();
   await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 90000);
   const lines = [...document.querySelectorAll('#log .log-line')].map((l) => l.textContent);
@@ -5927,7 +5939,7 @@ check(
 );
 const btFail = await evaluate(`
   ${BT_PANEL}
-  await waitFor(() => P().querySelector('button.primary'), 3000);
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
   P().querySelector('button.primary').click();
   await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 60000);
   return {
