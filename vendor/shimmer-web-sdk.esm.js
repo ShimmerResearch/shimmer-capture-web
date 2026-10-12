@@ -11665,8 +11665,11 @@ class VerisenseSerialDfu {
  * re-provision it - but only once the module has finished switching images
  * (see {@link Shimmer3RClient.updateBtModuleFirmware}).
  *
- * HARDWARE-VERIFY: this TypeScript, under Chrome's Web Bluetooth, has not
- * yet run against a real module — only the protocol has.
+ * HARDWARE-VERIFY: the normal path has run end to end on a Shimmer3R from
+ * Chrome on Windows (v1.4.16.16 to v1.4.18.18, on a link that took 512-byte
+ * writes). The stall fallback has not: dropping a link whose first write goes
+ * unanswered, reconnecting and carrying on at 63 bytes has run only against a
+ * scripted device here, and as the same logic from a Python host on the bench.
  */
 /** GATT UUIDs of the Infineon OTA firmware upgrade service. */
 const IF820_OTA = Object.freeze({
@@ -11832,6 +11835,10 @@ class StatusQueue {
         return this._values.splice(0, this._values.length);
     }
     next(timeoutMs, what, signal) {
+        /* An abort that landed while a write was in flight has already fired, so
+         * the listener below would never see it. */
+        if (signal?.aborted)
+            return Promise.reject(abortError());
         if (this._values.length)
             return Promise.resolve(this._values.shift());
         return new Promise((resolve, reject) => {
@@ -11939,6 +11946,9 @@ async function runIf820OtaUpdate(device, image, opts = {}) {
     const firstWriteTimeoutMs = opts.firstWriteTimeoutMs ?? IF820_OTA_FIRST_WRITE_TIMEOUT_MS;
     const reconnectAttempts = opts.reconnectAttempts ?? IF820_OTA_RECONNECT_ATTEMPTS;
     const reconnectDelayMs = opts.reconnectDelayMs ?? IF820_OTA_RECONNECT_DELAY_MS;
+    if (opts.chunkSize !== undefined && (!Number.isFinite(opts.chunkSize) || opts.chunkSize <= 0)) {
+        throw new If820OtaError(`Invalid chunkSize: ${opts.chunkSize}`);
+    }
     const firstChunk = Math.max(IF820_OTA_MIN_CHUNK_SIZE, Math.floor(opts.chunkSize ?? IF820_OTA_DEFAULT_CHUNK_SIZE));
     /* The sizes to try, largest first: the requested one, then the safe and
      * minimum sizes below it. */
@@ -12053,7 +12063,9 @@ async function runIf820OtaUpdate(device, image, opts = {}) {
              * module never switches images, so nothing depends on this landing. */
         }
     };
-    /** The first data write, bounded: on a stalled link it is never answered. */
+    /** The first data write, bounded: on a stalled link it is never answered.
+     * HARDWARE-VERIFY: this timeout and the reconnect that follows have not yet
+     * run under Web Bluetooth on a real stalled link (see the module note). */
     const firstWrite = async (chunk) => {
         let timer;
         const attempt = write(data, chunk);
@@ -17432,8 +17444,9 @@ class Shimmer3RClient extends BaseShimmerClient {
      * shortly after. Reconnect with a {@link WebBluetoothTransport} given the
      * same {@link device} to avoid a second picker.
      *
-     * HARDWARE-VERIFY: not yet run on a Shimmer3R — see the note in
-     * `if820Ota.ts`.
+     * HARDWARE-VERIFY: run end to end on a Shimmer3R from Chrome; the fallback
+     * that reconnects after a stalled 512-byte write has not been, on hardware —
+     * see the note in `if820Ota.ts`.
      */
     async updateBtModuleFirmware(image, opts = {}) {
         const t = this._transport;

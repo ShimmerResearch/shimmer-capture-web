@@ -7928,8 +7928,11 @@ declare function shimmer3ControlMessageLength(buf: Uint8Array): number;
  * re-provision it - but only once the module has finished switching images
  * (see {@link Shimmer3RClient.updateBtModuleFirmware}).
  *
- * HARDWARE-VERIFY: this TypeScript, under Chrome's Web Bluetooth, has not
- * yet run against a real module — only the protocol has.
+ * HARDWARE-VERIFY: the normal path has run end to end on a Shimmer3R from
+ * Chrome on Windows (v1.4.16.16 to v1.4.18.18, on a link that took 512-byte
+ * writes). The stall fallback has not: dropping a link whose first write goes
+ * unanswered, reconnecting and carrying on at 63 bytes has run only against a
+ * scripted device here, and as the same logic from a Python host on the bench.
  */
 /** GATT UUIDs of the Infineon OTA firmware upgrade service. */
 declare const IF820_OTA: Readonly<{
@@ -10552,8 +10555,9 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * shortly after. Reconnect with a {@link WebBluetoothTransport} given the
      * same {@link device} to avoid a second picker.
      *
-     * HARDWARE-VERIFY: not yet run on a Shimmer3R — see the note in
-     * `if820Ota.ts`.
+     * HARDWARE-VERIFY: run end to end on a Shimmer3R from Chrome; the fallback
+     * that reconnects after a stalled 512-byte write has not been, on hardware —
+     * see the note in `if820Ota.ts`.
      */
     updateBtModuleFirmware(image: ArrayBuffer | Uint8Array, opts?: If820OtaOptions): Promise<If820OtaResult>;
     /**
