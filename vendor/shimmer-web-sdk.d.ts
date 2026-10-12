@@ -8125,6 +8125,11 @@ interface If820OtaResult {
  * unanswered (the link has stalled), the link is dropped and re-opened to the
  * same device first - see {@link IF820_OTA_DEFAULT_CHUNK_SIZE} for why, and
  * `onRetry` for telling the host.
+ *
+ * One update at a time per device: a second call for a device whose update is
+ * still running is refused before it touches the module. Two runs would share
+ * the control point, each hearing the other's status bytes, and interleave
+ * their writes into the one image buffer the module has.
  */
 declare function runIf820OtaUpdate(device: If820OtaDeviceLike, image: ArrayBuffer | Uint8Array, opts?: If820OtaOptions): Promise<If820OtaResult>;
 /**
@@ -10554,6 +10559,9 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * Resolves once the module has accepted the image; expect a disconnect
      * shortly after. Reconnect with a {@link WebBluetoothTransport} given the
      * same {@link device} to avoid a second picker.
+     *
+     * A second call while an update is running on this connection is refused
+     * ({@link runIf820OtaUpdate} allows one per device).
      *
      * HARDWARE-VERIFY: run end to end on a Shimmer3R from Chrome; the fallback
      * that reconnects after a stalled 512-byte write has not been, on hardware —

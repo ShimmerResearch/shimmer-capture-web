@@ -11938,8 +11938,30 @@
      * unanswered (the link has stalled), the link is dropped and re-opened to the
      * same device first - see {@link IF820_OTA_DEFAULT_CHUNK_SIZE} for why, and
      * `onRetry` for telling the host.
+     *
+     * One update at a time per device: a second call for a device whose update is
+     * still running is refused before it touches the module. Two runs would share
+     * the control point, each hearing the other's status bytes, and interleave
+     * their writes into the one image buffer the module has.
      */
     async function runIf820OtaUpdate(device, image, opts = {}) {
+        if (updatesInFlight.has(device)) {
+            throw new If820OtaError('A Bluetooth module update is already running on this device');
+        }
+        updatesInFlight.add(device);
+        try {
+            return await runUpdate(device, image, opts);
+        }
+        finally {
+            updatesInFlight.delete(device);
+        }
+    }
+    /** How long a cancelled first write may take to settle before the link is
+     * treated as stalled and dropped. A healthy write settles in tens of ms. */
+    const IF820_OTA_ABORT_GRACE_MS = 500;
+    /** Devices with an update running, for {@link runIf820OtaUpdate}'s guard. */
+    const updatesInFlight = new WeakSet();
+    async function runUpdate(device, image, opts) {
         /* A private copy: the image cannot change under the CRC mid-transfer, and
          * it is ArrayBuffer-backed, which the GATT write signature requires. */
         const bytes = new Uint8Array(image.byteLength);
@@ -12081,18 +12103,49 @@
             const timeout = new Promise((_, reject) => {
                 timer = setTimeout(() => reject(new ChunkRefused('no answer', true)), firstWriteTimeoutMs);
             });
+            /* A cancel is honoured at once rather than after the timeout. */
+            let onAbort;
+            const aborted = new Promise((_, reject) => {
+                onAbort = () => reject(abortError());
+                if (signal?.aborted)
+                    onAbort();
+                else
+                    signal?.addEventListener('abort', onAbort, { once: true });
+            });
             try {
-                await Promise.race([attempt, timeout]);
+                await Promise.race([attempt, timeout, aborted]);
             }
             catch (e) {
                 if (e instanceof ChunkRefused)
                     throw e;
+                if (e?.name === 'AbortError') {
+                    /* A write still pending after a short grace is a stalled link, which
+                     * would also hold up the ABORT queued behind it, and which the module
+                     * drops by supervision timeout anyway. Drop it now. No VERIFY was
+                     * sent, so the module keeps its current image. */
+                    const settled = await Promise.race([
+                        attempt.then(() => true, () => true),
+                        sleep(IF820_OTA_ABORT_GRACE_MS).then(() => false),
+                    ]);
+                    if (!settled && server.connected) {
+                        log('cancelled during a stalled write; dropping the link');
+                        try {
+                            server.disconnect?.();
+                        }
+                        catch {
+                            /* already going */
+                        }
+                    }
+                    throw e;
+                }
                 /* Refused outright. A rejection that comes with the link gone is a stall
                  * the stack noticed first. */
                 throw new ChunkRefused(e, !server.connected);
             }
             finally {
                 clearTimeout(timer);
+                if (onAbort)
+                    signal?.removeEventListener('abort', onAbort);
             }
         };
         /** One full pass at a given chunk size. Throws {@link ChunkRefused} when the
@@ -17449,6 +17502,9 @@
          * Resolves once the module has accepted the image; expect a disconnect
          * shortly after. Reconnect with a {@link WebBluetoothTransport} given the
          * same {@link device} to avoid a second picker.
+         *
+         * A second call while an update is running on this connection is refused
+         * ({@link runIf820OtaUpdate} allows one per device).
          *
          * HARDWARE-VERIFY: run end to end on a Shimmer3R from Chrome; the fallback
          * that reconnects after a stalled 512-byte write has not been, on hardware —
