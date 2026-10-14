@@ -8076,7 +8076,10 @@ interface If820OtaOptions {
      * Called when the first data write is refused or stalls and the update is
      * about to start again at a smaller chunk. `reconnecting` is true when the
      * link is being dropped and re-opened to do so: a host sees that as a
-     * disconnect, which is part of the update and not the end of it.
+     * disconnect, which is part of the update and not the end of it. The update
+     * re-opens only the GATT server; a client whose transport was on that link
+     * (e.g. {@link Shimmer3RClient}) must reconnect before its next command,
+     * which it has to anyway once a successful update restarts the module.
      */
     onRetry?: (info: {
         fromChunkSize: number;

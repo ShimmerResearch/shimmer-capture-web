@@ -11909,6 +11909,11 @@
             }
         }
         const msg = String(lastError ?? '');
+        /* The link failing under the lookup is not a module without the service:
+         * keep it transient, so the host can retry. */
+        if (!server.connected || lastError?.name === 'NetworkError') {
+            throw wrapGattError(lastError, 'Opening the Bluetooth module update service');
+        }
         /* Web Bluetooth throws SecurityError when the service was not listed in
          * optionalServices at requestDevice time — the fix is on the host side, so
          * say so rather than "not found". */
@@ -11945,15 +11950,18 @@
      * their writes into the one image buffer the module has.
      */
     async function runIf820OtaUpdate(device, image, opts = {}) {
-        if (updatesInFlight.has(device)) {
+        /* Keyed by the GATT server, not the object passed in: two `{ gatt }`
+         * wrappers around one device are still one device. */
+        const key = device.gatt ?? device;
+        if (updatesInFlight.has(key)) {
             throw new If820OtaError('A Bluetooth module update is already running on this device');
         }
-        updatesInFlight.add(device);
+        updatesInFlight.add(key);
         try {
             return await runUpdate(device, image, opts);
         }
         finally {
-            updatesInFlight.delete(device);
+            updatesInFlight.delete(key);
         }
     }
     /** How long a cancelled first write may take to settle before the link is
@@ -12083,27 +12091,52 @@
             if (!control)
                 return;
             try {
-                await write(control, command(IF820_OTA_COMMAND.ABORT));
-                log('control point → ABORT');
+                const sent = write(control, command(IF820_OTA_COMMAND.ABORT));
+                sent.catch(() => { });
+                const landed = await Promise.race([
+                    sent.then(() => true),
+                    sleep(IF820_OTA_ABORT_GRACE_MS).then(() => false),
+                ]);
+                if (landed)
+                    log('control point → ABORT');
             }
             catch {
                 /* Best effort: the link may already be gone. Without a VERIFY the
                  * module never switches images, so nothing depends on this landing. */
             }
         };
-        /** The first data write, bounded: on a stalled link it is never answered.
-         * HARDWARE-VERIFY: this timeout and the reconnect that follows have not yet
-         * run under Web Bluetooth on a real stalled link (see the module note). */
-        const firstWrite = async (chunk) => {
-            let timer;
-            const attempt = write(data, chunk);
-            /* Whatever the stalled write eventually settles with, it is no longer
+        /**
+         * Wait for a data write, bounded by `timeoutMs` and by a cancel. A cancel is
+         * honoured at once; a write still pending {@link IF820_OTA_ABORT_GRACE_MS}
+         * after it is a stalled link, which would also hold up the ABORT queued
+         * behind it, so the link is dropped (the module drops it by supervision
+         * timeout anyway). With `dropOnTimeout` a write that times out drops the
+         * link the same way. No VERIFY has been sent either way, so the module
+         * keeps its current image.
+         */
+        const awaitWrite = async (attempt, timeoutMs, onTimeout, dropOnTimeout) => {
+            /* Whatever an abandoned write eventually settles with, it is no longer
              * anyone's concern, and must not surface as an unhandled rejection. */
             attempt.catch(() => { });
+            const dropStalled = (why) => {
+                if (!server.connected)
+                    return;
+                log(`${why}; dropping the link`);
+                try {
+                    server.disconnect?.();
+                }
+                catch {
+                    /* already going */
+                }
+            };
+            let timer;
+            let timedOut = false;
             const timeout = new Promise((_, reject) => {
-                timer = setTimeout(() => reject(new ChunkRefused('no answer', true)), firstWriteTimeoutMs);
+                timer = setTimeout(() => {
+                    timedOut = true;
+                    reject(onTimeout());
+                }, timeoutMs);
             });
-            /* A cancel is honoured at once rather than after the timeout. */
             let onAbort;
             const aborted = new Promise((_, reject) => {
                 onAbort = () => reject(abortError());
@@ -12116,36 +12149,38 @@
                 await Promise.race([attempt, timeout, aborted]);
             }
             catch (e) {
-                if (e instanceof ChunkRefused)
-                    throw e;
-                if (e?.name === 'AbortError') {
-                    /* A write still pending after a short grace is a stalled link, which
-                     * would also hold up the ABORT queued behind it, and which the module
-                     * drops by supervision timeout anyway. Drop it now. No VERIFY was
-                     * sent, so the module keeps its current image. */
+                if (signal?.aborted) {
                     const settled = await Promise.race([
                         attempt.then(() => true, () => true),
                         sleep(IF820_OTA_ABORT_GRACE_MS).then(() => false),
                     ]);
-                    if (!settled && server.connected) {
-                        log('cancelled during a stalled write; dropping the link');
-                        try {
-                            server.disconnect?.();
-                        }
-                        catch {
-                            /* already going */
-                        }
-                    }
-                    throw e;
+                    if (!settled)
+                        dropStalled('cancelled during a stalled write');
+                    throw abortError();
                 }
-                /* Refused outright. A rejection that comes with the link gone is a stall
-                 * the stack noticed first. */
-                throw new ChunkRefused(e, !server.connected);
+                if (timedOut && dropOnTimeout)
+                    dropStalled('a data write went unanswered');
+                throw e;
             }
             finally {
                 clearTimeout(timer);
                 if (onAbort)
                     signal?.removeEventListener('abort', onAbort);
+            }
+        };
+        /** The first data write, bounded: on a stalled link it is never answered.
+         * HARDWARE-VERIFY: this timeout and the reconnect that follows have not yet
+         * run under Web Bluetooth on a real stalled link (see the module note). */
+        const firstWrite = async (chunk) => {
+            try {
+                await awaitWrite(write(data, chunk), firstWriteTimeoutMs, () => new ChunkRefused('no answer', true), false);
+            }
+            catch (e) {
+                if (e instanceof ChunkRefused || e?.name === 'AbortError')
+                    throw e;
+                /* Refused outright. A rejection that comes with the link gone is a stall
+                 * the stack noticed first. */
+                throw new ChunkRefused(e, !server.connected);
             }
         };
         /** One full pass at a given chunk size. Throws {@link ChunkRefused} when the
@@ -12168,11 +12203,12 @@
                     await firstWrite(chunk);
                 }
                 else {
+                    const at = offset;
                     try {
-                        await write(data, chunk);
+                        await awaitWrite(write(data, chunk), responseTimeoutMs, () => new If820OtaError(`Bluetooth module did not accept the firmware write at offset ${at} (timed out)`, { transient: true }), true);
                     }
                     catch (e) {
-                        throw wrapGattError(e, `Writing firmware at offset ${offset}`);
+                        throw wrapGattError(e, `Writing firmware at offset ${at}`);
                     }
                 }
                 crc = crc32(chunk, crc);
