@@ -5114,7 +5114,7 @@ function isAtLeast(fw, min) {
 
 /** `ShimmerVerDetails.HW_ID` values that map onto a {@link ShimmerGeneration}. */
 const HW_ID_SHIMMER_3 = 3;
-const HW_ID_SHIMMER_3R$1 = 10;
+const HW_ID_SHIMMER_3R$2 = 10;
 /**
  * Map a DEVICE_VERSION_RESPONSE hardware id onto a generation, or `null` when
  * the id is unknown/absent (the caller then has to pick a default and say so —
@@ -5123,7 +5123,7 @@ const HW_ID_SHIMMER_3R$1 = 10;
 function generationFromHardwareVersion(hardwareVersion) {
     if (hardwareVersion === HW_ID_SHIMMER_3)
         return 'shimmer3';
-    if (hardwareVersion === HW_ID_SHIMMER_3R$1)
+    if (hardwareVersion === HW_ID_SHIMMER_3R$2)
         return 'shimmer3r';
     return null;
 }
@@ -6387,7 +6387,7 @@ function readExgKnobs(banks) {
  *     conflict list is SensorEXG.sDRefEcg etc. (:332-344).
  */
 /** HW_ID codes (ShimmerVerDetails.HW_ID) — matches infomem/layout.ts HW_ID. */
-const HW_ID_SHIMMER_3R = 10;
+const HW_ID_SHIMMER_3R$1 = 10;
 // Sensor-bitmap resolution masks (ConfigByteLayoutShimmer3, == SensorBitmapShimmer3).
 const MASK_EXG1_24BIT = 0x000010;
 const MASK_EXG2_24BIT = 0x000008;
@@ -6464,7 +6464,7 @@ function isExgChipClocksJoined(hardwareVersion) {
     // from the hardware version alone (no expansion-board rev in the docked
     // context), so classic Shimmer3 preserves whatever bit the device already had
     // (see applyExgPreset) rather than forcing it off.
-    return hardwareVersion === HW_ID_SHIMMER_3R;
+    return hardwareVersion === HW_ID_SHIMMER_3R$1;
 }
 /** Byte1 REG2 oscillator-clock-connection is bit 3. */
 const REG2_OSC_CLOCK_BIT = 0x08;
@@ -12267,6 +12267,70 @@ function isIf820UpdateAvailable(current, latest) {
         return false;
     return compareIf820Versions(current.version, latest) < 0;
 }
+// ── Which sensors may be updated ──
+/**
+ * The first Shimmer3R LogAndStream release the module update is offered on:
+ * v1.01.022. It is the first to recover by itself once the module restarts on
+ * its new image (it reboots the MCU, which re-reads the module version), and
+ * the first to repair the SPP MTU an update leaves broken on v1.4.18.x, which
+ * otherwise runs the classic link at a fraction of its speed. Older firmware
+ * keeps reporting the old module version until it is power-cycled.
+ */
+const IF820_OTA_MIN_SENSOR_FIRMWARE = Object.freeze({ major: 1, minor: 1, internal: 22 });
+/** Hardware version of a Shimmer3R, as GET_DEVICE_VERSION reports it. */
+const HW_ID_SHIMMER_3R = 10;
+/** Firmware identifier of LogAndStream, as GET_FW_VERSION reports it. */
+const FW_ID_LOGANDSTREAM = 3;
+/**
+ * Whether this sensor may have its Bluetooth module updated: a Shimmer3R
+ * running LogAndStream {@link IF820_OTA_MIN_SENSOR_FIRMWARE} or later. A
+ * sensor whose versions were not read is not supported - a host must never
+ * offer the update to a sensor it cannot identify.
+ */
+function if820OtaSensorSupport(sensor) {
+    const min = IF820_OTA_MIN_SENSOR_FIRMWARE;
+    const minText = `LogAndStream v${min.major}.${String(min.minor).padStart(2, '0')}.${String(min.internal).padStart(3, '0')}`;
+    if (!sensor ||
+        sensor.hardwareVersion == null ||
+        sensor.firmwareId == null ||
+        sensor.major == null ||
+        sensor.minor == null ||
+        sensor.internal == null) {
+        return {
+            supported: false,
+            reason: 'unknown',
+            message: "The sensor's hardware and firmware versions could not be read.",
+        };
+    }
+    if (sensor.hardwareVersion !== HW_ID_SHIMMER_3R) {
+        return {
+            supported: false,
+            reason: 'not-shimmer3r',
+            message: 'The Bluetooth module update is for Shimmer3R sensors only.',
+        };
+    }
+    if (sensor.firmwareId !== FW_ID_LOGANDSTREAM) {
+        return {
+            supported: false,
+            reason: 'not-logandstream',
+            message: `The Bluetooth module update needs ${minText} or later on the sensor.`,
+        };
+    }
+    const have = [sensor.major, sensor.minor, sensor.internal];
+    const need = [min.major, min.minor, min.internal];
+    for (let i = 0; i < 3; i++) {
+        if (have[i] !== need[i]) {
+            if (have[i] > need[i])
+                break;
+            return {
+                supported: false,
+                reason: 'firmware-too-old',
+                message: `The Bluetooth module update needs ${minText} or later on the sensor.`,
+            };
+        }
+    }
+    return { supported: true };
+}
 
 /**
  * How to describe a link that supplied no device name, in the reader's own terms.
@@ -17499,6 +17563,10 @@ class Shimmer3RClient extends BaseShimmerClient {
      * shortly after. Reconnect with a {@link WebBluetoothTransport} given the
      * same {@link device} to avoid a second picker.
      *
+     * Refused unless the sensor is a Shimmer3R on LogAndStream
+     * {@link IF820_OTA_MIN_SENSOR_FIRMWARE} or later (see
+     * {@link if820OtaSensorSupport}).
+     *
      * A second call while an update is running on this connection is refused
      * ({@link runIf820OtaUpdate} allows one per device).
      *
@@ -17516,6 +17584,19 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (this._streaming) {
             throw new Error('Stop streaming before updating the Bluetooth module firmware.');
         }
+        /* Both reads are cached after the first on a link, so this normally costs
+         * nothing: a host reads them on connect. */
+        const hw = await this.readDeviceVersion();
+        const fw = await this.readFwVersion();
+        const support = if820OtaSensorSupport({
+            hardwareVersion: hw.hardwareVersion,
+            firmwareId: fw.fwId,
+            major: fw.major,
+            minor: fw.minor,
+            internal: fw.patch,
+        });
+        if (!support.supported)
+            throw new Error(support.message);
         return runIf820OtaUpdate(t.device, image, opts);
     }
     /**
@@ -35247,6 +35328,7 @@ exports.IF820_OTA_DEFAULT_CHUNK_SIZE = IF820_OTA_DEFAULT_CHUNK_SIZE;
 exports.IF820_OTA_FAST_CHUNK_SIZE = IF820_OTA_FAST_CHUNK_SIZE;
 exports.IF820_OTA_FIRST_WRITE_TIMEOUT_MS = IF820_OTA_FIRST_WRITE_TIMEOUT_MS;
 exports.IF820_OTA_MIN_CHUNK_SIZE = IF820_OTA_MIN_CHUNK_SIZE;
+exports.IF820_OTA_MIN_SENSOR_FIRMWARE = IF820_OTA_MIN_SENSOR_FIRMWARE;
 exports.IF820_OTA_RECONNECT_ATTEMPTS = IF820_OTA_RECONNECT_ATTEMPTS;
 exports.IF820_OTA_RECONNECT_DELAY_MS = IF820_OTA_RECONNECT_DELAY_MS;
 exports.IF820_OTA_RESPONSE_TIMEOUT_MS = IF820_OTA_RESPONSE_TIMEOUT_MS;
@@ -35656,6 +35738,7 @@ exports.groupForCalibSensorId = groupForCalibSensorId;
 exports.gsrRangeForSample = gsrRangeForSample;
 exports.hasSensorBit = hasSensorBit;
 exports.hhmmToMinutesSinceMidnight = hhmmToMinutesSinceMidnight;
+exports.if820OtaSensorSupport = if820OtaSensorSupport;
 exports.if820OtaStatusText = if820OtaStatusText;
 exports.inferShimmer3Generation = inferShimmer3Generation;
 exports.inferVerisenseChargerChipFamily = inferVerisenseChargerChipFamily;
