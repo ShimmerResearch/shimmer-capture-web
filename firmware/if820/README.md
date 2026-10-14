@@ -31,7 +31,10 @@ decision, not a file drop.
 
 3. Check that the Shimmer3R firmware supports the new module version. The
    firmware picks its classic-Bluetooth data path from the module version
-   (`BT_selectDataPath()` in `shimmer3r-firmware`'s `CYW20820.c`).
+   (`BT_selectDataPath()` in `shimmer3r-firmware`'s `CYW20820.c`). The page
+   only offers the update to sensors on LogAndStream v1.01.022 or later (the
+   SDK's `IF820_OTA_MIN_SENSOR_FIRMWARE`); a newer module may need that floor
+   raised.
 
 Removing both files turns the feature off again: with no manifest, nothing is
 ever offered. Adding them means dropping the verify pass's "no module image yet"

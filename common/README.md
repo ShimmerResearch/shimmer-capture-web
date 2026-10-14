@@ -44,7 +44,7 @@ Three rules the whole library follows, so a page can rely on them:
 | `brand-editor.js`           | `createBrandEditor` — reads and writes the expansion-board EEPROM record holding the Classic-Bluetooth, BLE and USB names, with per-field limits that follow the hardware, stock-versus-custom detection, write-and-verify, restore-to-factory and the restart a new name needs.                                                                                                                                                                                                                                                                |
 | `factory-test-panel.js`     | `createFactoryTestPanel` — runs the firmware's own factory self-test and shows the report as it prints, with the verdict words coloured, a parsed summary, and text/CSV export. Owns the cancel-and-drain behaviour the firmware's missing abort command forces on a host.                                                                                                                                                                                                                                                                      |
 | `rtc-drift-panel.js`        | `createRtcDriftPanel` — samples the sensor's real-world clock against this host's, least-squares fits the drift in ppm, plots it, holds a screen wake lock, detects a stepped host clock and a sensor set on a different time convention, and exports CSV with its metadata.                                                                                                                                                                                                                                                                    |
-| `bt-module-update.js`       | `createBtModuleUpdate`, `loadBtModuleManifest` — offers the one Bluetooth module (IF820) firmware this site carries, from `firmware/if820/manifest.json`, to a Shimmer3R whose module is older, and runs it over BLE through the SDK's `updateBtModuleFirmware`. Off BLE it offers a reconnect over BLE instead. Afterwards it reconnects to the same sensor without the picker and confirms the new version. See "Bluetooth module update" below.                                                                                              |
+| `bt-module-update.js`       | `createBtModuleUpdate`, `loadBtModuleManifest` — offers the one Bluetooth module (IF820) firmware this site carries, from `firmware/if820/manifest.json`, to a Shimmer3R on LogAndStream v1.01.022 or later whose module is older, and runs it over BLE through the SDK's `updateBtModuleFirmware`. Off BLE it offers a reconnect over BLE instead. Afterwards it reconnects to the same sensor without the picker and confirms the new version. See "Bluetooth module update" below.                                                                                              |
 | `vendor/chart.umd.min.js`   | Chart.js 4.5.1, pinned. See `vendor/README.md`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `dev/mock-shimmer3r.js`     | `createMockShimmer3RTransport`, `createMockIf820OtaDevice`, `mockCyw20820VersionLine`, `mockEnabledFromUrl` — a scripted Shimmer3R for developing without hardware.                                                                                                                                                                                                                                                                                                                                                                             |
 | `dev/verify.mjs`            | The browser verification pass — see below. Runs in CI.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -148,7 +148,10 @@ service. After a good VERIFY the mock "restarts": it drops the link, and on
 reconnect it reports the version the image carried.
 
 - `btVersion=CYW20820 app=v01.04.16.16, …` puts the mock module on an
-  older version, so the update is offered.
+  older version. Add `fw=1.01.022` as well for the update to be offered: the
+  mock sensor reports LogAndStream v1.01.012 by default, which is below the
+  release the update needs, so on its own this shows the "update the
+  sensor's firmware first" note.
 - `otaFail=1` has the module refuse the image at VERIFY.
 - `otaMs=5` pauses each chunk, so the progress bar can be watched.
 - `otaStall=1` leaves data writes over 63 bytes unanswered, as the real module
@@ -184,6 +187,14 @@ decides when to offer it.
   page; `?mock=1` uses a synthetic image under `common/dev/if820-mock/`. To ship
   a release, add the image and its manifest in one commit; see
   `firmware/if820/README.md`.
+- **Shimmer3R on LogAndStream v1.01.022 or later only.** That release is the
+  first to recover by itself once the module restarts on its new image, and
+  to repair the SPP MTU an update leaves broken on v1.4.18.x; older firmware
+  keeps reporting the old module version until it is power-cycled. The SDK's
+  `if820OtaSensorSupport` decides. A Shimmer3R on older (or other) firmware
+  whose module is behind is told to update its firmware first and offered
+  no button; any other sensor, or one whose versions were not read, sees
+  nothing.
 - **BLE only.** The OTA service is a GATT service, so a Classic Bluetooth or
   USB link cannot reach it. Off BLE, the panel offers to reconnect over BLE,
   which costs one device-picker click. The page grants the OTA services in
@@ -193,11 +204,10 @@ decides when to offer it.
   the reconnect, as `otaBusy`. Every other panel's refusal reason names it,
   and `btUpdateHeldReason` names all of theirs. The verify pass checks both.
 - **The end of an update is a disconnect.** The module resets onto the new
-  image once it has verified it. Shimmer3R firmware with DEV-1164 then
-  reboots its MCU once the module is back, which re-reads the module version
-  (it is only read at boot). The panel reconnects to the same
-  `BluetoothDevice` without the picker, and the normal post-connect read
-  confirms the new version; older firmware needs a power-cycle first.
+  image once it has verified it. The sensor's firmware then reboots its MCU
+  once the module is back, which re-reads the module version (it is only
+  read at boot). The panel reconnects to the same `BluetoothDevice` without
+  the picker, and the normal post-connect read confirms the new version.
   Nothing arms reboot-on-disconnect: rebooting the MCU on the post-VERIFY
   drop cuts the module's power while it is switching images, and it comes back
   on the old one.

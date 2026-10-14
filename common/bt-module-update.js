@@ -136,6 +136,7 @@ export function createBtModuleUpdate(host, opts) {
   const manifestUrl = opts.manifestUrl ?? BT_MODULE_MANIFEST_URL;
   const supported =
     typeof sdk.isIf820UpdateAvailable === "function" &&
+    typeof sdk.if820OtaSensorSupport === "function" &&
     typeof sdk.crc32 === "function";
 
   /** @type {Awaited<ReturnType<typeof loadBtModuleManifest>>|undefined} */
@@ -144,11 +145,15 @@ export function createBtModuleUpdate(host, opts) {
   /** The image, fetched once and CRC-checked against the manifest. */
   let imageCache = null;
   /**
-   * idle | available | updating | restarting | done | failed
+   * idle | available | needs-firmware | updating | restarting | done | failed
    * `restarting` survives the disconnect the update itself causes.
+   * `needs-firmware`: the module is older than the image, but the sensor's
+   * own firmware is too old to be updated (the SDK's if820OtaSensorSupport).
    */
   let phase = "idle";
   let current = null;
+  /** if820OtaSensorSupport's answer for the connected sensor. */
+  let sensorSupport = null;
   let enabled = true;
   let busy = false;
   let abort = null;
@@ -286,6 +291,24 @@ export function createBtModuleUpdate(host, opts) {
     if (phase === "idle") return;
     const target = manifest?.version;
     const from = current?.version;
+
+    if (phase === "needs-firmware") {
+      host.append(
+        el(
+          "div",
+          { class: "banner info bt-update" },
+          dismissButton(),
+          el(
+            "div",
+            {},
+            el("strong", {}, "Bluetooth firmware v" + target + " is available"),
+            ` (this sensor has v${from}), but the sensor's firmware must be updated first.`,
+          ),
+          el("div", { class: "muted" }, sensorSupport?.message ?? ""),
+        ),
+      );
+      return;
+    }
 
     if (phase === "available") {
       const onBle = getMode() === "ble";
@@ -595,10 +618,14 @@ export function createBtModuleUpdate(host, opts) {
    * update, which is how a finished update is confirmed.
    *
    * @param {object|null} btModule `readBtModuleVersion()`'s result
+   * @param {object|null} sensor the sensor's hardware and firmware versions,
+   *   as the SDK's `if820OtaSensorSupport` takes them. The update is offered
+   *   only on a Shimmer3R running LogAndStream v1.01.022 or later.
    */
-  async function check(btModule) {
+  async function check(btModule, sensor) {
     current = btModule ?? null;
     if (!supported) return;
+    sensorSupport = sdk.if820OtaSensorSupport(sensor ?? null);
     const m = await ensureManifest();
 
     if (phase === "restarting") {
@@ -627,10 +654,22 @@ export function createBtModuleUpdate(host, opts) {
     }
 
     if (busy) return;
-    phase =
-      m && sdk.isIf820UpdateAvailable(current, m.version)
+    const newer = !!m && sdk.isIf820UpdateAvailable(current, m.version);
+    /* A Shimmer3R on older or other firmware is told why; anything that is
+       not a Shimmer3R, or that could not be identified, is offered nothing. */
+    phase = !newer
+      ? "idle"
+      : sensorSupport.supported
         ? "available"
-        : "idle";
+        : sensorSupport.reason === "firmware-too-old" ||
+            sensorSupport.reason === "not-logandstream"
+          ? "needs-firmware"
+          : "idle";
+    if (phase === "needs-firmware") {
+      log.log?.(
+        `Bluetooth module firmware v${m.version} is available, but not offered: ${sensorSupport.message}`,
+      );
+    }
     if (phase === "available") {
       log.log?.(
         `Bluetooth module firmware v${m.version} is available (sensor has v${current.version})`,

@@ -4948,8 +4948,15 @@
           idBtModule: btModule?.label ?? "(not read)",
         });
         /* Offers the module update when this module is older than the image
-                 the site carries; after an update's own reconnect, confirms it. */
-        void btUpdate.check(btModule);
+                 the site carries, on a Shimmer3R whose firmware supports it;
+                 after an update's own reconnect, confirms it. */
+        void btUpdate.check(btModule, {
+          hardwareVersion: hw?.hardwareVersion,
+          firmwareId: fw?.fwId,
+          major: fw?.major,
+          minor: fw?.minor,
+          internal: fw?.patch,
+        });
 
         const info = await tryDevice("inquire the channel list", () =>
           client.inquiry(),
@@ -5090,8 +5097,15 @@
           idBtModule: btModule?.label ?? "(not read)",
         });
         /* Offers the module update when this module is older than the image
-                 the site carries; after an update's own reconnect, confirms it. */
-        void btUpdate.check(btModule);
+                 the site carries, on a Shimmer3R whose firmware supports it;
+                 after an update's own reconnect, confirms it. */
+        void btUpdate.check(btModule, {
+          hardwareVersion: id?.hardwareVersion,
+          firmwareId: version?.firmwareIdentifier,
+          major: version?.firmwareVersionMajor,
+          minor: version?.firmwareVersionMinor,
+          internal: version?.firmwareVersionInternal,
+        });
         $("hostClock").textContent = formatClock(Date.now());
 
         const ctx = {

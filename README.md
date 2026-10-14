@@ -686,5 +686,6 @@ against Consensys reading the same sensor, in this order:
   with sensor firmware that reboots itself after the module restarts
   (shimmer3r-firmware DEV-1164). Not yet seen on hardware from Chrome: the
   fallback that reconnects and carries on with 63-byte writes when the link
-  stalls on 512-byte ones (the mock and the SDK's tests cover it). No module
-  image is bundled yet, so the deployed page offers no update.
+  stalls on 512-byte ones (the mock and the SDK's tests cover it). Offered
+  only to a Shimmer3R on LogAndStream v1.01.022 or later. No module image is
+  bundled yet, so the deployed page offers no update.

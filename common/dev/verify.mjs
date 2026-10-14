@@ -5741,7 +5741,51 @@ check(
   btCurrent.slice(0, 80) || "(panel empty)",
 );
 
-await goto(`${BASE}?mock=1&framed=0&btVersion=${btLine("01.04.16.16")}`);
+/* Only a Shimmer3R on LogAndStream v1.01.022 or later is offered the update:
+   older firmware does not recover by itself once the module restarts, and
+   does not repair the SPP MTU an update leaves broken on v1.4.18.x. */
+await goto(`${BASE}?mock=1&fw=1.01.021&btVersion=${btLine("01.04.16.16")}`);
+check(
+  "connect an older module on a Shimmer3R with v1.01.021",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btOldFw = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().textContent !== "", 3000);
+  return {
+    text: P().textContent,
+    button: !!P().querySelector('button.primary, button:not(.bt-update-dismiss)'),
+  };
+`);
+check(
+  "older sensor firmware is told to update first, and offered no update",
+  /must be updated first/.test(btOldFw.text) &&
+    /LogAndStream v1\.01\.022 or later/.test(btOldFw.text) &&
+    !btOldFw.button,
+  `${btOldFw.text.slice(0, 110)} | button ${btOldFw.button}`,
+);
+
+await goto(
+  `${BASE}?mock=1&hw=3&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
+check(
+  "connect a Shimmer3 reporting an older IF820",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btShimmer3 = await evaluate(`
+  ${BT_PANEL}
+  await new Promise((r) => setTimeout(r, 1500));
+  return P().textContent;
+`);
+check(
+  "a sensor that is not a Shimmer3R is offered nothing",
+  btShimmer3 === "",
+  btShimmer3.slice(0, 80) || "(panel empty)",
+);
+
+await goto(
+  `${BASE}?mock=1&framed=0&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
 check(
   "connect an older module over a serial-like link",
   (await evaluate(CONNECT)) === "mock",
@@ -5759,7 +5803,7 @@ check(
   `${btSerial.button} | ${btSerial.text.slice(0, 90)}`,
 );
 
-await goto(`${BASE}?mock=1&btVersion=${btLine("01.04.16.16")}`);
+await goto(`${BASE}?mock=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`);
 check("connect an older module over BLE", (await evaluate(CONNECT)) === "mock");
 const btRun = await evaluate(`
   ${BT_PANEL}
@@ -5864,7 +5908,9 @@ check(
 /* A link whose packet airtime only fits 63-byte writes: the real module never
    answers a larger one. The SDK drops and re-opens the link and carries on at
    63; the page must see an update that succeeds, not a disconnect. */
-await goto(`${BASE}?mock=1&otaStall=1&btVersion=${btLine("01.04.16.16")}`);
+await goto(
+  `${BASE}?mock=1&otaStall=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
 check(
   "connect an older module on a slow-airtime link",
   (await evaluate(CONNECT)) === "mock",
@@ -5908,7 +5954,9 @@ check(
 /* The bench case: the first reconnect after the update reaches a sensor
    whose MCU has not rebooted onto the module yet, so it still reports the
    old version. The panel must keep asking, not fail on the first answer. */
-await goto(`${BASE}?mock=1&otaLate=1&btVersion=${btLine("01.04.16.16")}`);
+await goto(
+  `${BASE}?mock=1&otaLate=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
 check(
   "connect an older module whose sensor restarts late",
   (await evaluate(CONNECT)) === "mock",
@@ -5936,7 +5984,9 @@ check(
    VERIFY, so it keeps the old image; the page must offer the update again on
    a link that still works, and a second run must go through. Each chunk is
    slowed (`otaMs`) so there is a transfer in progress to cancel. */
-await goto(`${BASE}?mock=1&otaMs=40&btVersion=${btLine("01.04.16.16")}`);
+await goto(
+  `${BASE}?mock=1&otaMs=40&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
 check(
   "connect an older module for a cancelled update",
   (await evaluate(CONNECT)) === "mock",
@@ -5991,7 +6041,9 @@ check(
   `${btCancel.retryCommands.join(",")} | ${btCancel.idBtAfter}`,
 );
 
-await goto(`${BASE}?mock=1&otaFail=1&btVersion=${btLine("01.04.16.16")}`);
+await goto(
+  `${BASE}?mock=1&otaFail=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
 check(
   "connect an older module whose update will fail",
   (await evaluate(CONNECT)) === "mock",
