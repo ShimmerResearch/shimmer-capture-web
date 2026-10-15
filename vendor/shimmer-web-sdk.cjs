@@ -11804,6 +11804,22 @@ class ChunkRefused extends Error {
     }
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** {@link sleep}, cut short by a cancel, which then rejects with AbortError. */
+function sleepUnlessAborted(ms, signal) {
+    if (signal?.aborted)
+        return Promise.reject(abortError());
+    return new Promise((resolve, reject) => {
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(abortError());
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+}
 function abortError() {
     const err = new Error('Bluetooth module update cancelled');
     err.name = 'AbortError';
@@ -12052,10 +12068,13 @@ async function runUpdate(device, image, opts) {
         let lastError = null;
         for (let attempt = 1; attempt <= reconnectAttempts; attempt++) {
             throwIfAborted$1(signal);
-            await sleep(reconnectDelayMs);
+            await sleepUnlessAborted(reconnectDelayMs, signal);
             onStatus(`Reconnecting to the Bluetooth module (attempt ${attempt} of ${reconnectAttempts})…`);
             try {
-                await server.connect();
+                if (opts.reconnect)
+                    await opts.reconnect();
+                else
+                    await server.connect();
                 await open();
                 return;
             }
@@ -12068,15 +12087,32 @@ async function runUpdate(device, image, opts) {
     };
     const send = async (op, param, what) => {
         log(`control point → ${what}`);
+        /* Bounded and cancellable like the data writes: a control-point write
+         * that hangs on a failing link would otherwise never reach the response
+         * wait, where the timeout and the cancel apply. (awaitWrite is declared
+         * below; send only runs once the whole update is set up.) */
         try {
-            await write(control, command(op, param));
+            await awaitWrite(write(control, command(op, param)), responseTimeoutMs, () => new If820OtaError(`Bluetooth module did not accept ${what} (timed out)`, {
+                transient: true,
+            }), true);
         }
         catch (e) {
             throw wrapGattError(e, what);
         }
     };
     const expectOk = async (what, timeoutMs) => {
-        const status = await statuses.next(timeoutMs, what, signal);
+        /* A transfer's flow-control hints (CONTINUE / MORE_DATA) arrive as their
+         * own notifications, so one can land after the last data write has
+         * resolved and sit in the queue ahead of the command's answer. They are
+         * never a command's answer: skip them, within the same deadline. */
+        const deadline = Date.now() + timeoutMs;
+        let status;
+        for (;;) {
+            status = await statuses.next(Math.max(1, deadline - Date.now()), what, signal);
+            if (status !== IF820_OTA_STATUS.CONTINUE && status !== IF820_OTA_STATUS.MORE_DATA)
+                break;
+            log(`skipping a late ${if820OtaStatusText(status)} while waiting for ${what}`);
+        }
         if (status !== IF820_OTA_STATUS.OK) {
             throw new If820OtaError(`Bluetooth module refused ${what}: ${if820OtaStatusText(status)}`, {
                 status,
@@ -17637,7 +17673,13 @@ class Shimmer3RClient extends BaseShimmerClient {
         });
         if (!support.supported)
             throw new Error(support.message);
-        return runIf820OtaUpdate(t.device, image, opts);
+        /* A fallback reconnect goes through this client, on the same transport and
+         * so the same device (no picker), so the client's own link is rebuilt with
+         * it rather than left holding the dropped connection's handles. */
+        return runIf820OtaUpdate(t.device, image, {
+            ...opts,
+            reconnect: opts.reconnect ?? (() => this.connect(t)),
+        });
     }
     /**
      * Read from the daughter-card (expansion board) EEPROM memory. `offset` is a
