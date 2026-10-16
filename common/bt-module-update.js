@@ -67,6 +67,10 @@ const TRANSFER_SHARE = 75;
 const EXPECTED_RESTART_MS = 45000;
 /** After a reconnect, how long the page's identity read may take to land. */
 const VERSION_WAIT_MS = 8000;
+/** After a failed or cancelled update, how long to keep the page locked
+ * waiting for the SDK to let go of the device (link work it gave up on still
+ * settling). Dropping the link settles it, so this is generous. */
+const SDK_IDLE_WAIT_MS = 15000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -154,6 +158,8 @@ export function createBtModuleUpdate(host, opts) {
   let current = null;
   /** if820OtaSensorSupport's answer for the connected sensor. */
   let sensorSupport = null;
+  /** The failure came after VERIFY: the new image may be running. */
+  let mayHaveCommitted = false;
   /** Bumped by every check() and disconnect; see check(). */
   let checkGeneration = 0;
   let enabled = true;
@@ -422,7 +428,9 @@ export function createBtModuleUpdate(host, opts) {
           el(
             "div",
             { class: "muted" },
-            "The module keeps its previous firmware until an update completes, so the sensor still works. Reconnect over BLE to try again.",
+            mayHaveCommitted
+              ? "The module may already be running the new firmware. Reconnect over BLE and check the Bluetooth module version before trying again."
+              : "The module keeps its previous firmware until an update completes, so the sensor still works. Reconnect over BLE to try again.",
           ),
           dismissButton(),
         ),
@@ -454,6 +462,7 @@ export function createBtModuleUpdate(host, opts) {
     }
 
     phase = "updating";
+    mayHaveCommitted = false;
     progress = { currentBytes: 0, totalBytes: manifest.bytes };
     statusText = "Downloading the firmware image…";
     failure = "";
@@ -535,7 +544,17 @@ export function createBtModuleUpdate(host, opts) {
       log[cancelled ? "warn" : "error"]?.(
         `Bluetooth module update ${cancelled ? "cancelled" : "failed"}: ${failure}`,
       );
+      /* The SDK says so when VERIFY had already been written. */
+      mayHaveCommitted = /may already have accepted/i.test(failure);
       phase = cancelled ? "available" : "failed";
+      statusText = "Finishing up…";
+      render();
+      /* A failed or cancelled update can leave link work the SDK gave up on
+         still running, and the SDK keeps the device until it settles; the
+         page stays locked until then too, so no connect or Disconnect races
+         it. Bounded, in case the browser's Bluetooth never settles it: the
+         SDK still refuses another update until it does. */
+      await waitForSdkIdle(client);
       setBusy(false);
       render();
       return;
@@ -553,6 +572,15 @@ export function createBtModuleUpdate(host, opts) {
     await restartAndReconnect();
   }
 
+  /** Wait (bounded) until the SDK no longer holds the device for an update. */
+  async function waitForSdkIdle(client) {
+    if (typeof client?.whenBtModuleUpdateIdle !== "function") return;
+    await Promise.race([
+      client.whenBtModuleUpdateIdle().catch(() => {}),
+      sleep(SDK_IDLE_WAIT_MS),
+    ]);
+  }
+
   async function restartAndReconnect() {
     /* Whatever goes wrong in here - a reconnect or a disconnect that throws -
        the update must end in a terminal state with the page released: an
@@ -566,6 +594,7 @@ export function createBtModuleUpdate(host, opts) {
       );
     } finally {
       if (phase === "restarting") {
+        mayHaveCommitted = true;
         failure = lastSeenVersion
           ? `the module accepted the update, but the sensor still reports v${lastSeenVersion}. ` +
             "Switch it off and on: it reads the module version only when it starts. " +
