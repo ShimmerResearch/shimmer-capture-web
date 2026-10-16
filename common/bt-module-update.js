@@ -184,6 +184,13 @@ export function createBtModuleUpdate(host, opts) {
    */
   let linkMayDrop = false;
   /**
+   * The SDK has dropped a stalled link and is reconnecting the SAME client
+   * through its own transport. The drop is not the end of the session: the
+   * page must keep it, or a later reconnect would build a second client on
+   * the same device.
+   */
+  let sdkReconnecting = false;
+  /**
    * Link drops seen during the update, and how many of them the SDK caused by
    * re-opening a stalled link. The module's own restart after VERIFY is the
    * drop beyond those.
@@ -515,6 +522,7 @@ export function createBtModuleUpdate(host, opts) {
               (reconnecting ? " after reconnecting" : ""),
           );
           linkMayDrop = true;
+          if (reconnecting) sdkReconnecting = true;
           /* The SDK drops and re-opens the link on the device itself, which
              the device listener counts as a drop. The mock re-opens a
              scripted device the page never sees, so there is nothing to
@@ -523,7 +531,10 @@ export function createBtModuleUpdate(host, opts) {
         },
         onProgress: (p) => {
           progress = p;
-          if (p.currentBytes > 0) linkMayDrop = false;
+          if (p.currentBytes > 0) {
+            linkMayDrop = false;
+            sdkReconnecting = false;
+          }
           transferDone = p.totalBytes > 0 && p.currentBytes >= p.totalBytes;
           const bar = host.querySelector("progress");
           if (bar) bar.value = overallPercent();
@@ -536,6 +547,16 @@ export function createBtModuleUpdate(host, opts) {
       );
     } catch (e) {
       abort = null;
+      /* The SDK gave up while reconnecting the client: the page kept the
+         session through that drop, so end it properly now. */
+      if (sdkReconnecting) {
+        sdkReconnecting = false;
+        await opts
+          .disconnect?.()
+          ?.catch?.((err) =>
+            log.warn?.(`disconnecting failed: ${err?.message ?? err}`),
+          );
+      }
       unlistenDevice?.();
       unlistenDevice = null;
       device = null;
@@ -561,6 +582,7 @@ export function createBtModuleUpdate(host, opts) {
     }
 
     abort = null;
+    sdkReconnecting = false;
     phase = "restarting";
     restartStartedAt = Date.now();
     restartTicker = setInterval(() => {
@@ -789,6 +811,11 @@ export function createBtModuleUpdate(host, opts) {
     /** True when a link drop now is part of an update: the module restarting
      * on the image it has just been sent, or the SDK re-opening a link that
      * stalled on large writes. */
+    /** True while the SDK is reconnecting this same client after a stalled
+     * write: the page keeps its session through that drop. */
+    get sdkReconnecting() {
+      return phase === "updating" && sdkReconnecting;
+    },
     get restartExpected() {
       return (
         phase === "restarting" ||

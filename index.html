@@ -5255,6 +5255,17 @@
        * whose writable stream was never closed is a file they cannot read.
        */
       async function onDisconnected(reason) {
+        /* The module update's SDK is reconnecting this same client after a
+                 stalled write: the session survives the drop, and tearing it down
+                 here would leave a later reconnect to build a second client on
+                 the same device. If the SDK gives up, the update panel ends the
+                 session itself. */
+        if (btUpdate.sdkReconnecting) {
+          log.log(
+            "the link dropped while the Bluetooth module update reconnects; keeping the session",
+          );
+          return;
+        }
         streaming = false;
         sdLogging = false;
         if (recorder.active) {
