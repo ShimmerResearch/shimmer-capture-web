@@ -1397,3 +1397,62 @@ input.cal-cell.faint {
     height: 150px;
   }
 }
+
+/* =========================================================================
+   Bluetooth module update (common/bt-module-update.js) - a full-width row
+   between the link/device cards and the tabs. The host is empty unless an
+   update is offered, and then takes no space at all.
+   ========================================================================= */
+.bt-update-host:not(:empty) {
+  margin: 12px 0;
+}
+
+.bt-update {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+}
+
+.bt-update > div:first-child {
+  flex: 1 1 320px;
+}
+
+.bt-update .muted {
+  flex: 1 1 100%;
+}
+
+.bt-update .row {
+  margin: 0;
+}
+
+.bt-update progress {
+  flex: 1 1 100%;
+}
+
+/* The dismiss x on a finished update's banner: top right, out of the text's
+   way, quiet until hovered. */
+.bt-update:has(.bt-update-dismiss) {
+  padding-right: 36px;
+}
+
+.bt-update-dismiss {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.bt-update-dismiss:hover,
+.bt-update-dismiss:focus-visible {
+  color: var(--ink);
+}

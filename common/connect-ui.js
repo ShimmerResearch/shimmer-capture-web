@@ -86,6 +86,7 @@ const MIN_USEFUL_SDK = "0.1.12";
  *   disconnect: () => Promise<void>,
  *   readonly session: object|null,
  *   setConnected: (on: boolean, label?: string) => void,
+ *   setLocked: (reason: string|null) => void,
  *   support: object,
  *   connectFailureHints: (mode: string, err: unknown) => string[],
  *   logPortIdentity: (transport: unknown) => void,
@@ -115,6 +116,19 @@ export function createConnectController(cfg) {
 
   /** @type {{client: unknown, mode: string, transport: unknown, label: string}|null} */
   let session = null;
+  /**
+   * Set while something else owns the link, such as the Bluetooth module
+   * update: its transfer, the module's restart and the reconnects that follow
+   * all drop and re-open the link themselves, and a connect or Disconnect
+   * clicked meanwhile would race them. It holds the BUTTONS only; the owner's
+   * own calls to connectVia still go through.
+   * @type {string|null}
+   */
+  let lockReason = null;
+  /** What setConnected last showed, so unlocking can restore it. */
+  let shownConnected = false;
+  /** @type {string|undefined} */
+  let shownLabel;
   let connecting = false;
   /** Guards the disconnect path against firing twice for one drop. */
   let disconnectReported = false;
@@ -142,10 +156,19 @@ export function createConnectController(cfg) {
    * @param {string} [label] pill text while connected
    */
   function setConnected(on, label) {
-    if (els.ble) els.ble.disabled = on || connecting || !support.webBluetooth;
-    if (els.bt) els.bt.disabled = on || connecting || !support.webSerial;
-    if (els.usb) els.usb.disabled = on || connecting || !support.webSerial;
-    if (els.disconnect) els.disconnect.disabled = !on;
+    shownConnected = !!on;
+    shownLabel = label;
+    if (els.ble)
+      els.ble.disabled =
+        on || connecting || !!lockReason || !support.webBluetooth;
+    if (els.bt)
+      els.bt.disabled = on || connecting || !!lockReason || !support.webSerial;
+    if (els.usb)
+      els.usb.disabled = on || connecting || !!lockReason || !support.webSerial;
+    if (els.disconnect) els.disconnect.disabled = !on || !!lockReason;
+    for (const b of [els.ble, els.bt, els.usb, els.disconnect]) {
+      if (b) b.title = lockReason ?? "";
+    }
     if (els.pill) {
       els.pill.textContent = on
         ? (label ?? session?.label ?? "connected")
@@ -492,6 +515,14 @@ export function createConnectController(cfg) {
       return session;
     },
     setConnected,
+    /**
+     * Hold every connect button and Disconnect while `reason` is set (shown
+     * as their tooltip); `null` releases them to the connected state.
+     */
+    setLocked(reason) {
+      lockReason = reason || null;
+      setConnected(shownConnected, shownLabel);
+    },
     support,
     connectFailureHints,
     logPortIdentity,

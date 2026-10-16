@@ -274,6 +274,17 @@ CYW20820 in the Vela module (`CYW20820 v1.4.18.18`). It reads `not reported`
 when the module has not answered the firmware's version query — which is a
 real state on a sensor asked early enough, not an error.
 
+When a Shimmer3R's module is older than the Bluetooth firmware this site
+carries, the panel offers an update under the identity rows. The site carries
+exactly one image, so there is nothing to choose. Over BLE it is one click:
+the page sends the image to the module's own update service, waits for the
+sensor to restart, reconnects without the device picker and confirms the new
+version. Over Classic Bluetooth or USB-C the module's update service is out of
+reach, so the panel offers to reconnect over BLE first. An update that fails
+or is cancelled leaves the module on its old firmware, and the offer comes
+back. `common/README.md` has the details; `firmware/if820/README.md` says how
+to replace the image.
+
 It sits there rather than on the Configure tab because two of those facts gate
 work everywhere else. Whether the sensor is sensing decides both an SD download
 and a name write, and the battery is the thing to check before starting a long
@@ -670,3 +681,11 @@ against Consensys reading the same sensor, in this order:
   obvious the moment you compare it with the Device panel's clock.
 - **The sensor rules**, by writing an image that breaks one and reading it back:
   the device should correct exactly what the banner predicted.
+- **The Bluetooth module update.** Run end to end on a Shimmer3R from Chrome on
+  Windows: v1.4.16.16 to v1.4.18.18 in 31 s, confirmed on the first reconnect,
+  with sensor firmware that reboots itself after the module restarts
+  (shimmer3r-firmware DEV-1164). Not yet seen on hardware from Chrome: the
+  fallback that reconnects and carries on with 63-byte writes when the link
+  stalls on 512-byte ones (the mock and the SDK's tests cover it). Offered
+  only to a Shimmer3R on LogAndStream v1.01.022 or later. No module image is
+  bundled yet, so the deployed page offers no update.

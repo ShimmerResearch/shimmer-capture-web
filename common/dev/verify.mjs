@@ -3559,6 +3559,7 @@ console.log("\n--- one SDK copy, reached one way ---");
 const SDK_CONSUMERS = [
   "index.html",
   "common/brand-editor.js",
+  "common/bt-module-update.js",
   "common/calibration-editor.js",
   "common/device-clock.js",
   "common/factory-test-panel.js",
@@ -4297,6 +4298,7 @@ const MUST_EXPLAIN = {
     "brandBusy",
     "calibBusy",
     "testBusy",
+    "otaBusy",
   ],
   sdUnavailableReason: [
     "streaming",
@@ -4305,6 +4307,7 @@ const MUST_EXPLAIN = {
     "brandBusy",
     "calibBusy",
     "testBusy",
+    "otaBusy",
   ],
   brandUnavailableReason: [
     "streaming",
@@ -4313,6 +4316,7 @@ const MUST_EXPLAIN = {
     "sdBusy",
     "calibBusy",
     "testBusy",
+    "otaBusy",
   ],
   calibLinkHeldReason: [
     "streaming",
@@ -4321,6 +4325,7 @@ const MUST_EXPLAIN = {
     "sdBusy",
     "brandBusy",
     "testBusy",
+    "otaBusy",
   ],
   /* The self-test is the sixth holder, and the first that outlives its own
      Cancel: the firmware has no abort, so testBusy stays up while the sensor
@@ -4333,6 +4338,7 @@ const MUST_EXPLAIN = {
     "sdBusy",
     "brandBusy",
     "calibBusy",
+    "otaBusy",
   ],
   /* The drift monitor is the one panel that waits instead of closing, so its
      skip reason has to name every holder INCLUDING the self-test it shares a
@@ -4345,6 +4351,20 @@ const MUST_EXPLAIN = {
     "brandBusy",
     "calibBusy",
     "testBusy",
+    "otaBusy",
+  ],
+  /* The Bluetooth module update is the seventh holder. It names every other
+     one, and every other one names it, because it owns the link for the
+     longest of any of them: through the module's restart and the reconnect. */
+  btUpdateHeldReason: [
+    "streaming",
+    "sdLogging",
+    "linkTesting",
+    "sdBusy",
+    "brandBusy",
+    "calibBusy",
+    "testBusy",
+    "busy",
   ],
 };
 
@@ -5671,6 +5691,396 @@ check(
     wrap.deviceMs > 0,
   `sensor ${new Date(wrap.unixMs).toISOString()}, ` +
     `${((wrap.unixMs - wrap.hostMs) / 1000).toFixed(1)} s ahead of this host`,
+);
+
+// ===========================================================================
+console.log("\n--- Bluetooth module update (DEV-1164) ---");
+/* Until a module release is chosen the deployable tree carries no image, and
+   with no manifest the page never offers an update. When one is added, this
+   check goes with it. */
+const btShipped = await (
+  await fetch(`${BASE}firmware/if820/manifest.json`)
+).status;
+check(
+  "the deployable tree carries no module image yet, so nothing is offered",
+  btShipped === 404,
+  `firmware/if820/manifest.json: HTTP ${btShipped}`,
+);
+/* The mock link is not Web Bluetooth, so the page swaps the client's module
+   update for one that runs the SDK's real OTA protocol against a scripted
+   OTA service (`createMockIf820OtaDevice`). What this pass proves is the
+   page's side: when it offers the update, that the bundled image reaches the
+   module intact, and that the reconnect after the module's restart confirms
+   the new version. */
+const btLine = (v) =>
+  encodeURIComponent(
+    `CYW20820 app=v${v}, stack=0x00000000, protocol=0x0103, hardware=0x00`,
+  );
+const BT_PANEL = `
+  const P = () => document.getElementById('btUpdatePanel');
+  const waitFor = async (fn, ms) => {
+    for (let i = 0; i < ms / 100 && !fn(); i++)
+      await new Promise((r) => setTimeout(r, 100));
+    return fn();
+  };
+`;
+
+await goto(`${BASE}?mock=1`);
+check(
+  "connect with a current Bluetooth module",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btCurrent = await evaluate(`
+  ${BT_PANEL}
+  await new Promise((r) => setTimeout(r, 500));
+  return P().textContent;
+`);
+check(
+  "a module already on the bundled version is offered nothing",
+  btCurrent === "",
+  btCurrent.slice(0, 80) || "(panel empty)",
+);
+
+/* Only a Shimmer3R on LogAndStream v1.01.022 or later is offered the update:
+   older firmware does not recover by itself once the module restarts, and
+   does not repair the SPP MTU an update leaves broken on v1.4.18.x. */
+await goto(`${BASE}?mock=1&fw=1.01.021&btVersion=${btLine("01.04.16.16")}`);
+check(
+  "connect an older module on a Shimmer3R with v1.01.021",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btOldFw = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().textContent !== "", 3000);
+  return {
+    text: P().textContent,
+    button: !!P().querySelector('button.primary, button:not(.bt-update-dismiss)'),
+  };
+`);
+check(
+  "older sensor firmware is told to update first, and offered no update",
+  /must be updated first/.test(btOldFw.text) &&
+    /LogAndStream v1\.01\.022 or later/.test(btOldFw.text) &&
+    !btOldFw.button,
+  `${btOldFw.text.slice(0, 110)} | button ${btOldFw.button}`,
+);
+
+await goto(
+  `${BASE}?mock=1&hw=3&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
+check(
+  "connect a Shimmer3 reporting an older IF820",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btShimmer3 = await evaluate(`
+  ${BT_PANEL}
+  await new Promise((r) => setTimeout(r, 1500));
+  return P().textContent;
+`);
+check(
+  "a sensor that is not a Shimmer3R is offered nothing",
+  btShimmer3 === "",
+  btShimmer3.slice(0, 80) || "(panel empty)",
+);
+
+await goto(
+  `${BASE}?mock=1&framed=0&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
+check(
+  "connect an older module over a serial-like link",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btSerial = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button'), 3000);
+  return { text: P().textContent, button: P().querySelector('button')?.textContent ?? null };
+`);
+check(
+  "off BLE, the update is offered as a reconnect over BLE",
+  /v1\.4\.18\.18/.test(btSerial.text) &&
+    /v1\.4\.16\.16/.test(btSerial.text) &&
+    /Reconnect over BLE/.test(btSerial.button ?? ""),
+  `${btSerial.button} | ${btSerial.text.slice(0, 90)}`,
+);
+
+await goto(`${BASE}?mock=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`);
+check("connect an older module over BLE", (await evaluate(CONNECT)) === "mock");
+const btRun = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
+  const offered = P().textContent;
+  const manifest = await (await fetch('common/dev/if820-mock/manifest.json')).json();
+  const image = new Uint8Array(
+    await (await fetch('common/dev/if820-mock/' + manifest.file)).arrayBuffer(),
+  );
+  // The reconnect builds a new scripted module, so hold on to this one.
+  const dev = window.mockOtaDevice;
+  P().querySelector('button.primary').click();
+  let sawProgress = false;
+  let applyDuring = null;
+  let connButtonsDuring = null;
+  await waitFor(() => {
+    if (P().querySelector('progress')) {
+      sawProgress = true;
+      if (applyDuring === null) applyDuring = document.getElementById('btnRefreshDevice').disabled;
+      if (connButtonsDuring === null) {
+        connButtonsDuring = ['btnBle', 'btnBt', 'btnUsb', 'btnDisconnect'].every(
+          (id) => document.getElementById(id).disabled,
+        );
+      }
+    }
+    return P().querySelector('.banner.ok, .banner.err');
+  }, 60000);
+  /* The confirming reconnect builds a fresh mock sensor; the page's
+     post-connect reads must reach its calibration dump (0x9A on the wire)
+     rather than be refused because the update still held the link. */
+  await waitFor(
+    () =>
+      window.mockTransport !== undefined &&
+      window.mockOtaDevice !== dev &&
+      window.mockTransport.writes.some((w) => w.bytes[0] === 0x9a),
+    10000,
+  );
+  const got = dev.received();
+  let same = got.length === image.length;
+  for (let i = 0; same && i < got.length; i++) same = got[i] === image[i];
+  await new Promise((r) => setTimeout(r, 300));
+  return {
+    offered,
+    sawProgress,
+    refreshDisabledDuring: applyDuring,
+    connButtonsDuring,
+    disconnectAfter: document.getElementById('btnDisconnect').disabled,
+    result: P().textContent,
+    ok: !!P().querySelector('.banner.ok'),
+    same,
+    bytes: got.length,
+    commands: dev.commands.map((c) => c[0]),
+    firstWrite: dev.writes[0],
+    calAfter: {
+      read:
+        window.mockOtaDevice !== dev &&
+        window.mockTransport.writes.some((w) => w.bytes[0] === 0x9a),
+    },
+    idBt: document.getElementById('idBtModule').textContent,
+    pill: document.getElementById('connPill').textContent,
+  };
+`);
+check(
+  "an older module over BLE is offered the bundled version",
+  /available/.test(btRun.offered) && /v1\.4\.18\.18/.test(btRun.offered),
+  btRun.offered.slice(0, 90),
+);
+check(
+  "the update shows progress and holds the rest of the page off the link",
+  btRun.sawProgress && btRun.refreshDisabledDuring === true,
+  `progress ${btRun.sawProgress}, Refresh disabled ${btRun.refreshDisabledDuring}`,
+);
+check(
+  "the connect buttons and Disconnect are held while the update owns the link",
+  btRun.connButtonsDuring === true && btRun.disconnectAfter === false,
+  `held during ${btRun.connButtonsDuring}, Disconnect disabled after ${btRun.disconnectAfter}`,
+);
+check(
+  "the module receives the bundled image byte for byte, then VERIFY",
+  btRun.same && btRun.commands.join(",") === "1,2,3",
+  `${btRun.bytes} bytes, commands ${btRun.commands.join(",")}`,
+);
+check(
+  "after the restart the page reconnects and confirms the new version",
+  btRun.ok && /v1\.4\.18\.18/.test(btRun.idBt) && /mock/.test(btRun.pill),
+  `${btRun.result.slice(0, 60)} | ${btRun.idBt} | ${btRun.pill}`,
+);
+
+check(
+  "the reconnect after the update reads the calibration, not refused by the update",
+  btRun.calAfter.read,
+  btRun.calAfter.read
+    ? "GET_CALIB_DUMP sent on the confirming reconnect"
+    : "no calibration read after the update",
+);
+const btDismiss = await evaluate(`
+  const P = () => document.getElementById('btUpdatePanel');
+  const x = P().querySelector('.bt-update-dismiss');
+  x?.click();
+  return { hadX: !!x, left: P().textContent };
+`);
+check(
+  "the finished update's banner has a dismiss x that clears it",
+  btDismiss.hadX && btDismiss.left === "",
+  btDismiss.hadX
+    ? `after click: "${btDismiss.left.slice(0, 40)}"`
+    : "no dismiss button",
+);
+check(
+  "the update starts with 512-byte writes",
+  btRun.firstWrite === 512,
+  `first data write ${btRun.firstWrite} bytes`,
+);
+
+/* A link whose packet airtime only fits 63-byte writes: the real module never
+   answers a larger one. The SDK drops and re-opens the link and carries on at
+   63; the page must see an update that succeeds, not a disconnect. */
+await goto(
+  `${BASE}?mock=1&otaStall=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
+check(
+  "connect an older module on a slow-airtime link",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btStall = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
+  const dev = window.mockOtaDevice;
+  P().querySelector('button.primary').click();
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 75000);
+  const lines = [...document.querySelectorAll('#log .log-line')].map((l) => l.textContent);
+  return {
+    ok: !!P().querySelector('.banner.ok'),
+    text: P().textContent,
+    writes: [...new Set(dev.writes)],
+    disconnects: dev.disconnects,
+    connects: dev.connects,
+    retryLine: lines.some((l) => /512-byte writes stalled the link; continuing with 63-byte/.test(l)),
+    errToast: [...document.querySelectorAll('.toast')].some((t) => /disconnected/i.test(t.textContent)),
+    idBt: document.getElementById('idBtModule').textContent,
+  };
+`);
+check(
+  "a stalled 512-byte write reconnects and finishes at 63 bytes",
+  btStall.ok &&
+    btStall.writes[0] === 512 &&
+    btStall.writes.includes(63) &&
+    btStall.writes.slice(1).every((n) => n <= 63) &&
+    btStall.disconnects === 1 &&
+    btStall.connects === 1 &&
+    btStall.retryLine &&
+    /v1\.4\.18\.18/.test(btStall.idBt),
+  `${btStall.text.slice(0, 50)} | writes ${btStall.writes} | drop ${btStall.disconnects}/${btStall.connects} | ${btStall.idBt}`,
+);
+check(
+  "and the page does not report that reconnect as a lost sensor",
+  !btStall.errToast,
+  btStall.errToast ? "a 'disconnected' toast was shown" : "no disconnect toast",
+);
+
+/* The bench case: the first reconnect after the update reaches a sensor
+   whose MCU has not rebooted onto the module yet, so it still reports the
+   old version. The panel must keep asking, not fail on the first answer. */
+await goto(
+  `${BASE}?mock=1&otaLate=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
+check(
+  "connect an older module whose sensor restarts late",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btLate = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
+  P().querySelector('button.primary').click();
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 90000);
+  const lines = [...document.querySelectorAll('#log .log-line')].map((l) => l.textContent);
+  return {
+    ok: !!P().querySelector('.banner.ok'),
+    text: P().textContent,
+    waited: lines.some((l) => /still reports Bluetooth module v1\.4\.16\.16; waiting/.test(l)),
+    idBt: document.getElementById('idBtModule').textContent,
+  };
+`);
+check(
+  "a sensor that first reports the old version is waited for, not failed",
+  btLate.ok && btLate.waited && /v1\.4\.18\.18/.test(btLate.idBt),
+  `${btLate.text.slice(0, 50)} | waited ${btLate.waited} | ${btLate.idBt}`,
+);
+
+/* Cancel mid-transfer: the module must be told to ABORT, never asked to
+   VERIFY, so it keeps the old image; the page must offer the update again on
+   a link that still works, and a second run must go through. Each chunk is
+   slowed (`otaMs`) so there is a transfer in progress to cancel. */
+await goto(
+  `${BASE}?mock=1&otaMs=40&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
+check(
+  "connect an older module for a cancelled update",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btCancel = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
+  const dev = window.mockOtaDevice;
+  P().querySelector('button.primary').click();
+  await waitFor(() => dev.writes.length >= 2, 10000);
+  const cancel = [...P().querySelectorAll('button')].find((b) => b.textContent === 'Cancel');
+  cancel?.click();
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 10000);
+  const afterCancel = {
+    hadCancel: !!cancel,
+    commands: dev.commands.map((c) => c[0]),
+    partial: dev.writes.length,
+    offeredAgain: !!P().querySelector('button.primary:not([disabled])'),
+    idBt: document.getElementById('idBtModule').textContent,
+    pill: document.getElementById('connPill').textContent,
+    refresh: document.getElementById('btnRefreshDevice').disabled,
+  };
+  P().querySelector('button.primary').click();
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 60000);
+  return {
+    ...afterCancel,
+    retryOk: !!P().querySelector('.banner.ok'),
+    retryCommands: dev.commands.map((c) => c[0]),
+    idBtAfter: document.getElementById('idBtModule').textContent,
+  };
+`);
+check(
+  "Cancel mid-transfer sends ABORT and never VERIFY",
+  btCancel.hadCancel &&
+    btCancel.commands.join(",") === "1,2,7" &&
+    btCancel.partial >= 2,
+  `cancel button ${btCancel.hadCancel}, commands ${btCancel.commands.join(",")}, ${btCancel.partial} writes before cancel`,
+);
+check(
+  "after a cancel the old version stays and the link is free to use",
+  btCancel.offeredAgain &&
+    /v1\.4\.16\.16/.test(btCancel.idBt) &&
+    /mock/.test(btCancel.pill) &&
+    btCancel.refresh === false,
+  `${btCancel.idBt} | ${btCancel.pill} | Refresh disabled ${btCancel.refresh}`,
+);
+check(
+  "and the update runs to completion on the same link afterwards",
+  btCancel.retryOk &&
+    btCancel.retryCommands.join(",") === "1,2,7,1,2,3" &&
+    /v1\.4\.18\.18/.test(btCancel.idBtAfter),
+  `${btCancel.retryCommands.join(",")} | ${btCancel.idBtAfter}`,
+);
+
+await goto(
+  `${BASE}?mock=1&otaFail=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`,
+);
+check(
+  "connect an older module whose update will fail",
+  (await evaluate(CONNECT)) === "mock",
+);
+const btFail = await evaluate(`
+  ${BT_PANEL}
+  await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
+  P().querySelector('button.primary').click();
+  await waitFor(() => P().querySelector('.banner.ok, .banner.err'), 60000);
+  return {
+    text: P().textContent,
+    err: !!P().querySelector('.banner.err'),
+    idBt: document.getElementById('idBtModule').textContent,
+    pill: document.getElementById('connPill').textContent,
+    refresh: document.getElementById('btnRefreshDevice').disabled,
+  };
+`);
+check(
+  "a refused image is reported, the old version stays, and the link is free again",
+  btFail.err &&
+    /verification failed/.test(btFail.text) &&
+    /v1\.4\.16\.16/.test(btFail.idBt) &&
+    btFail.refresh === false,
+  `${btFail.text.slice(0, 70)} | ${btFail.idBt} | Refresh disabled ${btFail.refresh}`,
 );
 
 // ===========================================================================

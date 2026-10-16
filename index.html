@@ -553,6 +553,13 @@
         </aside>
       </div>
 
+      <!-- The Bluetooth module update (common/bt-module-update.js): full width
+           under the link and device row, where it has room for its progress
+           bar and is seen before any tab. Empty, and so taking no space,
+           unless this sensor's module is older than the one image the site
+           carries. -->
+      <div id="btUpdatePanel" class="bt-update-host"></div>
+
       <!-- ===================================================== Tabs ====== -->
       <!-- General first, as in the Verisense device console: the one-shot
            commands somebody reaches for straight after connecting (what time
@@ -1142,9 +1149,12 @@
       import { createCalibrationEditor } from "./common/calibration-editor.js";
       import { createFactoryTestPanel } from "./common/factory-test-panel.js";
       import { createRtcDriftPanel } from "./common/rtc-drift-panel.js";
+      import { createBtModuleUpdate } from "./common/bt-module-update.js";
       import { readDeviceRwc, canReadRwc } from "./common/device-clock.js";
       import {
         createMockShimmer3RTransport,
+        createMockIf820OtaDevice,
+        mockCyw20820VersionLine,
         mockEnabledFromUrl,
       } from "./common/dev/mock-shimmer3r.js";
       /* The whole namespace, not destructured names: a vendored bundle that
@@ -1588,6 +1598,33 @@
        * abort and the sensor goes on printing its report to its own end.
        */
       let testBusy = false;
+      /**
+       * True for the whole of a Bluetooth module update — the transfer, the
+       * module's restart and the reconnect after it. The update owns the link
+       * end to end, and the reconnect is part of it, so nothing else may start
+       * in between.
+       */
+      let otaBusy = false;
+      /**
+       * Set only while the Bluetooth module update reconnects after the
+       * module's restart: the BLE factory then reuses this device instead of
+       * opening the picker.
+       */
+      let pendingBleDevice = null;
+      /** Mock link only: connects the scripted sensor; see setUpMock. */
+      let connectMock = null;
+      /**
+       * Mock link only: the module version the scripted sensor reports after
+       * a mock Bluetooth module update, which outlives the reconnect the way
+       * a real module's new firmware does.
+       */
+      let mockBtVersionAfterUpdate = null;
+      /**
+       * Mock link only, `&otaLate=1`: connects still to report the OLD module
+       * version after an update, as a real sensor does while its MCU has not
+       * yet rebooted onto the module (bench, 2026-10-11).
+       */
+      let mockConnectsBeforeNewVersion = 0;
 
       // =====================================================================
       // Small helpers
@@ -1669,6 +1706,56 @@
 
       const gate = createGate(document);
 
+      /* Mounted here, ahead of regate(), which reads it. Everything it is
+               handed is looked up when called, so the connect controller further
+               down can be referenced before it exists. */
+      /* The image the site offers. The mock link uses a synthetic one under
+               common/dev/, so the update can be exercised with no module image in
+               the deployable tree at all - which is how the feature ships switched
+               off until a release is chosen (firmware/if820/README.md). */
+      const BT_MODULE_MANIFEST = mockEnabledFromUrl()
+        ? "common/dev/if820-mock/manifest.json"
+        : "firmware/if820/manifest.json";
+      const btUpdate = createBtModuleUpdate($("btUpdatePanel"), {
+        manifestUrl: BT_MODULE_MANIFEST,
+        client: () => client,
+        mode: () => mode,
+        log,
+        toast: showToast,
+        linkHeldReason: () => btUpdateHeldReason(),
+        onBusyChange: (on) => {
+          otaBusy = on;
+          /* The update drops and re-opens the link itself; a connect or
+                   Disconnect click meanwhile would race it, and a Disconnect during
+                   the module's image switch is the one thing it must not see. */
+          connect.setLocked(
+            on
+              ? "The Bluetooth module is being updated — wait for it to finish, or use Cancel."
+              : null,
+          );
+          regate();
+        },
+        /* A Classic Bluetooth or USB link cannot reach the module's update
+                 service. The click that asks for this is the user gesture the
+                 device picker needs. */
+        switchToBle: async () => {
+          await disconnectFromSensor();
+          return connect.connectVia("ble");
+        },
+        reconnectBle: async (device) => {
+          /* The mock sensor has no BluetoothDevice; it reconnects its own
+                   way, through the same code its button runs. */
+          if (connectMock) return connectMock();
+          pendingBleDevice = device;
+          try {
+            return await connect.connectVia("ble");
+          } finally {
+            pendingBleDevice = null;
+          }
+        },
+        disconnect: () => disconnectFromSensor(),
+      });
+
       /**
        * Re-apply every `data-requires` / `data-cap` gate, then the handful of
        * states no attribute can express.
@@ -1692,7 +1779,7 @@
           connected: !!client,
           streaming,
           recording: recorder.active,
-          busy: busy || sdBusy || brandBusy || calibBusy || testBusy,
+          busy: busy || sdBusy || brandBusy || calibBusy || testBusy || otaBusy,
           caps,
         });
 
@@ -1710,7 +1797,8 @@
             !busy &&
             !brandBusy &&
             !calibBusy &&
-            !testBusy,
+            !testBusy &&
+            !otaBusy,
         );
         paintSdGating();
 
@@ -1722,7 +1810,8 @@
             !busy &&
             !sdBusy &&
             !calibBusy &&
-            !testBusy,
+            !testBusy &&
+            !otaBusy,
         );
         paintBrandGating();
 
@@ -1740,7 +1829,8 @@
             !busy &&
             !sdBusy &&
             !brandBusy &&
-            !testBusy,
+            !testBusy &&
+            !otaBusy,
         );
         paintCalibGating();
 
@@ -1756,7 +1846,8 @@
             !sdBusy &&
             !brandBusy &&
             !calibBusy &&
-            !linkTesting,
+            !linkTesting &&
+            !otaBusy,
         );
         /* The drift monitor is not disabled by the other panels: it takes one
                  round trip every N seconds and simply SKIPS a tick while somebody
@@ -1766,6 +1857,10 @@
           !!client && !!caps.rtcRead && !streaming && !sdLogging && !testBusy,
         );
         paintTestGating();
+
+        /* The update's own flag is excluded, like every panel's: its Cancel
+                 button must stay live while it runs. */
+        btUpdate.setEnabled(!!client && !btUpdateHeldReason());
 
         // Page state, not device state: these must work while disconnected so
         // an image can be inspected, saved or thrown away.
@@ -1853,6 +1948,9 @@
         }
         if (testBusy) {
           return "The self-test is running. The sensor answers nothing else until its report ends — wait for the TEST END line.";
+        }
+        if (otaBusy) {
+          return "The Bluetooth module is being updated. It owns the link until the sensor has restarted and reconnected — wait for it to finish.";
         }
         return null;
       }
@@ -3668,6 +3766,9 @@
         if (testBusy) {
           return "The sensor is running its self-test and answers nothing else until the report ends — wait for it to finish (up to about a minute).";
         }
+        if (otaBusy) {
+          return "The Bluetooth module is being updated. It owns the link until the sensor has restarted and reconnected — wait for it to finish.";
+        }
         return null;
       }
 
@@ -3870,6 +3971,9 @@
         if (testBusy) {
           return "The sensor is running its self-test and answers nothing else until the report ends — wait for it to finish.";
         }
+        if (otaBusy) {
+          return "The Bluetooth module is being updated. It owns the link until the sensor has restarted and reconnected — wait for it to finish.";
+        }
         return null;
       }
 
@@ -3915,6 +4019,9 @@
         }
         if (calibBusy) {
           return "A calibration write is using the link — wait for it to finish.";
+        }
+        if (otaBusy) {
+          return "The Bluetooth module is being updated. It owns the link until the sensor has restarted and reconnected — wait for it to finish.";
         }
         return null;
       }
@@ -3982,6 +4089,7 @@
         if (brandBusy) return "a device-naming write is using the link";
         if (calibBusy) return "a calibration write is using the link";
         if (busy) return "another command is in flight";
+        if (otaBusy) return "the Bluetooth module is being updated";
         return null;
       }
 
@@ -4086,6 +4194,38 @@
        * EEPROM. What is left is a sensor that is not connected, a sensor that
        * is sensing, and an SD transfer holding the link.
        */
+      /**
+       * Why the Bluetooth module update cannot take the link right now, or
+       * null. Every other holder is named, as the verify pass requires.
+       */
+      function btUpdateHeldReason() {
+        /* A command still waiting for its answer - the post-connect reads
+                 among them. The update writes straight to the module, so starting
+                 it now would interleave with that exchange. */
+        if (busy) {
+          return "The sensor is still answering another command — try again in a moment.";
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing. Stop the stream (or the SD recording) before updating the Bluetooth module — the sensor restarts at the end of the update.";
+        }
+        if (linkTesting) {
+          return "The throughput test is running — wait the few seconds for it to finish.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link — wait for it to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link — wait for it to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link — wait for it to finish.";
+        }
+        if (testBusy) {
+          return "The sensor is running its self-test — wait for its report to end.";
+        }
+        return null;
+      }
+
       function brandUnavailableReason() {
         if (!client) {
           return "Connect over BLE, Classic Bluetooth or USB-C to see the names this sensor advertises, and to change them.";
@@ -4107,6 +4247,9 @@
         }
         if (testBusy) {
           return "The sensor is running its self-test — wait for its report to end before changing the names.";
+        }
+        if (otaBusy) {
+          return "The Bluetooth module is being updated. It owns the link until the sensor has restarted and reconnected — wait for it to finish.";
         }
         return null;
       }
@@ -4443,7 +4586,7 @@
        * layout moves this page with it. Returns null when the vendored bundle
        * is too old to export the pieces, which the caller degrades over.
        */
-      function makeBleTransport() {
+      function makeBleTransport(device = null) {
         const defaults = sdk.SHIMMER3R_DEFAULTS;
         if (typeof sdk.WebBluetoothTransport !== "function" || !defaults) {
           return null;
@@ -4471,8 +4614,19 @@
           rxFlowCharUUID: defaults.CHAR_RX_FLOW_UUID,
           requestDeviceOptions: {
             filters: [{ services: [defaults.SERVICE_UUID] }],
-            optionalServices: [defaults.SERVICE_UUID],
+            /* The Bluetooth module's OTA services too, as the client's own
+                     requestedOptionalServices() does: Web Bluetooth only lets the
+                     page reach services granted here, and granting them now is what
+                     lets a module update run on this connection without a second
+                     picker. Absent from an SDK that predates them. */
+            optionalServices: [
+              defaults.SERVICE_UUID,
+              ...(sdk.IF820_OTA_SERVICE_UUIDS ?? []),
+            ],
           },
+          /* Set only by the Bluetooth module update's reconnect, which goes
+                   back to the same sensor without the picker. */
+          device,
           defaultWriteWithResponse: true,
           debug: false,
           logTag: "[Shimmer3R:ble]",
@@ -4506,7 +4660,7 @@
                    protocol is ACK-first and its commands are written with a
                    response. */
           ble: () => {
-            const raw = makeBleTransport();
+            const raw = makeBleTransport(pendingBleDevice);
             if (!raw) {
               /* An older vendored bundle with no WebBluetoothTransport export:
                        fall back to the client's own, which costs the tap on this
@@ -4688,6 +4842,10 @@
           return;
         }
         await tryDevice("enable the link CRC", () => client.setCrcMode(want));
+        /* The link can drop while this waits - a sensor restarting under a
+           reconnect does exactly that - and the disconnect handler clears
+           `client`; there is then nothing to read back. */
+        if (!client) return;
         /* Read back from the client rather than from the call: `crcMode` only
                  advances on a successful ACK, so this cannot end up expecting bytes
                  the device is not sending. */
@@ -4796,6 +4954,16 @@
           idHw: hardwareLabel(hw?.hardwareVersion, srBoard),
           idFw: firmwareLabel(fw),
           idBtModule: btModule?.label ?? "(not read)",
+        });
+        /* Offers the module update when this module is older than the image
+                 the site carries, on a Shimmer3R whose firmware supports it;
+                 after an update's own reconnect, confirms it. */
+        void btUpdate.check(btModule, {
+          hardwareVersion: hw?.hardwareVersion,
+          firmwareId: fw?.fwId,
+          major: fw?.major,
+          minor: fw?.minor,
+          internal: fw?.patch,
         });
 
         const info = await tryDevice("inquire the channel list", () =>
@@ -4936,6 +5104,16 @@
           idBatt: batteryLabel(batt),
           idBtModule: btModule?.label ?? "(not read)",
         });
+        /* Offers the module update when this module is older than the image
+                 the site carries, on a Shimmer3R whose firmware supports it;
+                 after an update's own reconnect, confirms it. */
+        void btUpdate.check(btModule, {
+          hardwareVersion: id?.hardwareVersion,
+          firmwareId: version?.firmwareIdentifier,
+          major: version?.firmwareVersionMajor,
+          minor: version?.firmwareVersionMinor,
+          internal: version?.firmwareVersionInternal,
+        });
         $("hostClock").textContent = formatClock(Date.now());
 
         const ctx = {
@@ -5007,6 +5185,7 @@
       function resetAfterDisconnect() {
         streaming = false;
         sdLogging = false;
+        btUpdate.onDisconnected();
         /* Back to reporting the selection, because the link that a CRC was
                  agreed on has gone and leaving "CRC 2 bytes" up would describe a
                  connection that no longer exists.
@@ -5076,6 +5255,17 @@
        * whose writable stream was never closed is a file they cannot read.
        */
       async function onDisconnected(reason) {
+        /* The module update's SDK is reconnecting this same client after a
+                 stalled write: the session survives the drop, and tearing it down
+                 here would leave a later reconnect to build a second client on
+                 the same device. If the SDK gives up, the update panel ends the
+                 session itself. */
+        if (btUpdate.sdkReconnecting) {
+          log.log(
+            "the link dropped while the Bluetooth module update reconnects; keeping the session",
+          );
+          return;
+        }
         streaming = false;
         sdLogging = false;
         if (recorder.active) {
@@ -5084,12 +5274,19 @@
         }
         plot.pause();
         stats.render();
+        /* Read before the reset below, which tells the update panel the link
+                 has gone. */
+        const updateRestart = btUpdate.restartExpected;
         resetAfterDisconnect();
         connect.setConnected(false);
-        showToast(
-          `The sensor disconnected (${reason?.message ?? reason ?? "link lost"})`,
-          "err",
-        );
+        if (updateRestart) {
+          log.log("the sensor is restarting after its Bluetooth module update");
+        } else {
+          showToast(
+            `The sensor disconnected (${reason?.message ?? reason ?? "link lost"})`,
+            "err",
+          );
+        }
       }
 
       // =====================================================================
@@ -5220,7 +5417,7 @@
           }, at ${fmtHz(rateHz)}.`,
         );
 
-        btn.addEventListener("click", async () => {
+        connectMock = async () => {
           const transport = createMockShimmer3RTransport({
             framed,
             rateHz,
@@ -5230,7 +5427,10 @@
             factoryTest,
             rtc,
             srBoard,
-            btVersion,
+            btVersion:
+              mockBtVersionAfterUpdate && mockConnectsBeforeNewVersion-- <= 0
+                ? mockBtVersionAfterUpdate
+                : btVersion,
             pressure,
             sensors,
             debug: params.get("debug") === "1",
@@ -5265,6 +5465,29 @@
             transport: tapTransport(transport),
           });
           window.mockClient = mockClient;
+          /* The mock link is not Web Bluetooth, so the SDK's own module update
+                   refuses it. Swapped for one that drives a scripted OTA service end
+                   to end, which "restarts" the sensor on the new version the way a
+                   real module does: `&otaFail=1` fails it at VERIFY, `&otaMs=5`
+                   slows each chunk so the progress bar can be watched, and
+                   `&otaStall=1` leaves writes over 63 bytes unanswered, as the
+                   module does on a slow-airtime link, so the SDK's reconnect
+                   and fallback run. */
+          const otaDevice = createMockIf820OtaDevice({
+            failVerify: params.get("otaFail") === "1",
+            byteDelayMs: Number(params.get("otaMs")) || 0,
+            stallAbove: params.get("otaStall") === "1" ? 63 : undefined,
+            onVerified: () => transport.emitDisconnect(),
+          });
+          window.mockOtaDevice = otaDevice;
+          mockClient.updateBtModuleFirmware = async (image, o = {}) => {
+            const result = await sdk.runIf820OtaUpdate(otaDevice, image, o);
+            const m = await (await fetch(BT_MODULE_MANIFEST)).json();
+            mockBtVersionAfterUpdate = mockCyw20820VersionLine(m.version);
+            mockConnectsBeforeNewVersion =
+              params.get("otaLate") === "1" ? 1 : 0;
+            return result;
+          };
           btn.disabled = true;
           try {
             mockClient.onStatus = (m) => log.log(m);
@@ -5278,13 +5501,16 @@
               label: framed ? "mock (framed)" : "mock (unframed)",
             });
             log.log("mock sensor connected");
+            return true;
           } catch (err) {
             log.error(`mock connect failed: ${err?.message ?? err}`);
             connect.setConnected(false);
+            return false;
           } finally {
             regate();
           }
-        });
+        };
+        btn.addEventListener("click", () => void connectMock());
       }
 
       // =====================================================================
