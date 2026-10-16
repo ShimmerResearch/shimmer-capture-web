@@ -12038,14 +12038,27 @@ function acquireIf820OtaDeviceLease(device) {
     if (updatesInFlight.has(key)) {
         throw new If820OtaError('A Bluetooth module update is already running on this device');
     }
-    updatesInFlight.add(key);
+    let idle;
+    updatesInFlight.set(key, new Promise((r) => (idle = r)));
     let held = true;
     return () => {
         if (!held)
             return;
         held = false;
         updatesInFlight.delete(key);
+        idle();
     };
+}
+/**
+ * Resolves once no Bluetooth module update holds `device` - at once if none
+ * does. An update that has failed or been cancelled can keep the device for
+ * a while after its promise settles, until link work it gave up on has
+ * settled too (see {@link runIf820OtaUpdate}); a host that locks its own UI
+ * for the update waits on this before unlocking it.
+ */
+function whenIf820OtaDeviceIdle(device) {
+    const key = device.gatt ?? device;
+    return updatesInFlight.get(key) ?? Promise.resolve();
 }
 /**
  * {@link runIf820OtaUpdate} for a caller that already holds the device's
@@ -12061,8 +12074,9 @@ onAbandoned) {
 /** How long a cancelled first write may take to settle before the link is
  * treated as stalled and dropped. A healthy write settles in tens of ms. */
 const IF820_OTA_ABORT_GRACE_MS = 500;
-/** Devices with an update running, for {@link runIf820OtaUpdate}'s guard. */
-const updatesInFlight = new WeakSet();
+/** Devices with an update running, for {@link runIf820OtaUpdate}'s guard,
+ * each with the promise that resolves when it is released. */
+const updatesInFlight = new WeakMap();
 async function runUpdate(device, image, opts, 
 /** Told of link work given up on that may still be running. */
 onAbandoned = () => { }) {
@@ -16703,6 +16717,8 @@ class Shimmer3RClient extends BaseShimmerClient {
                 return 0;
             return nextLen;
         };
+        /** The device {@link updateBtModuleFirmware} last ran on. */
+        this._btModuleUpdateDevice = null;
         /** Set for the whole of {@link updateBtModuleFirmware}. */
         this._btModuleUpdateRunning = false;
         /** The update's fallback reconnect while it is in flight; see below. */
@@ -17906,6 +17922,7 @@ class Shimmer3RClient extends BaseShimmerClient {
          * a direct runIf820OtaUpdate, on this same device must not be mid-update
          * while this one sends its version reads, nor get past them alongside. */
         const releaseLease = acquireIf820OtaDeviceLease(t.device);
+        this._btModuleUpdateDevice = t.device;
         const abandoned = [];
         this._btModuleUpdateRunning = true;
         try {
@@ -17954,6 +17971,25 @@ class Shimmer3RClient extends BaseShimmerClient {
                 releaseLease();
             }
         }
+    }
+    /**
+     * Resolves once no Bluetooth module update holds this connection's device:
+     * at once if none does, or when the link is not Web Bluetooth. A failed or
+     * cancelled {@link updateBtModuleFirmware} can keep the device for a while
+     * after it rejects, until link work it gave up on has settled; a host that
+     * locks its UI during the update waits on this before unlocking.
+     */
+    whenBtModuleUpdateIdle() {
+        /* The device the last update ran on, as well as the current link's: a
+         * host that disconnected or switched link after a failed update must
+         * still wait for the device that update is holding. */
+        const devices = new Set();
+        if (this._btModuleUpdateDevice)
+            devices.add(this._btModuleUpdateDevice);
+        const t = this._transport;
+        if (t instanceof WebBluetoothTransport && t.device)
+            devices.add(t.device);
+        return Promise.all([...devices].map((d) => whenIf820OtaDeviceIdle(d))).then(() => { });
     }
     /**
      * The module update's fallback reconnect, one at a time. The update gives
@@ -36298,6 +36334,7 @@ exports.verisenseDfuAttemptLabel = verisenseDfuAttemptLabel;
 exports.verisenseFactoryTestReportToCsvRows = verisenseFactoryTestReportToCsvRows;
 exports.verisenseStreamCsvKey = verisenseStreamCsvKey;
 exports.verisenseStreamCsvLayout = verisenseStreamCsvLayout;
+exports.whenIf820OtaDeviceIdle = whenIf820OtaDeviceIdle;
 exports.wiredPacketLength = wiredPacketLength;
 exports.writeInfoMemFieldValue = writeInfoMemFieldValue;
 exports.writeVerisenseOperationalFieldValue = writeVerisenseOperationalFieldValue;
