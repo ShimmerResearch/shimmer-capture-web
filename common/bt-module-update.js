@@ -154,6 +154,8 @@ export function createBtModuleUpdate(host, opts) {
   let current = null;
   /** if820OtaSensorSupport's answer for the connected sensor. */
   let sensorSupport = null;
+  /** Bumped by every check() and disconnect; see check(). */
+  let checkGeneration = 0;
   let enabled = true;
   let busy = false;
   let abort = null;
@@ -221,9 +223,10 @@ export function createBtModuleUpdate(host, opts) {
     return manifest;
   }
 
-  async function loadImage() {
+  /** @param {AbortSignal} [signal] the update's Cancel, so a slow download stops at once */
+  async function loadImage(signal) {
     if (imageCache) return imageCache;
-    const res = await fetch(manifest.url, { cache: "no-cache" });
+    const res = await fetch(manifest.url, { cache: "no-cache", signal });
     if (!res.ok) throw new Error(`firmware image: HTTP ${res.status}`);
     const bytes = new Uint8Array(await res.arrayBuffer());
     const crc = sdk.crc32(bytes) >>> 0;
@@ -477,7 +480,12 @@ export function createBtModuleUpdate(host, opts) {
 
     const started = performance.now();
     try {
-      const image = await loadImage();
+      const image = await loadImage(abort.signal);
+      /* A Cancel that landed while the image loaded (from the cache, the
+         fetch never saw it) must not go on to the SDK's device reads. */
+      if (abort.signal.aborted) {
+        throw Object.assign(new Error("cancelled"), { name: "AbortError" });
+      }
       log.log?.(
         `Bluetooth module update: v${current?.version} → v${manifest.version} ` +
           `(${manifest.file}, ${image.length} bytes)`,
@@ -654,10 +662,19 @@ export function createBtModuleUpdate(host, opts) {
    *   only on a Shimmer3R running LogAndStream v1.01.022 or later.
    */
   async function check(btModule, sensor) {
-    current = btModule ?? null;
-    if (!supported) return;
-    sensorSupport = sdk.if820OtaSensorSupport(sensor ?? null);
+    /* The manifest load below is awaited, so a disconnect and reconnect can
+       start a newer check meanwhile. Only the newest check may set what is
+       shown; an older one that finishes late must not judge the new
+       connection by the old sensor. */
+    const generation = ++checkGeneration;
+    if (!supported) {
+      current = btModule ?? null;
+      return;
+    }
     const m = await ensureManifest();
+    if (generation !== checkGeneration) return;
+    current = btModule ?? null;
+    sensorSupport = sdk.if820OtaSensorSupport(sensor ?? null);
 
     if (phase === "restarting") {
       /* Only the new version ends the wait. An old one, or none, is a sensor
@@ -711,6 +728,8 @@ export function createBtModuleUpdate(host, opts) {
 
   /** The link went away. An update's own restart is expected and kept. */
   function onDisconnected() {
+    // A check still loading the manifest describes the link that just went.
+    checkGeneration++;
     // Counted here only when the device itself is not being watched.
     if (busy && !unlistenDevice) noteDrop();
     if (phase === "restarting") return;
