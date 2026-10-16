@@ -11808,6 +11808,38 @@
         }
     }
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    /**
+     * `p`, unless `timeoutMs` passes first (rejects with `onTimeout()`) or the
+     * signal is cancelled (rejects with AbortError). `p`'s own late result is
+     * ignored.
+     */
+    function settleWithin(p, timeoutMs, signal, onTimeout) {
+        p.catch(() => { });
+        if (signal?.aborted)
+            return Promise.reject(abortError());
+        return new Promise((resolve, reject) => {
+            const done = () => {
+                clearTimeout(timer);
+                signal?.removeEventListener('abort', onAbort);
+            };
+            const onAbort = () => {
+                done();
+                reject(abortError());
+            };
+            const timer = setTimeout(() => {
+                done();
+                reject(onTimeout());
+            }, timeoutMs);
+            signal?.addEventListener('abort', onAbort, { once: true });
+            p.then((v) => {
+                done();
+                resolve(v);
+            }, (e) => {
+                done();
+                reject(e);
+            });
+        });
+    }
     /** {@link sleep}, cut short by a cancel, which then rejects with AbortError. */
     function sleepUnlessAborted(ms, signal) {
         if (signal?.aborted)
@@ -11911,9 +11943,14 @@
             transient: IF820_OTA_TRANSIENT_ERROR_REGEX.test(`${e?.name ?? ''} ${msg}`),
         });
     }
-    async function resolveService(server, log) {
+    async function resolveService(server, log, 
+    /** False once the caller has given up on this discovery: stop issuing
+     * lookups on the link. */
+    stillWanted = () => true) {
         let lastError = null;
         for (const uuid of IF820_OTA_SERVICE_UUIDS) {
+            if (!stillWanted())
+                throw abortError();
             try {
                 const service = await server.getPrimaryService(uuid);
                 log(`OTA service ${uuid} found`);
@@ -11961,31 +11998,78 @@
      * `onRetry` for telling the host.
      *
      * One update at a time per device: a second call for a device whose update is
-     * still running is refused before it touches the module. Two runs would share
+     * still running is refused before it touches the module. "Running" lasts
+     * until any link work the update gave up on (a connect, reconnect or write
+     * that timed out or was cancelled, which cannot itself be stopped) has
+     * settled, since it may still change the link; dropping the link settles it.
+     * A browser whose Bluetooth stack never settles such a call therefore keeps
+     * the device unavailable for updates until the page is reloaded. Two runs would share
      * the control point, each hearing the other's status bytes, and interleave
      * their writes into the one image buffer the module has.
      */
     async function runIf820OtaUpdate(device, image, opts = {}) {
-        /* Keyed by the GATT server, not the object passed in: two `{ gatt }`
-         * wrappers around one device are still one device. */
+        const release = acquireIf820OtaDeviceLease(device);
+        const abandoned = [];
+        try {
+            return await runUpdate(device, image, opts, (p) => abandoned.push(p));
+        }
+        finally {
+            /* A connect or reconnect the update gave up on cannot be stopped, and may
+             * still change the link after this returns; the device stays leased
+             * until it settles, so no other update starts on a link it is changing. */
+            if (abandoned.length) {
+                void Promise.allSettled(abandoned).then(release);
+            }
+            else {
+                release();
+            }
+        }
+    }
+    /**
+     * Take the one-update-per-device lease, or throw if an update already holds
+     * it; returns its release. Keyed by the GATT server, not the object passed
+     * in: two `{ gatt }` wrappers around one device are still one device.
+     *
+     * Package-internal: {@link Shimmer3RClient.updateBtModuleFirmware} takes it
+     * before its own pre-update reads, so another client or a direct
+     * {@link runIf820OtaUpdate} on the same device is refused before any link
+     * traffic, and then runs the update under it with
+     * {@link runIf820OtaUpdateUnderLease}.
+     * @internal
+     */
+    function acquireIf820OtaDeviceLease(device) {
         const key = device.gatt ?? device;
         if (updatesInFlight.has(key)) {
             throw new If820OtaError('A Bluetooth module update is already running on this device');
         }
         updatesInFlight.add(key);
-        try {
-            return await runUpdate(device, image, opts);
-        }
-        finally {
+        let held = true;
+        return () => {
+            if (!held)
+                return;
+            held = false;
             updatesInFlight.delete(key);
-        }
+        };
+    }
+    /**
+     * {@link runIf820OtaUpdate} for a caller that already holds the device's
+     * lease from {@link acquireIf820OtaDeviceLease} (and releases it).
+     * @internal
+     */
+    function runIf820OtaUpdateUnderLease(device, image, opts = {}, 
+    /** Told of link work the update gave up on that may still be running; the
+     * caller keeps the lease until it settles. */
+    onAbandoned) {
+        return runUpdate(device, image, opts, onAbandoned);
     }
     /** How long a cancelled first write may take to settle before the link is
      * treated as stalled and dropped. A healthy write settles in tens of ms. */
     const IF820_OTA_ABORT_GRACE_MS = 500;
     /** Devices with an update running, for {@link runIf820OtaUpdate}'s guard. */
     const updatesInFlight = new WeakSet();
-    async function runUpdate(device, image, opts) {
+    async function runUpdate(device, image, opts, 
+    /** Told of link work given up on that may still be running. */
+    onAbandoned = () => { }) {
         /* A private copy: the image cannot change under the CRC mid-transfer, and
          * it is ArrayBuffer-backed, which the GATT write signature requires. */
         const bytes = new Uint8Array(image.byteLength);
@@ -12017,7 +12101,15 @@
         try {
             if (!server.connected) {
                 onStatus('Connecting to the Bluetooth module…');
-                await server.connect();
+                /* Bounded and cancellable like every later step: a connect the stack
+                 * never settles must not hold the update forever. */
+                const connecting = server.connect();
+                await settleWithin(connecting, responseTimeoutMs, signal, () => {
+                    return new If820OtaError('Connecting timed out', { transient: true });
+                }).catch((e) => {
+                    onAbandoned(connecting);
+                    throw e;
+                });
             }
         }
         catch (e) {
@@ -12039,25 +12131,50 @@
         /** Resolve the service and characteristics on the current connection and
          * subscribe to the control point. Run again after a reconnect, which hands
          * out new GATT objects. */
-        const open = async () => {
-            control?.removeEventListener('characteristicvaluechanged', onValue);
-            const resolved = await resolveService(server, log);
-            serviceUuid = resolved.uuid;
+        const open = async (generation) => {
+            /* Discovery runs into locals and is committed to the session only at the
+             * end, and only while this attempt is still current: a reconnect attempt
+             * given up on (see reopen) may still be part-way through it when a later
+             * one starts, and must not leave its handles or listener behind. */
+            const current = () => generation === undefined || generation === reopenGeneration;
+            const resolved = await resolveService(server, log, current);
+            if (!current())
+                return;
+            let ctrl;
+            let dat;
             try {
-                control = await resolved.service.getCharacteristic(IF820_OTA.CONTROL_POINT_UUID);
-                data = await resolved.service.getCharacteristic(IF820_OTA.DATA_UUID);
+                ctrl = await resolved.service.getCharacteristic(IF820_OTA.CONTROL_POINT_UUID);
+                dat = await resolved.service.getCharacteristic(IF820_OTA.DATA_UUID);
             }
             catch (e) {
                 throw wrapGattError(e, 'Opening the update characteristics');
             }
-            control.addEventListener('characteristicvaluechanged', onValue);
+            if (!current())
+                return;
+            /* The listener goes on only once the subscription has started, and only
+             * for the current attempt: a startNotifications() that never settles is
+             * abandoned by its caller's timeout, and must leave nothing attached.
+             * Nothing arrives on the control point before a command is sent, so no
+             * status is missed by subscribing first. */
             try {
-                await control.startNotifications();
+                await ctrl.startNotifications();
             }
             catch (e) {
                 throw wrapGattError(e, 'Subscribing to the update control point');
             }
+            if (!current())
+                return;
+            if (control && control !== ctrl) {
+                control.removeEventListener('characteristicvaluechanged', onValue);
+            }
+            ctrl.addEventListener('characteristicvaluechanged', onValue);
+            control = ctrl;
+            data = dat;
+            serviceUuid = resolved.uuid;
         };
+        /** Bumped per reconnect attempt and whenever one is given up on; an
+         * attempt whose number is no longer current never calls open(). */
+        let reopenGeneration = 0;
         /** Drop a stalled link and open a fresh one to the same device. */
         const reopen = async () => {
             if (server.connected) {
@@ -12074,23 +12191,50 @@
                 throwIfAborted$1(signal);
                 await sleepUnlessAborted(reconnectDelayMs, signal);
                 onStatus(`Reconnecting to the Bluetooth module (attempt ${attempt} of ${reconnectAttempts})…`);
-                try {
+                /* Each attempt is bounded and cancellable: a connect that never settles
+                 * must not hold the update forever, nor outlast a cancel. An attempt
+                 * given up on is invalidated by its generation, so a connect that
+                 * completes late never goes on to open() - which would swap the control
+                 * point and its listener out from under a later attempt, or under an
+                 * update that has already ended. */
+                const generation = ++reopenGeneration;
+                const reopened = (async () => {
                     if (opts.reconnect)
                         await opts.reconnect();
                     else
                         await server.connect();
-                    await open();
+                    if (generation !== reopenGeneration)
+                        return;
+                    await open(generation);
+                })();
+                try {
+                    await settleWithin(reopened, responseTimeoutMs, signal, () => {
+                        return new If820OtaError('Reconnecting timed out', { transient: true });
+                    });
                     return;
                 }
                 catch (e) {
+                    reopenGeneration++;
+                    onAbandoned(reopened);
+                    if (e?.name === 'AbortError')
+                        throw e;
                     lastError = e;
                     log(`reconnect attempt ${attempt} failed: ${String(e)}`);
                 }
             }
             throw new If820OtaError(`Could not reconnect to the Bluetooth module to retry the update: ${String(lastError)}`, { transient: true });
         };
-        const send = async (op, param, what) => {
+        const send = async (op, param, what, cancellable = true) => {
+            /* Before the write is even started: a callback just before this one
+             * (onStatus('Verifying…') among them) may have cancelled, and a VERIFY
+             * once written lets the module switch images. */
+            throwIfAborted$1(signal);
             log(`control point → ${what}`);
+            /* Again after log(): onLog is the caller's code and may itself cancel. */
+            throwIfAborted$1(signal);
+            /* From here the command is on its way; for VERIFY that is the commit. */
+            if (op === IF820_OTA_COMMAND.VERIFY)
+                verifySent = true;
             /* Bounded and cancellable like the data writes: a control-point write
              * that hangs on a failing link would otherwise never reach the response
              * wait, where the timeout and the cancel apply. (awaitWrite is declared
@@ -12098,13 +12242,13 @@
             try {
                 await awaitWrite(write(control, command(op, param)), responseTimeoutMs, () => new If820OtaError(`Bluetooth module did not accept ${what} (timed out)`, {
                     transient: true,
-                }), true);
+                }), true, cancellable);
             }
             catch (e) {
                 throw wrapGattError(e, what);
             }
         };
-        const expectOk = async (what, timeoutMs) => {
+        const expectOk = async (what, timeoutMs, cancellable = true) => {
             /* A transfer's flow-control hints (CONTINUE / MORE_DATA) arrive as their
              * own notifications, so one can land after the last data write has
              * resolved and sit in the queue ahead of the command's answer. They are
@@ -12112,7 +12256,14 @@
             const deadline = Date.now() + timeoutMs;
             let status;
             for (;;) {
-                status = await statuses.next(Math.max(1, deadline - Date.now()), what, signal);
+                try {
+                    status = await statuses.next(Math.max(1, deadline - Date.now()), what, cancellable ? signal : undefined);
+                }
+                catch (e) {
+                    if (e?.name !== 'AbortError')
+                        answerTimedOut = true;
+                    throw e;
+                }
                 if (status !== IF820_OTA_STATUS.CONTINUE && status !== IF820_OTA_STATUS.MORE_DATA)
                     break;
                 log(`skipping a late ${if820OtaStatusText(status)} while waiting for ${what}`);
@@ -12133,8 +12284,23 @@
                     sent.then(() => true),
                     sleep(IF820_OTA_ABORT_GRACE_MS).then(() => false),
                 ]);
-                if (landed)
+                if (landed) {
                     log('control point → ABORT');
+                }
+                else {
+                    /* An ABORT that is not even accepted means a stalled link: drop it,
+                     * and keep the device leased until the write settles. */
+                    onAbandoned(sent);
+                    if (server.connected) {
+                        log('ABORT went unanswered; dropping the link');
+                        try {
+                            server.disconnect?.();
+                        }
+                        catch {
+                            /* already going */
+                        }
+                    }
+                }
             }
             catch {
                 /* Best effort: the link may already be gone. Without a VERIFY the
@@ -12150,7 +12316,8 @@
          * link the same way. No VERIFY has been sent either way, so the module
          * keeps its current image.
          */
-        const awaitWrite = async (attempt, timeoutMs, onTimeout, dropOnTimeout) => {
+        const awaitWrite = async (attempt, timeoutMs, onTimeout, dropOnTimeout, cancellable = true) => {
+            const sig = cancellable ? signal : undefined;
             /* Whatever an abandoned write eventually settles with, it is no longer
              * anyone's concern, and must not surface as an unhandled rejection. */
             attempt.catch(() => { });
@@ -12176,24 +12343,28 @@
             let onAbort;
             const aborted = new Promise((_, reject) => {
                 onAbort = () => reject(abortError());
-                if (signal?.aborted)
+                if (sig?.aborted)
                     onAbort();
                 else
-                    signal?.addEventListener('abort', onAbort, { once: true });
+                    sig?.addEventListener('abort', onAbort, { once: true });
             });
             try {
                 await Promise.race([attempt, timeout, aborted]);
             }
             catch (e) {
-                if (signal?.aborted) {
+                if (sig?.aborted) {
                     const settled = await Promise.race([
                         attempt.then(() => true, () => true),
                         sleep(IF820_OTA_ABORT_GRACE_MS).then(() => false),
                     ]);
-                    if (!settled)
+                    if (!settled) {
+                        onAbandoned(attempt);
                         dropStalled('cancelled during a stalled write');
+                    }
                     throw abortError();
                 }
+                if (timedOut)
+                    onAbandoned(attempt);
                 if (timedOut && dropOnTimeout)
                     dropStalled('a data write went unanswered');
                 throw e;
@@ -12201,7 +12372,7 @@
             finally {
                 clearTimeout(timer);
                 if (onAbort)
-                    signal?.removeEventListener('abort', onAbort);
+                    sig?.removeEventListener('abort', onAbort);
             }
         };
         /** The first data write, bounded: on a stalled link it is never answered.
@@ -12219,6 +12390,11 @@
                 throw new ChunkRefused(e, !server.connected);
             }
         };
+        /** Set when a command's answer timed out: see the failure path. */
+        let answerTimedOut = false;
+        /** Set once VERIFY is about to be written: from there the update can no
+         * longer be cancelled, and is not ABORTed on failure. */
+        let verifySent = false;
         /** One full pass at a given chunk size. Throws {@link ChunkRefused} when the
          * very first data write fails, so the caller can retry smaller. */
         const pass = async (chunkSize, canRetry) => {
@@ -12264,13 +12440,36 @@
              * stop it here. */
             throwIfAborted$1(signal);
             onStatus('Verifying the firmware on the Bluetooth module…');
-            await send(IF820_OTA_COMMAND.VERIFY, crc, `VERIFY (crc32 0x${crc.toString(16).padStart(8, '0')})`);
-            await expectOk('VERIFY', verifyTimeoutMs);
+            /* VERIFY is the commit. A cancel is honoured up to the moment it is
+             * written (send checks first); from then on the module may already be
+             * switching images, which an ABORT cannot undo, so the write and its
+             * answer run to completion or to their timeouts, never to a cancel. */
+            throwIfAborted$1(signal);
+            await send(IF820_OTA_COMMAND.VERIFY, crc, `VERIFY (crc32 0x${crc.toString(16).padStart(8, '0')})`, false);
+            await expectOk('VERIFY', verifyTimeoutMs, false);
             return crc;
         };
         try {
             onStatus('Opening the Bluetooth module update service…');
-            await open();
+            {
+                /* Discovery and the subscription, bounded and cancellable; a discovery
+                 * given up on is invalidated by its generation, so it can never commit
+                 * its handles late (see open). */
+                const generation = ++reopenGeneration;
+                const opening = open(generation);
+                try {
+                    await settleWithin(opening, responseTimeoutMs, signal, () => {
+                        return new If820OtaError('Opening the update service timed out', { transient: true });
+                    });
+                }
+                catch (e) {
+                    reopenGeneration++;
+                    /* Still discovering or subscribing on the link: the device stays
+                     * leased until it settles, as for a reconnect attempt. */
+                    onAbandoned(opening);
+                    throw e;
+                }
+            }
             let step = 0;
             let crc;
             for (;;) {
@@ -12307,11 +12506,39 @@
             };
         }
         catch (e) {
+            /* A command whose answer timed out may still be answered late, and on a
+             * link left up that answer would reach whatever update runs next on it.
+             * So a timed-out answer leaves the link dropped (after the best-effort
+             * ABORT), and nothing from this update can be read as the next one's. */
+            const dropStaleLink = () => {
+                if (!answerTimedOut || !server.connected)
+                    return;
+                log('a command answer timed out; dropping the link so no late answer reaches a later update');
+                try {
+                    server.disconnect?.();
+                }
+                catch {
+                    /* already going */
+                }
+            };
+            if (verifySent) {
+                dropStaleLink();
+                /* An ABORT cannot undo a VERIFY the module accepted, so none is sent,
+                 * and the failure says the new image may be running anyway. */
+                if (e instanceof If820OtaError && e.status === null) {
+                    throw new If820OtaError(`${e.message}. The module may already have accepted the new firmware: ` +
+                        'reconnect and read its version.', { transient: e.transient });
+                }
+                throw e;
+            }
             if (server.connected)
                 await abortQuietly();
+            dropStaleLink();
             throw e;
         }
         finally {
+            /* A reconnect still in flight resumes nothing once the update has ended. */
+            reopenGeneration++;
             control?.removeEventListener('characteristicvaluechanged', onValue);
         }
     }
@@ -16480,6 +16707,12 @@
                     return 0;
                 return nextLen;
             };
+            /** Set for the whole of {@link updateBtModuleFirmware}. */
+            this._btModuleUpdateRunning = false;
+            /** The update's fallback reconnect while it is in flight; see below. */
+            this._btModuleReconnect = null;
+            /** Stream starts still waiting for their ACK, before `_streaming` is set. */
+            this._streamStarting = 0;
             // ---------------------------------------------------------------------------
             // Firmware version (feature gating)
             // ---------------------------------------------------------------------------
@@ -17661,29 +17894,93 @@
             if (!(t instanceof WebBluetoothTransport) || !t.device) {
                 throw new Error('The Bluetooth module can only be updated over a BLE (Web Bluetooth) connection.');
             }
-            if (this._streaming) {
+            if (this._streaming || this._streamStarting > 0) {
                 throw new Error('Stop streaming before updating the Bluetooth module firmware.');
             }
-            /* Both reads are cached after the first on a link, so this normally costs
-             * nothing: a host reads them on connect. */
-            const hw = await this.readDeviceVersion();
-            const fw = await this.readFwVersion();
-            const support = if820OtaSensorSupport({
-                hardwareVersion: hw.hardwareVersion,
-                firmwareId: fw.fwId,
-                major: fw.major,
-                minor: fw.minor,
-                internal: fw.patch,
-            });
-            if (!support.supported)
-                throw new Error(support.message);
-            /* A fallback reconnect goes through this client, on the same transport and
-             * so the same device (no picker), so the client's own link is rebuilt with
-             * it rather than left holding the dropped connection's handles. */
-            return runIf820OtaUpdate(t.device, image, {
-                ...opts,
-                reconnect: opts.reconnect ?? (() => this.connect(t)),
-            });
+            /* Taken before the version reads below, not just inside
+             * runIf820OtaUpdate: a second call must not get as far as putting its own
+             * reads on the link alongside the first's. */
+            if (this._btModuleUpdateRunning) {
+                throw new If820OtaError('A Bluetooth module update is already running on this device');
+            }
+            if (this._btModuleReconnect) {
+                throw new If820OtaError("The previous Bluetooth module update's reconnect is still in progress; try again shortly.");
+            }
+            /* The per-device lease too, before any link traffic: another client, or
+             * a direct runIf820OtaUpdate, on this same device must not be mid-update
+             * while this one sends its version reads, nor get past them alongside. */
+            const releaseLease = acquireIf820OtaDeviceLease(t.device);
+            const abandoned = [];
+            this._btModuleUpdateRunning = true;
+            try {
+                /* Both reads are cached after the first on a link, so this normally
+                 * costs nothing: a host reads them on connect. */
+                const hw = await this.readDeviceVersion();
+                const fw = await this.readFwVersion();
+                const support = if820OtaSensorSupport({
+                    hardwareVersion: hw.hardwareVersion,
+                    firmwareId: fw.fwId,
+                    major: fw.major,
+                    minor: fw.minor,
+                    internal: fw.patch,
+                });
+                if (!support.supported)
+                    throw new Error(support.message);
+                /* Again, after the reads: startStreaming refuses once the guard above is
+                 * set, but a stream started just before it is only visible now. */
+                if (this._streaming || this._streamStarting > 0) {
+                    throw new Error('Stop streaming before updating the Bluetooth module firmware.');
+                }
+                /* A fallback reconnect goes through this client, on the same transport
+                 * and so the same device (no picker), so the client's own link is
+                 * rebuilt with it rather than left holding the dropped connection's
+                 * handles. */
+                return await runIf820OtaUpdateUnderLease(t.device, image, {
+                    ...opts,
+                    reconnect: opts.reconnect ?? (() => this._reconnectForBtModuleUpdate(t)),
+                }, (work) => abandoned.push(work));
+            }
+            finally {
+                this._btModuleUpdateRunning = false;
+                /* Link work still in flight keeps the device leased until it settles:
+                 * this client's own fallback reconnect, and anything the update gave up
+                 * on (a caller's own reconnect, an unanswered write) - any of it may
+                 * still change the link, which no other update on the device may
+                 * share. */
+                // Re-read: the update may have set it since the check at the top.
+                const pending = this._btModuleReconnect;
+                if (pending)
+                    abandoned.push(pending);
+                if (abandoned.length) {
+                    void Promise.allSettled(abandoned).then(releaseLease);
+                }
+                else {
+                    releaseLease();
+                }
+            }
+        }
+        /**
+         * The module update's fallback reconnect, one at a time. The update gives
+         * up on an attempt that runs past its timeout, but connect() itself cannot
+         * be stopped, and a second one started alongside it would leave the two
+         * resetting this client's link and protocol state over each other. So a
+         * later attempt waits on the same connect rather than starting another,
+         * and a new update is refused until it has settled; a late one that
+         * completes after the update has ended just leaves the client connected.
+         */
+        _reconnectForBtModuleUpdate(t) {
+            if (!this._btModuleReconnect) {
+                this._btModuleReconnect = this.connect(t).finally(() => {
+                    this._btModuleReconnect = null;
+                });
+            }
+            return this._btModuleReconnect;
+        }
+        /** Streaming would share the link with the module update's transfer. */
+        _refuseWhileBtModuleUpdating(what) {
+            if (this._btModuleUpdateRunning) {
+                throw new Error(`${what} is not possible while the Bluetooth module firmware is updating.`);
+            }
         }
         /**
          * Read from the daughter-card (expansion board) EEPROM memory. `offset` is a
@@ -18820,6 +19117,16 @@
             return this._crcFailures;
         }
         async startStreaming() {
+            this._refuseWhileBtModuleUpdating('Streaming');
+            this._streamStarting++;
+            try {
+                await this._startStreaming();
+            }
+            finally {
+                this._streamStarting--;
+            }
+        }
+        async _startStreaming() {
             if (!this.schema)
                 this._emitStatus('Starting stream without schema (not recommended).');
             this._prepareStreamTimeline();
@@ -18935,6 +19242,16 @@
         }
         /** Start streaming AND SD card logging simultaneously. */
         async startStreamingAndLogging() {
+            this._refuseWhileBtModuleUpdating('Streaming');
+            this._streamStarting++;
+            try {
+                await this._startStreamingAndLogging();
+            }
+            finally {
+                this._streamStarting--;
+            }
+        }
+        async _startStreamingAndLogging() {
             if (!this.schema)
                 this._emitStatus('Starting stream without schema (not recommended).');
             this._prepareStreamTimeline();

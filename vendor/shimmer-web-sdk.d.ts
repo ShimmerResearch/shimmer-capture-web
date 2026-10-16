@@ -8068,7 +8068,12 @@ interface If820OtaOptions {
     onProgress?: (progress: If820OtaProgress) => void;
     /** Diagnostic lines (protocol chatter; not for end users). */
     onLog?: (message: string) => void;
-    /** Cancels the update. The module is sent ABORT and keeps its old firmware. */
+    /**
+     * Cancels the update. The module is sent ABORT and keeps its old firmware.
+     * Honoured up to the moment VERIFY is written; after that the module may
+     * already be switching images, so the update runs to its end and a cancel
+     * then has no effect.
+     */
     signal?: AbortSignal;
     /** First chunk size to try. Default {@link IF820_OTA_DEFAULT_CHUNK_SIZE}. */
     chunkSize?: number;
@@ -8086,7 +8091,8 @@ interface If820OtaOptions {
     }) => void;
     /** Bound on the first data write. */
     firstWriteTimeoutMs?: number;
-    /** Reconnect attempts after dropping a stalled link. */
+    /** Reconnect attempts after dropping a stalled link. Each is bounded by
+     * `responseTimeoutMs` and ends at once on a cancel. */
     reconnectAttempts?: number;
     /** Pause before each reconnect attempt. */
     reconnectDelayMs?: number;
@@ -8137,7 +8143,12 @@ interface If820OtaResult {
  * `onRetry` for telling the host.
  *
  * One update at a time per device: a second call for a device whose update is
- * still running is refused before it touches the module. Two runs would share
+ * still running is refused before it touches the module. "Running" lasts
+ * until any link work the update gave up on (a connect, reconnect or write
+ * that timed out or was cancelled, which cannot itself be stopped) has
+ * settled, since it may still change the link; dropping the link settles it.
+ * A browser whose Bluetooth stack never settles such a call therefore keeps
+ * the device unavailable for updates until the page is reloaded. Two runs would share
  * the control point, each hearing the other's status bytes, and interleave
  * their writes into the one image buffer the module has.
  */
@@ -10621,6 +10632,24 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * see the note in `if820Ota.ts`.
      */
     updateBtModuleFirmware(image: ArrayBuffer | Uint8Array, opts?: If820OtaOptions): Promise<If820OtaResult>;
+    /** Set for the whole of {@link updateBtModuleFirmware}. */
+    private _btModuleUpdateRunning;
+    /** The update's fallback reconnect while it is in flight; see below. */
+    private _btModuleReconnect;
+    /**
+     * The module update's fallback reconnect, one at a time. The update gives
+     * up on an attempt that runs past its timeout, but connect() itself cannot
+     * be stopped, and a second one started alongside it would leave the two
+     * resetting this client's link and protocol state over each other. So a
+     * later attempt waits on the same connect rather than starting another,
+     * and a new update is refused until it has settled; a late one that
+     * completes after the update has ended just leaves the client connected.
+     */
+    private _reconnectForBtModuleUpdate;
+    /** Stream starts still waiting for their ACK, before `_streaming` is set. */
+    private _streamStarting;
+    /** Streaming would share the link with the module update's transfer. */
+    private _refuseWhileBtModuleUpdating;
     /**
      * Read from the daughter-card (expansion board) EEPROM memory. `offset` is a
      * HOST offset — firmware maps it past the first (HW details) EEPROM page, so
@@ -11177,6 +11206,7 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     get crcFailures(): number;
     startStreaming(): Promise<void>;
+    private _startStreaming;
     /**
      * Open the stream plane *before* the start command goes out, so that frames
      * arriving before its ACK are accumulated whole.
@@ -11229,6 +11259,7 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     stopStreaming(): Promise<void>;
     /** Start streaming AND SD card logging simultaneously. */
     startStreamingAndLogging(): Promise<void>;
+    private _startStreamingAndLogging;
     /**
      * Stop streaming AND SD card logging (STOP_SDBT_COMMAND 0x97), best-effort
      * and without waiting for its ACK, for the reasons {@link stopStreaming}
