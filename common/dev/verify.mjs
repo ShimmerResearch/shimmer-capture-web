@@ -5818,10 +5818,16 @@ const btRun = await evaluate(`
   P().querySelector('button.primary').click();
   let sawProgress = false;
   let applyDuring = null;
+  let connButtonsDuring = null;
   await waitFor(() => {
     if (P().querySelector('progress')) {
       sawProgress = true;
       if (applyDuring === null) applyDuring = document.getElementById('btnRefreshDevice').disabled;
+      if (connButtonsDuring === null) {
+        connButtonsDuring = ['btnBle', 'btnBt', 'btnUsb', 'btnDisconnect'].every(
+          (id) => document.getElementById(id).disabled,
+        );
+      }
     }
     return P().querySelector('.banner.ok, .banner.err');
   }, 60000);
@@ -5843,6 +5849,8 @@ const btRun = await evaluate(`
     offered,
     sawProgress,
     refreshDisabledDuring: applyDuring,
+    connButtonsDuring,
+    disconnectAfter: document.getElementById('btnDisconnect').disabled,
     result: P().textContent,
     ok: !!P().querySelector('.banner.ok'),
     same,
@@ -5867,6 +5875,11 @@ check(
   "the update shows progress and holds the rest of the page off the link",
   btRun.sawProgress && btRun.refreshDisabledDuring === true,
   `progress ${btRun.sawProgress}, Refresh disabled ${btRun.refreshDisabledDuring}`,
+);
+check(
+  "the connect buttons and Disconnect are held while the update owns the link",
+  btRun.connButtonsDuring === true && btRun.disconnectAfter === false,
+  `held during ${btRun.connButtonsDuring}, Disconnect disabled after ${btRun.disconnectAfter}`,
 );
 check(
   "the module receives the bundled image byte for byte, then VERIFY",

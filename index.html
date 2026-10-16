@@ -1725,6 +1725,14 @@
         linkHeldReason: () => btUpdateHeldReason(),
         onBusyChange: (on) => {
           otaBusy = on;
+          /* The update drops and re-opens the link itself; a connect or
+                   Disconnect click meanwhile would race it, and a Disconnect during
+                   the module's image switch is the one thing it must not see. */
+          connect.setLocked(
+            on
+              ? "The Bluetooth module is being updated — wait for it to finish, or use Cancel."
+              : null,
+          );
           regate();
         },
         /* A Classic Bluetooth or USB link cannot reach the module's update

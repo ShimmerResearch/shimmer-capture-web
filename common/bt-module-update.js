@@ -546,6 +546,34 @@ export function createBtModuleUpdate(host, opts) {
   }
 
   async function restartAndReconnect() {
+    /* Whatever goes wrong in here - a reconnect or a disconnect that throws -
+       the update must end in a terminal state with the page released: an
+       exception escaping this left the phase at restarting and the whole page
+       held busy for good. */
+    try {
+      await restartAndReconnectSteps();
+    } catch (e) {
+      log.error?.(
+        `Bluetooth module update: reconnecting after the update failed: ${e?.message ?? e}`,
+      );
+    } finally {
+      if (phase === "restarting") {
+        failure = lastSeenVersion
+          ? `the module accepted the update, but the sensor still reports v${lastSeenVersion}. ` +
+            "Switch it off and on: it reads the module version only when it starts. " +
+            "If it still reports the old version after that, run the update again."
+          : "the sensor did not come back after the update. Switch it off and on, then reconnect over BLE — the new version shows once it has restarted.";
+        phase = "failed";
+        render();
+      }
+      clearInterval(restartTicker);
+      restartTicker = null;
+      device = null;
+      setBusy(false);
+    }
+  }
+
+  async function restartAndReconnectSteps() {
     /* The module resets itself after VERIFY, which drops the link. If it is
        somehow still up after a generous wait, drop it from this side so the
        reconnect below starts from a clean link. */
@@ -559,7 +587,9 @@ export function createBtModuleUpdate(host, opts) {
       log.warn?.(
         "the module did not drop the link after the update; disconnecting",
       );
-      await opts.disconnect();
+      await opts
+        .disconnect()
+        .catch((e) => log.warn?.(`disconnecting failed: ${e?.message ?? e}`));
     }
     await sleep(BOOT_WAIT_MS);
 
@@ -571,7 +601,15 @@ export function createBtModuleUpdate(host, opts) {
          moves the phase on to done once the new version is reported. `device`
          is the sensor the update ran on; the page reconnects to it without
          the picker. */
-      if (await opts.reconnectBle(device)) {
+      /* A reconnect that throws (a GATT or permission error) is one failed
+         attempt, not the end of the wait. */
+      const reconnected = await Promise.resolve()
+        .then(() => opts.reconnectBle(device))
+        .catch((e) => {
+          log.warn?.(`reconnect attempt ${i} failed: ${e?.message ?? e}`);
+          return false;
+        });
+      if (reconnected) {
         /* check() is not awaited by the page, so give it time to land. */
         for (
           let w = 0;
@@ -585,7 +623,13 @@ export function createBtModuleUpdate(host, opts) {
            rebooted onto the module yet (it may not answer at all, or still
            report the old version), or the link dropped mid-read. Let go and
            ask again shortly. */
-        if (getClient()) await opts.disconnect();
+        if (getClient()) {
+          await opts
+            .disconnect()
+            .catch((e) =>
+              log.warn?.(`disconnecting failed: ${e?.message ?? e}`),
+            );
+        }
         statusText = lastSeenVersion
           ? `The sensor still reports v${lastSeenVersion}; waiting for it to restart…`
           : "Waiting for the sensor to finish restarting…";
@@ -593,19 +637,6 @@ export function createBtModuleUpdate(host, opts) {
       }
       await sleep(RECONNECT_GAP_MS);
     }
-    if (phase === "restarting") {
-      failure = lastSeenVersion
-        ? `the module accepted the update, but the sensor still reports v${lastSeenVersion}. ` +
-          "Switch it off and on: it reads the module version only when it starts. " +
-          "If it still reports the old version after that, run the update again."
-        : "the sensor did not come back after the update. Switch it off and on, then reconnect over BLE — the new version shows once it has restarted.";
-      phase = "failed";
-      render();
-    }
-    clearInterval(restartTicker);
-    restartTicker = null;
-    device = null;
-    setBusy(false);
   }
 
   // -------------------------------------------------------------------------
