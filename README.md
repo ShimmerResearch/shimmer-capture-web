@@ -75,10 +75,14 @@ those controls out rather than guessing. It does have a clock write, so
 setting the clock works over all three links, and it has a test command, so the
 self-test runs over all three too.
 
-\*\* Over the dock the ExG chip test reports FAIL, because that connection and
-the chip share pins and the firmware says so in the report itself. That is the
-docked test, not the board — run the self-test over Bluetooth to judge an ExG
-expansion board.
+\*\* **On a Shimmer3 only**, the ExG chip test reports FAIL over the dock,
+because on that board the dock connection and the chip share pins, and the
+firmware says so in the report itself instead of running the test. That is the
+docked test, not the board — run the self-test over Bluetooth to judge a
+Shimmer3's ExG expansion board. A Shimmer3R has no such limit: its ExG test
+runs normally over USB-C and over the dock, so an ExG FAIL from a Shimmer3R is
+a real result. The page's note beside the self-test says which applies once
+the sensor has identified itself.
 
 \*\*\* **The throughput test is Bluetooth-only**, and for the same command-set
 reason: the dock protocol has no data-rate test in it, so there is nothing over USB-C for the
@@ -576,9 +580,10 @@ is the only way out early. The LED suites are meant to be watched — each line
 names the LED that should be lit at that moment.
 
 Over the USB-C/dock link the test runs through the dock protocol's own test
-command. One line comes out differently there: the ExG chip test reports FAIL
-from the dock, because that connection and the chip share pins. That is the
-docked test, not the board.
+command. On a Shimmer3 one line comes out differently there: the ExG chip test
+reports FAIL from the dock, because on that board the dock connection and the
+chip share pins. That is the docked test, not the board. A Shimmer3R runs the
+ExG test normally over USB-C and over the dock, so there a FAIL is real.
 
 **The clock-drift monitor** samples the sensor's real-world clock against this
 host's on an interval and least-squares fits the slope in ppm, with a plot, a
