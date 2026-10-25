@@ -4047,10 +4047,26 @@
        * Something worth knowing before reading the report, or null. NEVER a
        * refusal — see the note above — and shown beside the panel rather than
        * in place of it.
+       *
+       * The ExG caveat is Shimmer3's alone. Its firmware skips the ExG chip
+       * test from the dock and prints a FAIL instead, because on that board the
+       * dock UART and the chip share pins (`hal_FactoryTest.c` `SPI_test()`). A
+       * Shimmer3R has no such check — S3R_TEST_0021 runs over USB-C and the dock
+       * alike, and its ExG SPI3 and dock USART1 share no pins — so telling a
+       * Shimmer3R user to discount that line would hide a real fault. Keyed on
+       * the hardware version the sensor stated (3 = Shimmer3, 10 = Shimmer3R).
        */
       function selfTestLinkNote() {
         if (client && mode === "usb") {
-          return "Over the USB-C/dock link the self-test runs through the dock protocol's own test command. One line comes out differently: the ExG chip test reports FAIL from the dock, because that connection and the chip share pins. That is the docked test, not the board.";
+          const viaDock =
+            "Over the USB-C/dock link the self-test runs through the dock protocol's own test command.";
+          if (identifiedHardwareVersion === 3) {
+            return `${viaDock} On a Shimmer3 one line comes out differently: the firmware does not run the ExG chip test from the dock and reports it as FAIL, because on that board the dock connection and the chip share pins. That is the docked test, not the board — run the self-test over Bluetooth to judge an ExG board.`;
+          }
+          if (identifiedHardwareVersion === 10) {
+            return `${viaDock} A Shimmer3R runs every test here just as it does over Bluetooth, the ExG chip test included, so a FAIL on any line is a real result.`;
+          }
+          return `${viaDock} On a Shimmer3 the ExG chip test reports FAIL from the dock, because on that board the dock connection and the chip share pins — that is the docked test, not the board. A Shimmer3R runs the ExG test normally over USB-C and the dock, so there a FAIL is real.`;
         }
         return null;
       }

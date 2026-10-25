@@ -133,8 +133,10 @@ export function describeShimmer3Caps(client, mode) {
     branding: has("readDaughterCardMem") && has("writeDaughterCardMem"),
     /* The firmware's own factory self-test. Deliberately NOT link-gated: the
        dock protocol addresses the same suite through its TEST component, so a
-       docked or USB-C sensor runs it too — the only difference is that the
-       ExG chip test cannot pass from the dock, which the report says itself. */
+       docked or USB-C sensor runs it too. The only difference is Shimmer3's:
+       its ExG chip test cannot pass from the dock (the dock UART and the chip
+       share pins there), which the report says itself. A Shimmer3R runs the
+       ExG test normally over USB-C and the dock. */
     factoryTest: has("runFactoryTest"),
     /* The red-LED override, and this one IS link-gated: the dock protocol has
        no LED command at all (the property exists in the header but only under
