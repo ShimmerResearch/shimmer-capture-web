@@ -7,7 +7,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-declare const SDK_VERSION = "0.5.9";
+declare const SDK_VERSION = "0.5.11";
 
 /**
  * Discriminated kind tag for a data field in an ObjectCluster.
@@ -3467,6 +3467,12 @@ interface TransferLoggedDataResult {
     blob?: Blob;
 }
 interface RunHardwareTestReportOptions {
+    /**
+     * How long the report may go without sending anything before it is given up
+     * (default 120000). The clock restarts with every chunk, so a long report
+     * that keeps streaming, such as a NAND health test printing its progress
+     * dots, is never cut off part-way.
+     */
     timeoutMs?: number;
     marker?: string;
     endMarker?: string;
@@ -3884,6 +3890,13 @@ declare const BT_FEATURE: Readonly<{
      * active SD recording.
      */
     readonly REBOOT_ON_DISCONNECT: 2;
+    /**
+     * Stream the event channel's records to this host, as
+     * `[0x8A][0xBB][len][record][CRC-16]` frames (DEV-971; log-and-stream-common
+     * `docs/SHIMMER3_BT_COMMUNICATION_PROTOCOL.md` §7.15). Per connection: cleared
+     * on connect and disconnect. Firmware without the event channel NACKs it.
+     */
+    readonly EVENT_STREAM: 3;
 }>;
 declare const OPCODES: Readonly<{
     readonly DATA_PACKET: 0;
@@ -4048,6 +4061,11 @@ declare const OPCODES: Readonly<{
     readonly DUMMY_COMMAND: 181;
     readonly RESET_BT_ERROR_COUNTS: 182;
     readonly SET_FEATURE: 183;
+    /** Event channel (DEV-971): `[0xB9]` → `[ACK][0xBA][status × 9]`. */
+    readonly GET_EVENT_CHANNEL_STATUS_COMMAND: 185;
+    readonly EVENT_CHANNEL_STATUS_RESPONSE: 186;
+    /** Event channel record frame, under the `0x8A` in-stream prefix. */
+    readonly EVENT_RECORD_RESPONSE: 187;
     readonly SET_SD_SYNC_COMMAND: 224;
     readonly SD_SYNC_RESPONSE: 225;
     readonly NACK_COMMAND_PROCESSED: 254;
@@ -4426,12 +4444,22 @@ declare function generationFromHardwareVersion(hardwareVersion: number | null | 
  *   this SDK has always emitted for it. Width and encoding are the same on
  *   both, so nothing decodes wrongly — only the label is platform-neutral.
  * - `0x14`-`0x16` → `HG_ACCEL_*`. The firmware calls these `X/Y/Z_ALT_ACCEL`.
+ *   Both generations send them **big-endian**, but in different encodings. This
+ *   map keeps the Shimmer3R entry, a 12-bit value left-justified from the
+ *   ADXL371's `XDATA_H` (the Java driver's `i12*>`), because that is what it has
+ *   always exported. The Shimmer3 layer overrides it with a plain `i16`: there,
+ *   these channels are the MPU9x50/ICM-20948's own accelerometer, read from
+ *   `ACCEL_XOUT_H` (log-and-stream-common
+ *   `docs/SHIMMER3_STREAMING_DATA_FORMAT.md` §5). Until DEV-1338 these entries
+ *   said `le`. The `i12*` decoders never read that field, so Shimmer3R values
+ *   were right, but a Shimmer3 got the 12-bit decode, which is a sixteenth of
+ *   the value.
  */
 declare const CHANNEL_FORMATS: Readonly<Record<number, ChannelFormat>>;
 /**
  * Per-generation channel table, layered over {@link CHANNEL_FORMATS}.
  *
- * Two kinds of entry live here, and only one of them is cosmetic:
+ * Five kinds of entry live here, and only the first is cosmetic:
  *
  * 1. **The ADC block, `0x0D`-`0x13`.** The IDs are reused with different
  *    meanings on the two platforms — `shimmer_sensing.h:107-122` defines
@@ -4461,10 +4489,22 @@ declare const CHANNEL_FORMATS: Readonly<Record<number, ChannelFormat>>;
  *    The emission *order* of the pair is also reversed between the two
  *    generations, which is why a host must always take the channel order from
  *    the inquiry response rather than from a fixed list of its own.
- * 3. **`0x27`/`0x28` STRAIN_HIGH/STRAIN_LOW.** Shimmer3-only: the bridge
+ * 3. **`0x0A`-`0x0C` GYRO_X/Y/Z.** Same width, opposite **byte order**: a
+ *    Shimmer3's MPU9x50 is read over I²C MSB first and streamed as the
+ *    firmware read it, so the Java driver types these `i16r` on `SHIMMER_3`
+ *    and `i16` on `SHIMMER_3R`, whose LSM6DSV is read LSB first
+ *    (`ShimmerObject.java:3227-3239`, `interpretDataPacketFormat`). The SD-log
+ *    decoder has always used `i16r` for the Shimmer3 (`sdlog/channels.ts`).
+ *    Until DEV-1288 these were shared little-endian, which decoded every
+ *    streamed Shimmer3 gyro sample byte-swapped: -591 read as -19971.
+ * 4. **`0x27`/`0x28` STRAIN_HIGH/STRAIN_LOW.** Shimmer3-only: the bridge
  *    amplifier is an expansion board with no Shimmer3R equivalent, so these
  *    are deliberately absent from the `shimmer3r` table and a Shimmer3R
  *    reporting them is reported as an unknown channel rather than guessed at.
+ * 5. **`0x14`-`0x16` HG_ACCEL_X/Y/Z, Shimmer3 only.** The shared entry is the
+ *    Shimmer3R's 12-bit ADXL371 value. A Shimmer3 sends its 9-axis chip's own
+ *    accelerometer there as a plain big-endian `i16`, so this layer overrides
+ *    the shared entry (DEV-1338).
  *
  * Names follow the SD-log channel tables in `devices/sdlog/channels.ts` so the
  * streamed and logged copies of the same signal carry the same label. The one
@@ -4490,6 +4530,31 @@ declare const CHANNEL_FORMATS: Readonly<Record<number, ChannelFormat>>;
  * and agrees with the Java driver's `u16r`/`u24r` vs `u24` type strings.
  */
 declare const CHANNEL_FORMAT_OVERRIDES: Readonly<Record<ShimmerGeneration, Readonly<Record<number, ChannelFormat>>>>;
+/**
+ * The mag channels as an **old-IMU Shimmer3** sends them: big-endian.
+ *
+ * Shimmer3 boards before the "new IMU" revisions carry an LSM303DLHC, whose
+ * magnetometer registers run high byte first; the Java driver types `0x07`-`0x09`
+ * `i16r` when `isSupportedNewImuSensors()` is false and `i16` otherwise
+ * (`ShimmerObject.java:3156-3200`). Which boards are new-IMU is decided by
+ * the daughter-card id — see `sdlog/header.ts` `isNewImuSensors`, the same
+ * rule the SD-log decoder applies.
+ *
+ * This is not in {@link CHANNEL_FORMAT_OVERRIDES} because the generation does
+ * not decide it: two Shimmer3s can disagree. A caller that knows the board is
+ * old-IMU layers it on top of `channelFormatsFor('shimmer3')`; a caller that does
+ * not know keeps the little-endian default, which is right for every board
+ * made since the new IMU. (The SD-log decoder also reorders old-IMU mag to
+ * X, Z, Y; streaming needs no reorder, because each channel carries its own id
+ * and the inquiry lists them in the order they are sent.)
+ *
+ * Run on the bench (21 Oct 2026, `Shimmer3Client`, LogAndStream v1.01.007,
+ * RN42 v4.77): a Shimmer3 whose id page is blank, so old-IMU by the rule above,
+ * streamed mag at 256 Hz that read |B| ~1490 counts with a per-axis SD of
+ * 3-11 big-endian, and SD 600-2700 (noise) little-endian. The new-IMU
+ * revision thresholds themselves are still unverified; see `isNewImuSensors`.
+ */
+declare const SHIMMER3_OLD_IMU_MAG_FORMATS: Readonly<Record<number, ChannelFormat>>;
 /**
  * The complete channel table for one hardware generation: every entry of
  * {@link CHANNEL_FORMATS} with {@link CHANNEL_FORMAT_OVERRIDES} applied on top.
@@ -4528,6 +4593,10 @@ declare function isGenerationSensitiveChannel(id: number): boolean;
  *
  * - `0x1A`/`0x1B` qualify — 2 big-endian bytes then 3 on a Shimmer3 versus 3
  *   little-endian bytes each on a Shimmer3R, emitted in the opposite order.
+ * - The gyro `0x0A`-`0x0C` qualify — big-endian on a Shimmer3, little-endian on
+ *   a Shimmer3R.
+ * - The alt accel `0x14`-`0x16` qualify — a big-endian `i16` on a Shimmer3, a
+ *   left-justified 12-bit value on a Shimmer3R.
  * - The Shimmer3-only `0x27`/`0x28` qualify, because they resolve to nothing at
  *   all on a Shimmer3R, so assuming the wrong way either invents a width or
  *   loses one.
@@ -5688,6 +5757,13 @@ interface BuildStreamSchemaOptions {
     /** Frame preamble byte (DATA_PACKET, 0x00 on both families). */
     dataPreambleByte?: number;
     /**
+     * Formats that replace the generation's own for these IDs, for a layout the
+     * generation alone does not decide — the old-IMU Shimmer3 mag
+     * (`SHIMMER3_OLD_IMU_MAG_FORMATS`). Only IDs the generation already describes
+     * are replaced, so this can correct a byte order but never invents a channel.
+     */
+    formatOverrides?: Readonly<Record<number, ChannelFormat>>;
+    /**
      * Called once per problem found, with a sentence fit for a status log. Wired
      * to the client's `onStatus` so an unrecognised channel is visible to the
      * host rather than only to the schema.
@@ -6383,6 +6459,104 @@ declare function getDefaultCalibration(family: ImuFamily, group: InertialGroup, 
 } | null;
 
 /**
+ * Gyro on-the-fly offset calibration.
+ *
+ * Port of the Shimmer Java driver's
+ *   com.shimmerresearch.algorithms.gyroOnTheFlyCal.GyroOnTheFlyCalModule
+ *   com.shimmerresearch.algorithms.gyroOnTheFlyCal.OnTheFlyGyroOffsetCal
+ * which Consensys runs whenever derived-sensor bit 29 (`GYRO_ON_THE_FLY_CAL`)
+ * is set in the configuration (InfoMem over Bluetooth, the header on SD).
+ *
+ * While the sensor lies still it re-estimates the gyro offset. Every sample's
+ * calibrated and raw triples go into a sliding window of round(fs) samples;
+ * once the window is full and every calibrated axis has a standard deviation
+ * under 1.2 deg/s, the mean of the raw window becomes the gyro offset
+ * (`CalibDetailsKinematic.updateCurrentOffsetVector`), from the next sample on.
+ *
+ * The arithmetic is Apache Commons Math 2.2's — `Mean.evaluate` with its
+ * correction pass, and the bias-corrected `Variance` — because that is what
+ * makes the result bit-exact with Java. It is checked against the Java driver's
+ * own output on two Bluetooth recordings, and against what Consensys stored for
+ * an SD file (`tests/calibration/gyro-on-the-fly.test.ts`).
+ */
+
+/** Derived-sensor bit 29: `DerivedSensorsBitMask.GYRO_ON_THE_FLY_CAL`. */
+declare const DERIVED_GYRO_ON_THE_FLY_CAL: bigint;
+/** `OnTheFlyGyroOffsetCal.DEFAULT_THRESHOLD`, in deg/s. */
+declare const GYRO_ON_THE_FLY_THRESHOLD_DPS = 1.2;
+/** Whether a derived-sensors bitmap has the on-the-fly calibration enabled. */
+declare function isGyroOnTheFlyEnabled(derivedSensors: bigint | number): boolean;
+/**
+ * The window length for a sampling rate: `(int) Math.round(fs)`, so halves
+ * round up (`OnTheFlyGyroOffsetCal.setBufferSizeFromSamplingRate`). Zero for a
+ * rate that is not known.
+ */
+declare function gyroOnTheFlyWindow(samplingRateHz: number): number;
+type Triple = [number, number, number];
+/**
+ * The on-the-fly estimator for one device, plus the offsets it has estimated.
+ *
+ * Java writes an estimate into the calibration object in force
+ * (`getCurrentCalibDetailsGyro()`, the one for the configured range), so it
+ * lives exactly as long as that object does: a range change moves to another
+ * object with its own offset, and re-reading the calibration replaces the
+ * objects and with them every estimate. The offsets here are keyed the same
+ * way — by the {@link KinematicCalibration} the estimate was made against —
+ * which gives the same lifetimes without mutating a shared default.
+ */
+declare class GyroOnTheFlyCal {
+    private _window;
+    private readonly _cal;
+    private readonly _raw;
+    private _offsets;
+    private _updates;
+    private _lastOffset;
+    /** Samples in the window, or 0 before a sampling rate is known. */
+    get windowSamples(): number;
+    /** How many times an estimate has replaced the offset. */
+    get updates(): number;
+    /** The most recent estimate, or `null` before the first. */
+    get lastOffset(): Readonly<Triple> | null;
+    /**
+     * Size the window from the sampling rate. Values already in it are kept,
+     * oldest first to go if it shrinks, as `DescriptiveStatistics.setWindowSize`
+     * does. Java does this when streaming starts (`initializeAlgorithms`) and
+     * when the rate changes.
+     */
+    setSamplingRate(samplingRateHz: number): void;
+    /** Empty the window and forget every estimate: a new SD file, a new device. */
+    reset(): void;
+    /**
+     * The calibration to apply to the next sample: `base` with the estimated
+     * offset in place of its own, once there is an estimate for it.
+     */
+    calibrationFor(base: KinematicCalibration): KinematicCalibration;
+    /** Whether an estimate is in force for `base`. */
+    isActiveFor(base: KinematicCalibration): boolean;
+    /**
+     * Feed one sample (`updateGyroOnTheFlyGyroOVCal`): its calibrated triple and
+     * the raw triple it came from. When the window is full and still, the raw
+     * mean becomes the offset for `base` and is returned; otherwise `null`.
+     */
+    update(base: KinematicCalibration, cal: readonly [number, number, number], raw: readonly [number, number, number]): Readonly<Triple> | null;
+}
+/** What a client or decoder reports about the on-the-fly calibration. */
+interface GyroOnTheFlyInfo {
+    /** Derived-sensor bit 29 is set, so the offset is being re-estimated. */
+    enabled: boolean;
+    /** An estimate is replacing the stored offset of the calibration in force. */
+    active: boolean;
+    /** Window length in samples, round(fs); 0 before the rate is known. */
+    windowSamples: number;
+    /** Per-axis standard deviation under which the window counts as still. */
+    thresholdDps: number;
+    /** How many times an estimate has replaced the offset. */
+    updates: number;
+    /** The most recent estimated offset, in raw counts, or `null`. */
+    offset: [number, number, number] | null;
+}
+
+/**
  * Streaming-path inertial calibration.
  *
  * Applies kinematic calibration to the inertial channels of a decoded
@@ -6458,6 +6632,8 @@ interface StreamCalibrationState {
     device?: Partial<Record<InertialGroup, KinematicCalibration>>;
     /** Whether to calibrate the inertial groups at all. */
     emitInertial: boolean;
+    /** The gyro on-the-fly offset estimator, or `null` when bit 29 is clear. */
+    gyroOnTheFly?: GyroOnTheFlyCal | null;
     /** The configured GSR range: 0-3 fixed, 4 auto. */
     gsrRange: number;
     /** Both ExG chips' register banks, or `null` when the host has not read them. */
@@ -6526,6 +6702,12 @@ interface StreamCalibrationInfo {
         usingDefaultCalibration: boolean;
         unit: string;
     }>>;
+    /**
+     * The gyro on-the-fly offset calibration (derived-sensor bit 29): whether it
+     * is enabled, and whether an estimate is replacing the offset of the gyro
+     * calibration in force.
+     */
+    gyroOnTheFly: GyroOnTheFlyInfo;
     gsr: {
         range: number;
     };
@@ -7718,14 +7900,21 @@ interface Shimmer3InquiryResult {
  * pressure here and 3 little-endian bytes each on a Shimmer3R
  * (see `CHANNEL_FORMAT_OVERRIDES`).
  *
- * The only Shimmer3-relevant knob is the timestamp width (u24 for firmware code
- * ≥ 6, else u16 — see ShimmerObject#updateTimestampByteLength).
+ * Two Shimmer3-relevant knobs remain: the timestamp width (u24 for firmware
+ * code ≥ 6, else u16 — see ShimmerObject#updateTimestampByteLength), and the
+ * IMU generation, which sets the mag byte order.
  *
  * @param onProblem optional sink for the message an unrecognised channel ID
  *   produces; `Shimmer3Client` wires it to `onStatus`. The schema's `trusted`
  *   and `unknownChannelIds` say the same thing to code rather than to a log.
+ * @param imuGeneration `'old'` decodes mag `0x07`-`0x09` big-endian, as an
+ *   LSM303DLHC board sends it (`SHIMMER3_OLD_IMU_MAG_FORMATS`). `'new'` or
+ *   unknown (`null`, the default) keeps little-endian, which is right for every
+ *   new-IMU board. The Java driver falls back to old when it has no board id;
+ *   this does not, so that a failed or skipped board read never flips the byte
+ *   order of the boards made since.
  */
-declare function buildShimmer3Schema(channelIds: number[], timestampFmt: TimestampFmt, onProblem?: (message: string) => void): Shimmer3StreamSchema;
+declare function buildShimmer3Schema(channelIds: number[], timestampFmt: TimestampFmt, onProblem?: (message: string) => void, imuGeneration?: 'old' | 'new' | null): Shimmer3StreamSchema;
 /**
  * Decode an INQUIRY_RESPONSE using the Shimmer3 (classic) layout.
  *
@@ -7737,11 +7926,13 @@ declare function buildShimmer3Schema(channelIds: number[], timestampFmt: Timesta
  *
  * @param onProblem optional sink for schema problems (an unrecognised channel
  *   ID); see {@link buildShimmer3Schema}.
+ * @param imuGeneration the board's IMU generation when known; see
+ *   {@link buildShimmer3Schema}.
  * @throws if the buffer is shorter than the header, or shorter than the channel
  *   count it declares. Rejecting is deliberate — see the body — and callers can
  *   let it propagate: nothing is assigned from the result until it returns.
  */
-declare function interpretShimmer3InquiryResponse(u8: Uint8Array, timestampFmt?: TimestampFmt, onProblem?: (message: string) => void): Shimmer3InquiryResult;
+declare function interpretShimmer3InquiryResponse(u8: Uint8Array, timestampFmt?: TimestampFmt, onProblem?: (message: string) => void, imuGeneration?: 'old' | 'new' | null): Shimmer3InquiryResult;
 /** Parsed DEVICE_VERSION (a.k.a. Shimmer HW version) response. */
 interface Shimmer3DeviceVersion {
     hardwareVersion: number;
@@ -8217,6 +8408,224 @@ type If820OtaSensorSupport = {
 declare function if820OtaSensorSupport(sensor: If820OtaSensorIdentity | null | undefined): If820OtaSensorSupport;
 
 /**
+ * The Shimmer3 / Shimmer3R event channel's records: the user button's and the
+ * TTL input's edges, each with its own RTC time, written to an event file
+ * beside every SD data file and, to a Bluetooth host that opts in, streamed as
+ * in-stream frames.
+ *
+ * One record layout serves both. Format: log-and-stream-common
+ * `docs/SHIMMER3_EVENT_CHANNEL.md` §4.2 (file) and
+ * `docs/SHIMMER3_BT_COMMUNICATION_PROTOCOL.md` §7.15 (frame and status); the
+ * encoder is `Events/shimmer_event_record.c`, whose host test pins the bytes of
+ * the worked examples this module's tests decode.
+ *
+ * HARDWARE-VERIFY: decoded from the firmware's own encoder and doc examples
+ * only; no event file or frame from a device has been read through this SDK.
+ */
+/** The RTC the records are timed by: 32768 ticks a second. */
+declare const EVENT_TICKS_PER_SECOND = 32768;
+/** Event file and record sizes, and the file's magic. */
+declare const EVENT_FILE: Readonly<{
+    readonly MAGIC: "SEVT";
+    /** The only format version this decoder knows. */
+    readonly FORMAT_VERSION: 1;
+    readonly HEADER_LENGTH: 64;
+    readonly RECORD_LENGTH: 16;
+}>;
+/** Record type, byte 0. 0x10 and up are reserved. */
+declare const EVENT_RECORD_TYPE: Readonly<{
+    /** An input changed. */
+    readonly EDGE: 1;
+    /** Each input's state at a file's open, or at a Bluetooth opt-in. */
+    readonly INITIAL_STATE: 2;
+    /** Nothing was recorded for 60 s; with {@link EVENT_RECORD_FLAG.FINAL}, the file's end. */
+    readonly HEARTBEAT: 3;
+    /** Edges were lost just before this point. */
+    readonly OVERFLOW: 4;
+}>;
+/** Record flags, byte 1. Bit 6 is never written. */
+declare const EVENT_RECORD_FLAG: Readonly<{
+    /** The time was latched by a timer (TTL edges). */
+    readonly HW_CAPTURE: 1;
+    /** An edge the debounce first took as bounce, put back at its own time. */
+    readonly SYNTHESIZED: 2;
+    /** A TTL capture read more than 32.768 ms after it happened (Shimmer3R). */
+    readonly LATE: 4;
+    /** Reserved. */
+    readonly STATE_STALE: 8;
+    /** The last record of a file. */
+    readonly FINAL: 128;
+}>;
+/** Record channel, byte 12. */
+declare const EVENT_CHANNEL: Readonly<{
+    readonly BUTTON: 0;
+    readonly TTL: 1;
+    /** Records that describe no one input: initial state, heartbeat. */
+    readonly NONE: 255;
+}>;
+/** Bits of a record's state byte, and of a file header's or status's input mask. */
+declare const EVENT_INPUT: Readonly<{
+    readonly BUTTON: 1;
+    readonly TTL: 2;
+}>;
+/** One record, decoded. */
+interface EventRecord {
+    /** {@link EVENT_RECORD_TYPE}. */
+    type: number;
+    /** {@link EVENT_RECORD_FLAG} bits. */
+    flags: number;
+    /**
+     * Sequence number. In a file it continues across a split; over Bluetooth it
+     * is the link's own, from 0 at the opt-in, so a gap is records the link lost.
+     */
+    seq: number;
+    /** RTC ticks at 32768 Hz, all 64 bits. Its low 24 bits line up with a data packet's timestamp. */
+    ticks: bigint;
+    /** {@link EVENT_CHANNEL}. */
+    channel: number;
+    /** Every input's state after this record, {@link EVENT_INPUT} bits. */
+    state: number;
+    /** Whether the button is held after this record. */
+    buttonDown: boolean;
+    /** Whether the TTL input is high after this record. */
+    ttlHigh: boolean;
+    /** Edges lost so far this session (in a file) or since the opt-in (over Bluetooth); stops at 0xFFFF. */
+    dropped: number;
+}
+/**
+ * Decode the 16-byte record at `bytes[offset]`.
+ *
+ * @throws RangeError when fewer than 16 bytes remain
+ */
+declare function parseEventRecord(bytes: Uint8Array, offset?: number): EventRecord;
+/** A short description of a record, such as `Button pressed` or `TTL low`. */
+declare function describeEventRecord(rec: EventRecord): string;
+/** Why an event file was opened, header byte 36. */
+declare const EVENT_FILE_OPEN_REASON: Readonly<{
+    readonly SESSION_START: 1;
+    readonly SPLIT: 2;
+}>;
+/** An event file's 64-byte header, decoded. */
+interface EventFileHeader {
+    version: number;
+    headerLength: number;
+    recordLength: number;
+    /** 3 Shimmer3, 10 Shimmer3R. */
+    hardwareId: number;
+    /** The data file's initial timestamp, all 64 bits: pair the two files by it. */
+    fileOpenTicks: bigint;
+    /**
+     * Shimmer3: the offset from boot time to real-world time (as SD header bytes
+     * 44-51), added to a record's ticks for real-world time. Shimmer3R: 0, its
+     * RTC already counts real-world time.
+     */
+    rtcOffsetTicks: bigint;
+    /** Config time, Unix seconds. */
+    configTime: number;
+    firmwareId: number;
+    firmwareVersion: {
+        major: number;
+        minor: number;
+        internal: number;
+    };
+    /** The first record's sequence number; non-zero after a split. */
+    firstSeq: number;
+    /** {@link EVENT_FILE_OPEN_REASON}. */
+    openReason: number;
+    /** Which inputs the file records, {@link EVENT_INPUT} bits. */
+    inputs: number;
+}
+/** Thrown for bytes that are not an event file this decoder can read. */
+declare class EventFileFormatError extends Error {
+    constructor(message: string);
+}
+/** A decoded event file. */
+interface EventFile {
+    header: EventFileHeader;
+    records: EventRecord[];
+    /** Bytes after the last whole record, from a file cut short mid-write. */
+    trailingBytes: number;
+    /** Whether the file ends with a final record. Without one it was cut short, by a flat battery say. */
+    complete: boolean;
+}
+/**
+ * Decode an event file: `events/<experiment>/<session>/<NNN>` on the card, the
+ * partner of `data/<experiment>/<session>/<NNN>`.
+ *
+ * The header's own lengths are honoured, so a later format with a longer header
+ * or longer records still decodes, its extra bytes skipped.
+ *
+ * @throws EventFileFormatError when the magic, version or lengths are wrong
+ */
+declare function parseEventFile(bytes: Uint8Array): EventFile;
+/**
+ * A record's real-world time in Unix milliseconds: its ticks, plus the file's
+ * RTC offset on a Shimmer3, at 32768 a second.
+ *
+ * HARDWARE-VERIFY: the Shimmer3 offset's sign follows the firmware
+ * (`RTC_getRwcTimeDiffPtr`, added to the RTC for real-world time); no Shimmer3
+ * event file has been decoded.
+ */
+declare function eventTicksToUnixMs(ticks: bigint, rtcOffsetTicks?: bigint): number;
+/** Opcodes of the event channel's Bluetooth commands and responses. */
+declare const EVENT_CHANNEL_OPCODES: Readonly<{
+    /** `[0x8A][0xBB][len][record][CRC-16 LE]`, only to a host that opted in. */
+    readonly EVENT_RECORD_RESPONSE: 187;
+    readonly GET_EVENT_CHANNEL_STATUS_COMMAND: 185;
+    /** `[ACK][0xBA][status × 9]`. */
+    readonly EVENT_CHANNEL_STATUS_RESPONSE: 186;
+}>;
+/** The length of a frame with the firmware's 16-byte record: 21. */
+declare const EVENT_FRAME_LENGTH: number;
+/**
+ * The length of the event record frame at `buf[at]`, or `NEED_MORE` when the
+ * buffer ends before that can be told, or `RESYNC` when it is not one.
+ *
+ * The frame carries its own CRC-16 (seed 0xB0CA, as the link CRC) whatever
+ * CRC mode the link is in, and never the link CRC on top. A frame is only
+ * taken once that CRC checks out, which is what lets a parser find one between
+ * stream data packets with confidence.
+ */
+declare function eventFrameLength(buf: Uint8Array, at?: number): number;
+/**
+ * Decode a whole record frame, `[0x8A][0xBB][len][record][CRC]`.
+ *
+ * @returns the record, or null when the bytes are not a frame whose CRC checks out
+ */
+declare function parseEventFrame(frame: Uint8Array): EventRecord | null;
+/** The answer to `GET_EVENT_CHANNEL_STATUS_COMMAND` (0xB9). */
+interface EventChannelStatus {
+    /** Inputs the configuration enables, {@link EVENT_INPUT} bits. */
+    inputsEnabled: number;
+    /** The stream is on for this connection, as asked; the task applies it moments later. */
+    streaming: boolean;
+    /** An event file is open. */
+    fileOpen: boolean;
+    /** The event file was stopped by an error, this session or the last. */
+    fileError: boolean;
+    /** The TTL input is armed. */
+    ttlArmed: boolean;
+    /** The TTL input is switched off for a second after a flood. */
+    ttlThrottled: boolean;
+    /** Each input's state now, {@link EVENT_INPUT} bits. */
+    state: number;
+    /** The link's next sequence number. */
+    nextSeq: number;
+    /** Edges lost this session: the event file's dropped count. */
+    sessionDropped: number;
+    /** Records the link lost since the opt-in, because its queue was full. */
+    linkLost: number;
+}
+/** Length of the status payload after the 0xBA opcode. */
+declare const EVENT_CHANNEL_STATUS_LENGTH = 9;
+/**
+ * Decode the 9 status bytes that follow `EVENT_CHANNEL_STATUS_RESPONSE`.
+ *
+ * @throws RangeError when fewer than 9 bytes are given
+ */
+declare function parseEventChannelStatus(payload: Uint8Array): EventChannelStatus;
+
+/**
  * Calibration-dump (0x9A GET_CALIB_DUMP) wire-format codec and the
  * calibration source-priority ladder.
  *
@@ -8347,6 +8756,12 @@ interface InfoMemContext {
         minor: number;
         internal: number;
     };
+    /**
+     * Whether the firmware has the event channel and configuration byte 232
+     * (DEV-971), as the device itself answered: `Shimmer3RClient.supportsEventChannel`.
+     * Absent or false leaves byte 232 out of the layout and the field schema.
+     */
+    eventChannel?: boolean;
 }
 /**
  * IMU sensor rate/range settings held in the InfoMem config-setup bytes.
@@ -8567,6 +8982,18 @@ interface InfoMemDeviceConfig {
         /** Bluetooth disabled while logging (ExperimentConfig0 bit 3). */
         disableBluetooth: boolean;
     };
+    /**
+     * Configuration byte 232 as stored: the button mode, log triggers and TTL
+     * input of LogAndStream firmware with the event channel (DEV-971).
+     *
+     * Kept raw, so a config read and written back unedited leaves it exactly as it
+     * was. Read it through `decodeButtonLogMode` or `describeButtonLogMode`, which
+     * apply the firmware's own rules: 0xFF, what older firmware leaves there, and
+     * any other value the firmware cannot act on read as 0, "as before". Write it
+     * with `encodeButtonLogMode`. 0 unless {@link InfoMemContext.eventChannel}
+     * says the firmware has the byte.
+     */
+    buttonLogMode: number;
     /** Bluetooth baud-rate index byte. */
     btBaudRate: number;
     /**
@@ -8753,6 +9180,18 @@ interface InfoMemLayout {
     idxMaxExpLengthLsb: number;
     idxMacAddress: number;
     idxSDConfigDelayFlag: number;
+    /**
+     * Configuration byte 232 (`NV_BUTTON_LOG_MODE`): button mode, log triggers
+     * and the TTL input, on LogAndStream firmware with the event channel
+     * (DEV-971). See `devices/events/buttonLogMode.ts`.
+     *
+     * Undefined unless {@link InfoMemContext.eventChannel} says the firmware has
+     * it. No release has it yet, and the builds that do report the same version
+     * as the release before them, so there is no version to gate on; a host asks
+     * the device instead (`Shimmer3RClient.supportsEventChannel`). Older firmware
+     * never writes the byte and leaves it at 0xFF, which reads as "as before".
+     */
+    idxButtonLogMode?: number;
     idxBtFactoryReset: number;
     idxNode0: number;
     /** `ConfigByteLayoutShimmer3.lengthGeneralCalibrationBytes` (@238) — always 21. */
@@ -9363,6 +9802,14 @@ interface InfoMemFieldDefinition {
     /** Bit width within the byte (`bit` kind only). */
     readonly width?: number;
     /**
+     * `bit` kind only: bits that, when any is set, make the firmware ignore the
+     * whole byte and act as though it were 0 - bit 7 of configuration byte 232,
+     * which older firmware and erased memory leave set. A read of such a byte
+     * gives 0, and a write starts from 0, so setting one field of a 0xFF byte
+     * does not leave the other bits saying 7.
+     */
+    readonly zeroWhenAnySet?: number;
+    /**
      * COMPOSITE fields only: the layout key of the byte holding the field's high
      * bit(s). `layoutKey`/`shift`/`width` describe the LOW part, this pair the
      * high part, and the value is `(msb << width) | lsb` — exactly the Java
@@ -9438,8 +9885,15 @@ declare function readInfoMemFieldValue(bytes: Uint8Array, field: InfoMemFieldDef
  * updated (and both read-modify-write).
  */
 declare function writeInfoMemFieldValue(bytes: Uint8Array, field: InfoMemFieldDefinition, layout: InfoMemLayout, value: number | string | Uint8Array | readonly string[]): void;
-/** The schema fields that apply to a given part generation, in schema order. */
-declare function infoMemFieldsFor(generation: Shimmer3Generation): InfoMemFieldDefinition[];
+/**
+ * The schema fields that apply to a given part generation, in schema order.
+ *
+ * Pass the device's resolved layout to get exactly the fields it has bytes
+ * for, byte 232's three included when its firmware has them. Without one,
+ * fields on a byte only some firmware has are left out, so a caller that reads
+ * every field it is given never meets an offset the layout does not define.
+ */
+declare function infoMemFieldsFor(generation: Shimmer3Generation, layout?: InfoMemLayout): InfoMemFieldDefinition[];
 /**
  * Expansion-board revision that marks a Shimmer3 base board as "new IMU"
  * (LSM303AH + ICM20948 instead of LSM303DLHC + MPU9150).
@@ -10066,6 +10520,22 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     /** When false, inertial channels are emitted raw-only (no `'cal'` field). Default true. */
     emitCalibratedInertial: boolean;
     /**
+     * Whether the gyro on-the-fly offset calibration runs while streaming — the
+     * Java driver's `GyroOnTheFlyCalModule`, which Consensys runs when
+     * derived-sensor bit 29 (`GYRO_ON_THE_FLY_CAL`) is set. While the sensor lies
+     * still, the mean of the last round(fs) raw gyro samples replaces the gyro
+     * offset (`devices/calibration/gyroOnTheFly.ts`).
+     *
+     * Set from the configuration whenever {@link readInfoMemConfig} reads it or
+     * {@link writeInfoMemConfig} writes it, and a host may set it itself.
+     * Turning it off drops every estimate, so the stored offset is back in force
+     * from the next sample.
+     */
+    get gyroOnTheFlyCal(): boolean;
+    set gyroOnTheFlyCal(on: boolean);
+    private _gyroOnTheFlyEnabled;
+    private readonly _gyroOnTheFly;
+    /**
      * The kinematic calibration actually applied to each streamed inertial group:
      * whichever of the dump and the per-sensor commands won, at the range now
      * configured. Recomputed by {@link _reselectDeviceCalibrations}; a group
@@ -10157,6 +10627,22 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     onDeviceStatus: ((status: Shimmer3DeviceStatus) => void) | null;
     /**
+     * Invoked for each event channel record the device streams: a button press
+     * or release, a TTL edge, lost edges, and first the inputs' state at the
+     * opt-in (DEV-971; log-and-stream-common
+     * `docs/SHIMMER3_BT_COMMUNICATION_PROTOCOL.md` §7.15).
+     *
+     * Nothing arrives until {@link setEventStream} opts this connection in. Each
+     * frame carries its own CRC and is delivered only once it checks out, whether
+     * it arrives idle or between stream data packets. Frames can arrive after
+     * packets sampled later than their edge, so order by `ticks`, whose low 24
+     * bits line up with a packet's timestamp.
+     *
+     * HARDWARE-VERIFY: built from the firmware source and its doc's example
+     * frame; no device has streamed a record to this client yet.
+     */
+    onEventRecord: ((record: EventRecord) => void) | null;
+    /**
      * Invoked whenever {@link factoryTestState} changes, synchronously. A host uses
      * it to hold its own "the link is busy" gate through the whole run — including
      * the `draining` phase after a cancel, when the sensor is still printing and no
@@ -10213,6 +10699,14 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * so the parser cannot end up expecting bytes the device is not sending.
      */
     private _reestablishCrcMode;
+    /**
+     * Forget everything an inquiry set: the schema and every setting read from
+     * the device's config word. They describe the device at the far end, so a
+     * link to the next device - perhaps a different sensor - starts from the
+     * declared defaults until it inquires. An inquiry stores them before its
+     * last status line, so a reconnect made from that line relies on this too.
+     */
+    private _resetInquiredConfig;
     disconnect(): Promise<void>;
     /**
      * Protocol state that belongs to ONE link, cleared wherever a link ends or
@@ -10308,6 +10802,14 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * {@link onDeviceStatus} documents.
      */
     private _maybeEmitDeviceStatus;
+    /**
+     * Deliver the event record frames a control-plane chunk carries on
+     * {@link onEventRecord}. A notification can hold several back to back - the
+     * firmware sends up to eight a pass - and a stray ACK may sit in front.
+     */
+    private _maybeEmitEventRecords;
+    /** Decode one whole, CRC-checked event frame and hand it to {@link onEventRecord}. */
+    private _emitEventRecord;
     /**
      * Re-frame an unframed transport's read into whole firmware messages, then
      * replay them through {@link _handleFramedChunk} so every command, waiter and
@@ -10457,6 +10959,11 @@ declare class Shimmer3RClient extends BaseShimmerClient {
         enabledSensors: number;
     }>;
     /**
+     * {@link setSensors} on `link`, the link its operation began on: the
+     * re-inquiry goes to the device that took the SET, or nowhere.
+     */
+    private _setSensors;
+    /**
      * Set the sampling rate.
      * The firmware expects a 16-bit divisor: `divisor = floor(32768 / rateHz)`.
      */
@@ -10477,6 +10984,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
         schema: StreamSchemaBase;
         bytes: Uint8Array<ArrayBuffer>;
     }>;
+    /** {@link inquiry} on `link`, the link its operation began on. */
+    private _inquiry;
     /**
      * Read an inquiry response, reassembling it across notifications.
      *
@@ -10536,6 +11045,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private _awaitAtLeastBytes;
     private _readLengthPrefixedResponse;
     readInfoMem(address: number, length: number): Promise<Uint8Array>;
+    /** {@link readInfoMem} on `link`, the link its operation began on. */
+    private _readInfoMem;
     /**
      * Arm a one-shot soft reboot that the device performs as soon as this host
      * disconnects (SET_FEATURE / FEATURE_REBOOT_ON_DISCONNECT).
@@ -10554,6 +11065,45 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * firmware NACKs the unknown feature id.
      */
     setRebootOnDisconnect(enabled: boolean): Promise<void>;
+    /**
+     * Opt this connection in to (or out of) the event channel's records
+     * (SET_FEATURE / FEATURE_EVENT_STREAM, DEV-971). Once in, every button and
+     * TTL record arrives on {@link onEventRecord}, starting with the inputs'
+     * state at the opt-in, whether or not the device is streaming or logging.
+     *
+     * It lasts for this connection only: the firmware clears it on connect and
+     * on disconnect, so call it again after every reconnection. It enables no
+     * input - configuration byte 232 decides which are recorded - but it does
+     * arm an enabled TTL input outside a logging session.
+     *
+     * @returns false when the firmware NACKs feature 3, which is how firmware
+     *   without the event channel answers; true once it is ACKed
+     */
+    setEventStream(enabled: boolean): Promise<boolean>;
+    /**
+     * Ask the device whether its firmware has the event channel, and with it
+     * configuration byte 232 (DEV-971): {@link setEventStream} with `false`,
+     * which every Shimmer3R firmware answers - ACK with the event channel, NACK
+     * without - and which changes nothing, since a connection starts opted out.
+     *
+     * Pass the answer to the InfoMem context as `eventChannel`, which is what
+     * brings byte 232 into the layout and the field schema. There is no firmware
+     * version to go by: the builds that have it report the release before them.
+     */
+    supportsEventChannel(): Promise<boolean>;
+    /**
+     * Read the event channel's status (GET_EVENT_CHANNEL_STATUS_COMMAND 0xB9 →
+     * `[ACK][0xBA][9 bytes]`): which inputs the configuration enables, whether
+     * this connection is opted in, whether an event file is open or has failed,
+     * whether the TTL input is armed or throttled, each input's state, and the
+     * link's counters.
+     *
+     * Firmware without the event channel does not answer, so this times out
+     * there.
+     *
+     * HARDWARE-VERIFY: from the firmware source (`ShimEvt_buildStatus`) only.
+     */
+    getEventChannelStatus(): Promise<EventChannelStatus>;
     /**
      * Read the board's SR identity — `{boardId, boardRev, specialRev}`, the
      * first three bytes of the daughter-card id page
@@ -10709,6 +11259,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * but the round trip is unconfirmed.
      */
     writeInfoMem(address: number, data: Uint8Array): Promise<void>;
+    /** {@link writeInfoMem} on `link`, the link its operation began on. */
+    private _writeInfoMem;
     /**
      * Read the whole {@link INFOMEM_SIZE}-byte configuration image in 128-byte
      * page reads (D → C → B), reassembled in order.
@@ -10840,6 +11392,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * NACKed while sensing.
      */
     updateCalibDump(): Promise<void>;
+    /** {@link updateCalibDump} on `link`, the link its operation began on. */
+    private _updateCalibDump;
     /**
      * Build the InfoMem layout context from the device's own version replies.
      *
@@ -10925,6 +11479,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * For drift measurement only the rate matters, not the epoch.
      */
     setRtcTime(unixMs: number): Promise<void>;
+    /** {@link setRtcTime} on `link`, the link its operation began on. */
+    private _setRtcTime;
     /**
      * Read both ExG chips' 10-byte register banks over the radio
      * (GET_EXG_REGS ×2 → EXG_REGS_RESPONSE decode). Ported from
@@ -10938,6 +11494,11 @@ declare class Shimmer3RClient extends BaseShimmerClient {
         exg1: Uint8Array;
         exg2: Uint8Array;
     }>;
+    /**
+     * {@link readExgConfig} on `link`, the link its operation began on: both
+     * banks come from one device.
+     */
+    private _readExgConfig;
     /**
      * Read one chip's bank. EXG_REGS_RESPONSE is `[0x62][count][reg0..reg9]` — the
      * byte after the opcode is the register COUNT the firmware is returning, which
@@ -10969,6 +11530,12 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     writeExgConfig(exg1: Uint8Array, exg2: Uint8Array): Promise<void>;
     /**
+     * {@link writeExgConfig} on `link`, the link its operation began on. Both
+     * banks and the read-back go to one device: chip 2's bank must not go to
+     * whatever replaced it, nor the replacement's registers pass the verify.
+     */
+    private _writeExgConfig;
+    /**
      * Shimmer3R-only: overwrite REG1's (bank byte 0) low 3 bits with the ADS1292R
      * oversampling ratio for the current sampling rate. This reproduces exactly
      * what the previous `_writeExgPages` did — `exg[4] = ((exg[4] >> 3) << 3) |
@@ -10992,6 +11559,18 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * (ShimmerBluetooth.java:2732,2735) and runs `writeEXGConfiguration()` earlier
      * in the same flow (:2670). {@link setSensors} re-inquires, so the streaming
      * schema and `enabledSensors` end up reflecting the new preset.
+     *
+     * Every step runs on the link the preset began on: a drop part-way fails the
+     * call rather than finish the preset on whatever device reconnects.
+     *
+     * HARDWARE-VERIFY: that binding - here and in {@link setSensors},
+     * {@link readExgConfig}, {@link writeExgConfig}, {@link readCalibration}, the
+     * chunked InfoMem reads and writes ({@link readInfoMemBytes},
+     * {@link writeInfoMemBytes}, {@link readInfoMemConfig},
+     * {@link writeInfoMemConfig}) and the calibration dump ({@link readCalibDump},
+     * {@link writeCalibDump}) - has only been run against a scripted loopback
+     * device that drops and reconnects between steps. No real Shimmer3R link has
+     * dropped part-way through one of them.
      */
     applyExgPresetLive(preset: ApplicableExgPreset, resolution: ExgResolution): Promise<void>;
     /**
@@ -11450,6 +12029,11 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * START_STREAMING ended the next link's stream.
      */
     private _writeOnLink;
+    /**
+     * @param link the link the command belongs to: by default the current one,
+     *   or, for one step of a multi-step operation, the link the operation began
+     *   on - which fails the step at once if that link has since been reset.
+     */
     private _writeExpectingAck;
     /**
      * @param link the link generation the command was written on, from the
@@ -12683,13 +13267,17 @@ interface Shimmer3ClientOptions extends ShimmerClientOptions {
      */
     stopStreamingOnConnect?: boolean;
     /**
-     * IMU generation for default inertial calibration selection. `'old'` =
-     * LSM303DLHC accel/mag + MPU9x50 gyro (Shimmer3 SR<6); `'new'` = LSM303AHTR
-     * accel/mag (new-IMU boards). Default `'old'`.
+     * IMU generation of the board. `'old'` = LSM303DLHC accel/mag + MPU9x50 gyro
+     * (Shimmer3 SR<6); `'new'` = LSM303AHTR accel/mag (new-IMU boards). It
+     * selects the default inertial calibration and, on an old-IMU board, decodes
+     * the streamed mag big-endian (`SHIMMER3_OLD_IMU_MAG_FORMATS`).
      *
-     * HARDWARE-VERIFY: the streaming protocol does not expose the daughter-card
-     * revision, so the generation cannot be auto-detected here; set this to match
-     * the device when using the new-IMU boards.
+     * When omitted, the connect handshake decides it from the daughter-card id
+     * on firmware code 5 and up, as the Java driver does
+     * ({@link Shimmer3Client.readExpansionBoard}). Where the id is not read, or
+     * the read fails, the default calibration is the old-IMU one, as before,
+     * while the mag stays little-endian: a byte order is only flipped on a known
+     * old-IMU board.
      */
     imuGeneration?: 'old' | 'new';
     /**
@@ -12752,20 +13340,37 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * Number of command handlers ({@link _waitForAck} / {@link _waitForResponse})
      * currently awaiting a response. Gates NACK framing in {@link _drainControl}
      * so a stray 0xFE arriving with no command in flight cannot fabricate a NACK.
+     * Like `_awaitInq`, it counts the current link's waiters only.
      */
     private _awaitCmd;
+    /**
+     * Which link the client is on. {@link _resetLinkProtocolState} moves it on
+     * and fails every waiter registered for the old link. An operation captures
+     * `_link.current` before its first write and passes it to each step, so a
+     * drop strands the operation: it neither takes the next link's ACK or reply
+     * nor goes on issuing commands over the next link.
+     */
+    private readonly _link;
+    /**
+     * Whether the link in place is open: set once {@link connect}'s transport
+     * has connected, cleared by every reset. A drop leaves the transport in
+     * place for an explicit {@link disconnect}, so `_transport` alone said a
+     * dropped link was still there, and a command issued before the next
+     * `connect()` - from `onDisconnect`, say - took the new generation and was
+     * written to the dead transport.
+     */
+    private _linkLive;
     /**
      * The chain the status and battery reads queue on, so they run one at a
      * time. See {@link _readInstream}.
      */
     private _instreamReads;
-    /** Cancels the status or battery read in flight, when the link goes. */
-    private _instreamReadAbort;
     /**
      * True from just before a GET_STATUS is written until a status message
      * arrives or the read gives up. The status message that clears it is the
      * reply, which goes to {@link getStatus}'s caller. Any other status message
-     * is a push, which goes to {@link onDeviceStatus}.
+     * is a push, which goes to {@link onDeviceStatus}. Per link: cleared by
+     * {@link _resetLinkProtocolState}.
      */
     private _statusReplyOwed;
     deviceVersion: Shimmer3DeviceVersion | null;
@@ -12778,7 +13383,32 @@ declare class Shimmer3Client extends BaseShimmerClient {
     imuRanges: StreamingImuRanges;
     /** When false, inertial channels are emitted raw-only (no `'cal'` field). Default true. */
     emitCalibratedInertial: boolean;
+    /**
+     * Whether the gyro on-the-fly offset calibration runs while streaming — the
+     * Java driver's `GyroOnTheFlyCalModule`, which Consensys runs when
+     * derived-sensor bit 29 (`GYRO_ON_THE_FLY_CAL`) is set. While the sensor lies
+     * still, the mean of the last round(fs) raw gyro samples replaces the gyro
+     * offset (`devices/calibration/gyroOnTheFly.ts`).
+     *
+     * This client does not decode the configuration, so a host that has read
+     * it sets this from its derived sensors, with `isGyroOnTheFlyEnabled`.
+     * Turning it off drops every estimate, so the stored offset is back in force
+     * from the next sample.
+     */
+    get gyroOnTheFlyCal(): boolean;
+    set gyroOnTheFlyCal(on: boolean);
+    private _gyroOnTheFlyEnabled;
+    private readonly _gyroOnTheFly;
     private _imuFamily;
+    /** `imuGeneration` as the caller gave it; it wins over a board read. */
+    private readonly _imuGenerationOption;
+    /** What {@link readExpansionBoard} found on this link, or null before it. */
+    private _imuGenerationFromBoard;
+    /**
+     * The daughter-card id {@link readExpansionBoard} last read on this link, or
+     * null when it has not been read or the id page is blank.
+     */
+    expansionBoard: ShimmerSrBoard | null;
     private _deviceCalibrations;
     /**
      * Every usable block from a calibration dump, by group and range
@@ -12873,11 +13503,50 @@ declare class Shimmer3Client extends BaseShimmerClient {
      *   2. dummy GET_SAMPLING_RATE write + drain to flush the RFCOMM buffer,
      *   3. GET_DEVICE_VERSION_COMMAND (0x3F) → DEVICE_VERSION_RESPONSE (HW version),
      *   4. GET_FW_VERSION_COMMAND (0x2E) → FW_VERSION_RESPONSE (firmware version),
+     *   5. on firmware code 5 and up, best effort, GET_DAUGHTER_CARD_ID_COMMAND
+     *      (0x66) → DAUGHTER_CARD_ID_RESPONSE, which sets {@link imuGeneration}
+     *      (ShimmerBluetooth.java:1606-1610; see {@link readExpansionBoard}),
      *   then the streaming timestamp width is derived from the firmware code.
      */
     connect(transport?: ShimmerTransport): Promise<void>;
+    /** @param link the link {@link connect} opened: every step runs on it alone. */
     private _handshake;
+    /**
+     * Forget everything an inquiry set: the schema and every setting read from
+     * the device's config word. They describe the device at the far end, so a
+     * link to the next device - perhaps a different sensor - starts from the
+     * declared defaults until it inquires. An inquiry stores them before its
+     * status line and onInquiry run, so a reconnect made from either relies on
+     * this too. Same reset as Shimmer3RClient's.
+     */
+    private _resetInquiredConfig;
     disconnect(): Promise<void>;
+    /**
+     * Protocol state that belongs to ONE link, cleared wherever a link ends or a
+     * new one begins: {@link connect}, {@link disconnect} and
+     * {@link _handleTransportDisconnect}.
+     *
+     * Last, it fails every command still waiting on the old link. Such a command
+     * used to stay registered: every waiter sees every message, so on the next
+     * link it took the first ACK or matching reply as its own, and an operation
+     * stranded part-way - the connect handshake, a stop's drain - went on over
+     * the next link.
+     *
+     * Failing the old link's commands here assumes nothing that answers them can
+     * arrive over the next link, or nothing that the connect handshake's flush
+     * does not discard. Run on hardware (bench-tools shimmer3-link-drop.mjs,
+     * 2026-10-16): a Base6 reset dropped the link of a Shimmer3 on each shipped
+     * radio (RN42 v4.77 and v6.15, RN4678 V1.00.5 and V1.23, LogAndStream
+     * v1.01.006) with a command, a status read and a battery read stranded, and
+     * the app's disconnect() and reconnect left nothing crossing over, 12 runs of
+     * 12.
+     *
+     * HARDWARE-VERIFY: the reset reached from a transport-reported drop. Over a
+     * Windows Bluetooth COM port the drop is never reported - writes still
+     * succeed and the bridge sees no error - so that run reached this reset
+     * through disconnect() alone. Web Serial in Chrome is untested.
+     */
+    private _resetLinkProtocolState;
     /** Handle an unexpected transport disconnect (the link dropped under us). */
     private _handleTransportDisconnect;
     private _handleNotify;
@@ -12902,7 +13571,7 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * - NACK (0xFE) with no command outstanding is likewise dropped. This diverges
      *   from the Java driver (ShimmerObject processes every 0xFE unconditionally)
      *   but strictly reduces the risk of a leaked stream byte being read as a NACK.
-     *   Defence-in-depth: `_onTemp` handlers are only added while `_awaitCmd > 0`,
+     *   Defence-in-depth: a waiter only listens while it is counted in `_awaitCmd`,
      *   so an ungated stray 0xFE would emit to no listener anyway — this keeps that
      *   invariant explicit and survives refactors that add a longer-lived listener.
      */
@@ -12918,6 +13587,11 @@ declare class Shimmer3Client extends BaseShimmerClient {
         sensors: number;
         enabledSensors: number;
     }>;
+    /**
+     * {@link setSensors} on `link`, the link its operation began on: the
+     * re-inquiry goes to the device that took the SET, or nowhere.
+     */
+    private _setSensors;
     /**
      * Set the sampling rate (SET_SAMPLING_RATE_COMMAND). The firmware takes a
      * 16-bit divisor `floor(32768 / rateHz)`; identical to Shimmer3R.
@@ -12966,6 +13640,8 @@ declare class Shimmer3Client extends BaseShimmerClient {
         exg1: Uint8Array;
         exg2: Uint8Array;
     }>;
+    /** {@link readExgConfig} on `link`, the link its operation began on. */
+    private _readExgConfig;
     /**
      * True when this firmware serves the real-world-clock commands.
      *
@@ -13060,6 +13736,12 @@ declare class Shimmer3Client extends BaseShimmerClient {
      */
     writeExgConfig(exg1: Uint8Array, exg2: Uint8Array): Promise<void>;
     /**
+     * {@link writeExgConfig} on `link`, the link its operation began on. Both
+     * banks and the read-back go to one device: chip 2's bank must not go to
+     * whatever replaced it, nor the replacement's registers pass the verify.
+     */
+    private _writeExgConfig;
+    /**
      * Apply an ExG preset live: derive the register banks and the enabled-sensors
      * bitmap from the current inquiry state via the codec's `applyExgPreset`, write
      * the registers, then set the enabled sensors LAST — the desktop flow marks
@@ -13079,6 +13761,8 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * stream schema. Tolerant of an optional leading ACK before the response.
      */
     inquiry(): Promise<Shimmer3InquiryResult>;
+    /** {@link inquiry} on `link`, the link its operation began on. */
+    private _inquiry;
     /**
      * Arm a one-shot soft reboot that the device performs as soon as this host
      * disconnects (SET_FEATURE / FEATURE_REBOOT_ON_DISCONNECT).
@@ -13149,9 +13833,13 @@ declare class Shimmer3Client extends BaseShimmerClient {
      *   {@link _instreamReads}, each reply has exactly one waiter.
      * - **Waiter first.** The waiter is registered before the write, so a reply
      *   that lands while the write is still being awaited is not lost.
-     * - **Cancelled with the link.** {@link disconnect} and a transport drop abort
-     *   the read in flight, so it cannot take the next link's status as its
-     *   reply.
+     * - **Bound to the link it was asked on.** The link is captured when the
+     *   read is called, not when its turn comes, so a read queued behind another
+     *   when the link goes fails at its turn instead of asking the next device.
+     *   The reset of {@link disconnect} and of a transport drop fails the read
+     *   in flight at once, so it cannot take the next link's status as its
+     *   reply, and a reply that settles in the same turn as the drop does not
+     *   reach the caller.
      *
      * The connection, streaming and firmware checks run when the read's turn
      * comes, not when it is queued, because any of them can change in between.
@@ -13185,6 +13873,46 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * arrive in separate reads.
      */
     private _maybeEmitDeviceStatus;
+    /**
+     * The board's IMU generation as this client will decode it: the
+     * `imuGeneration` option when given, else what {@link readExpansionBoard}
+     * found, else null (unknown).
+     */
+    get imuGeneration(): 'old' | 'new' | null;
+    private _setBoard;
+    /**
+     * Read the daughter-card id — `{boardId, boardRev, specialRev}`, the first
+     * three bytes of the id page (GET_DAUGHTER_CARD_ID_COMMAND 0x66 →
+     * `[0x65][length][bytes…]`) — and, unless the `imuGeneration` option was
+     * given, take the board's IMU generation from it.
+     *
+     * The Java driver reads this while connecting, on firmware code 5 and up
+     * (`ShimmerBluetooth.java:1606-1610`), and decides old- or new-IMU from it
+     * (`isSupportedNewImuSensors`; here `sdlog/header.ts` `isNewImuSensors`, the
+     * rule the SD-log decoder uses). On an old-IMU board that sets the mag
+     * channels big-endian and selects the old-IMU default calibration. Call it
+     * before {@link inquiry}: the schema is built from the generation known when
+     * the inquiry is answered.
+     *
+     * Returns null when the page is blank (all 0x00 or all 0xFF), and the IMU
+     * generation is then old, as Java's is for a board it cannot identify.
+     *
+     * The connect handshake already calls this on firmware code 5 and up, so a
+     * host needs it only to re-read the board, or on older firmware.
+     *
+     * Run on the bench (21 Oct 2026, LogAndStream v1.01.006/v1.01.007) through
+     * the connect handshake on one Shimmer3 per shipped radio: RN42 v6.15
+     * (SR48-3-0, new IMU), RN4678 V1.23 (SR49-3-1, new), RN4678 V1.00.5
+     * (SR31-9-1, new) and RN42 v4.77 (blank id page, so old IMU, whose mag then
+     * decoded correctly big-endian). 26 connects reached the read and 24
+     * answered it. The other two, on the RN4678 V1.23, timed out on a link that
+     * then failed its inquiry too, and the connect still succeeded with the
+     * generation unknown, as intended. No board with a real old-IMU id (such as
+     * SR31-4) has been read.
+     */
+    readExpansionBoard(): Promise<ShimmerSrBoard | null>;
+    /** {@link readExpansionBoard} on `link`: also run by the connect handshake. */
+    private _readExpansionBoardOn;
     /**
      * Read from the daughter-card EEPROM memory. `offset` is a HOST offset —
      * firmware maps it past the first (HW details) EEPROM page, so host offsets
@@ -13224,7 +13952,9 @@ declare class Shimmer3Client extends BaseShimmerClient {
     stopStreaming(): Promise<void>;
     /**
      * Resolve once no bytes have arrived for `quietMs` (checked every 50 ms via
-     * the `_rxSeq` counter bumped in {@link _handleNotify}), or `maxMs` overall.
+     * the `_rxSeq` counter bumped in {@link _handleNotify}), or `maxMs` overall,
+     * or once `link` has been reset: the bytes arriving after that are the next
+     * link's, and they would keep a drain of the old one going.
      *
      * HEURISTIC (hardware QA, please probe): the Shimmer3 streaming protocol has
      * no end-of-stream handshake — STOP_STREAMING is ACKed but the firmware does
@@ -13278,24 +14008,42 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * @returns the groups whose calibration was successfully read.
      */
     readCalibration(timeoutMs?: number): Promise<InertialGroup[]>;
+    /**
+     * Write `u8` over the link `link`, the one the calling operation began on.
+     * Refused once that link has been reset, and failed at the reset if the
+     * transport is still holding the write then. Writing through
+     * `this._transport` regardless let an operation stranded by a drop go on
+     * over the next link, and a held write's failure ran its caller's cleanup
+     * against that link once the old transport let go.
+     */
     private _write;
+    /**
+     * @param link the link the operation began on, captured before its first
+     *   await or callback. Required: read here, the link in place could already
+     *   be the next one, since any status line can run a handler that ends it.
+     */
     private _writeExpectingAck;
-    /** Resolve on the next ACK control message; reject on NACK or timeout. */
+    /**
+     * Resolve on the next ACK control message; reject on NACK, on timeout, or
+     * when `link` is reset.
+     *
+     * @param link the link the command was written on, from the caller: read
+     *   here instead, after an awaited write, it could already be the next link's.
+     */
     private _waitForAck;
     /**
      * Resolve on the next control message whose opcode matches `expectedOpcode`.
      * Leading ACKs are ignored (classic firmware may or may not ACK-prefix a
-     * response); a NACK rejects.
+     * response); a NACK rejects, and so does a reset of `link`.
      *
+     * @param link as for {@link _waitForAck}: read before the command's write.
      * @param opts.subOpcode for a reply behind the 0x8A (INSTREAM_CMD_RESPONSE)
      *   prefix, the byte after it. That byte, not the prefix, says which message
      *   this is, and a status push shares the prefix with every such reply.
      * @param opts.signal stops the wait early: it rejects at once and stops
-     *   taking messages.
+     *   taking messages. A link reset needs no signal; it fails the wait itself.
      */
     private _waitForResponse;
-    private _onTemp;
-    private _offTemp;
     private _emitTemp;
 }
 
@@ -14888,6 +15636,17 @@ interface SdLogHeader {
      */
     pressureSensorInferred: boolean;
     /**
+     * Header byte 225 (`SDH_BUTTON_LOG_MODE`, DEV-971): configuration byte 232
+     * as the firmware acted on it for this file - button mode, log triggers and
+     * TTL input - raw. Firmware before the field leaves 0xFF, which
+     * `decodeButtonLogMode` reads as "as before" by the byte's own rule. Null
+     * for firmware other than LogAndStream.
+     *
+     * HARDWARE-VERIFY: from the firmware source only; no file carrying the field
+     * has been decoded.
+     */
+    buttonLogMode: number | null;
+    /**
      * Human-readable notes on anything the decoder had to work around or could
      * not confirm in this header. Empty when there is nothing to report.
      */
@@ -14920,6 +15679,13 @@ interface SdLogChannelCalibrationInfo {
     source: 'sd-header' | 'default';
     /** The hardware range value used to select the calibration. */
     range: number;
+    /**
+     * Gyro only: the on-the-fly offset calibration (derived-sensor bit 29).
+     * `enabled` comes from the header; `active`, `updates` and `offset` describe
+     * the decode once it has run - for a session, the state the last file left,
+     * with `updates` summed over every file.
+     */
+    gyroOnTheFly?: GyroOnTheFlyInfo;
 }
 /** Machine-readable reasons for rejecting an SD-log input. */
 type SdLogFormatErrorCode = 'LEGACY_UNSUPPORTED' | 'UNSUPPORTED_DEVICE' | 'NO_DATA' | 'TOO_SMALL' | 'BAD_HEADER' | 'INCONSISTENT_SESSION';
@@ -15012,8 +15778,11 @@ declare function parseSdLogHeader(bytes: Uint8Array): SdLogHeader;
  *     accounting (the 9-byte timestamp-offset field before the first packet
  *     of each 512-byte block is consumed and DISCARDED; porting the sync
  *     algorithm itself is out of scope)
- *   ShimmerObject#unwrapTimeStamp / #parseTimestampShimmer3 — rollover
- *     unwrapping and tick→ms conversion
+ *   TimestampUnwrap (ShimmerObject#unwrapTimeStamp / #isLastTimestampRejected)
+ *     — rollover unwrapping with the DEV-1023 reorder window and invalid-zero
+ *     rejection, through the SDK's shared StreamTimeline; a record the firmware
+ *     never stamped is dropped, as the Java file reader drops it
+ *   ShimmerObject#parseTimestampShimmer3 — tick→ms conversion
  *   ParserLoggedDataToDatabase#createMapOfFiles / #parseDataToDB /
  *   #compareSDHeader — numeric file ordering + cross-file consistency
  *     (modern files are self-contained: each restarts its own unwrap state
@@ -15032,6 +15801,14 @@ interface SdLogDecodeResult {
     records: SdLogRecord[];
     /** True when decoding stopped early because `maxRecords` was reached. */
     truncated: boolean;
+    /**
+     * Records dropped because their timestamp field was an invalid `0x000000` —
+     * a record the firmware never stamped (LogAndStream v1.00.x–v1.01.003 could
+     * write one under SD back-pressure). Read as a counter wrap it would put
+     * every later record 512 s late, so it is left out of {@link records}, as the
+     * Java driver's file reader leaves it out. See `INVALID_ZERO_WINDOW_TICKS`.
+     */
+    droppedUnstampedRecords: number;
 }
 /**
  * Decode a single SD-log binary file (e.g. `000`) into typed records.
@@ -15088,6 +15865,210 @@ declare function parseSdTrialFolderName(folder: string): {
     trialName: string;
     configTime: string;
 };
+
+/**
+ * Configuration byte 232 (`NV_BUTTON_LOG_MODE`) on a Shimmer3 or Shimmer3R:
+ * what the user button does, what else may start SD logging, and whether the
+ * TTL input is recorded.
+ *
+ *    bits 0-2  button mode   {@link BUTTON_MODE}
+ *    bits 3-4  log triggers  {@link LOG_TRIGGERS}, read only when the button
+ *                            mode is not {@link BUTTON_MODE.LEGACY}
+ *    bit 5     TTL input recorded, whatever the button mode
+ *    bit 6     unused, cleared
+ *    bit 7     must be 0
+ *
+ * 0 means "as before": `userButtonEnable` (byte 217 bit 5) decides both what a
+ * press does and whether leaving the dock starts logging. Anything the firmware
+ * cannot act on reads as 0 too: bit 7 set (erased flash, and firmware before the
+ * byte, is 0xFF), a reserved value, or a button mode that is not built.
+ *
+ * A port of log-and-stream-common `Configuration/shimmer_button_log_mode.c`,
+ * kept rule for rule so a host reads every one of the 256 values exactly as the
+ * firmware does. `docs/SHIMMER3_CONFIGURATION_INFOMEM.md` §8.3 has the table and
+ * the reasons behind each rule.
+ *
+ * HARDWARE-VERIFY: ported from the firmware source and its host tests; no
+ * device running the byte has been configured through this SDK yet.
+ */
+
+/** Bit masks of configuration byte 232. */
+declare const BUTTON_LOG_MODE: Readonly<{
+    /** InfoMem offset of the byte (`NV_BUTTON_LOG_MODE`, 128 + 104). */
+    readonly INFOMEM_OFFSET: 232;
+    readonly BUTTON_MASK: 7;
+    readonly TRIGGER_SHIFT: 3;
+    readonly TRIGGER_MASK: 24;
+    readonly TTL_INPUT: 32;
+    readonly INVALID: 128;
+}>;
+/**
+ * Bits 0-2: what a press does. 6 and 7 are reserved and read as
+ * {@link BUTTON_MODE.LEGACY}. "Recorded" means every press and release goes to
+ * the event channel; a double press is then what starts and stops logging, so a
+ * marker press cannot stop a recording.
+ */
+declare const BUTTON_MODE: Readonly<{
+    /** `userButtonEnable` decides, as before the byte existed. */
+    readonly LEGACY: 0;
+    /** A press does nothing, and the LED shows nothing while it is held. */
+    readonly DISABLED: 1;
+    /** A press starts and stops logging. */
+    readonly SINGLE_PRESS: 2;
+    /** A double press starts and stops logging. */
+    readonly DOUBLE_PRESS: 3;
+    /** A double press starts and stops logging, and every press is recorded. */
+    readonly DOUBLE_RECORDED: 4;
+    /** Every press is recorded, and a press never starts or stops logging. */
+    readonly RECORDED: 5;
+}>;
+type ButtonMode = (typeof BUTTON_MODE)[keyof typeof BUTTON_MODE];
+/** Bits 3-4: what else may start logging. 3 is reserved. */
+declare const LOG_TRIGGERS: Readonly<{
+    /** A host command only. */
+    readonly HOST: 0;
+    /** A host command, or leaving the dock (on Shimmer3R, unplugging USB-C). */
+    readonly HOST_UNDOCK: 1;
+    /** Nothing: SD logging is off. */
+    readonly NONE: 2;
+}>;
+type LogTriggers = (typeof LOG_TRIGGERS)[keyof typeof LOG_TRIGGERS];
+/** `[value, label]` pairs for a button-mode selector, in value order. */
+declare const BUTTON_MODE_OPTIONS: readonly (readonly [number, string])[];
+/** `[value, label]` pairs for a log-trigger selector, in value order. */
+declare const LOG_TRIGGER_OPTIONS: readonly (readonly [number, string])[];
+/**
+ * The byte the firmware acts on, and writes back after a configuration write:
+ * `raw` itself when it is valid, 0 when bit 7 is set, and otherwise the button
+ * mode and log triggers cleared when either is not valid (a legacy byte's log
+ * triggers are not read, so they are cleared too). Bit 5 stands on its own
+ * unless bit 7 is set. Bit 6 is cleared.
+ */
+declare function correctButtonLogMode(raw: number): number;
+/** The button mode the firmware acts on (bits 0-2 of the corrected byte). */
+declare function buttonModeOf(raw: number): number;
+/** The log triggers the firmware acts on: 0 whenever the button mode is legacy. */
+declare function logTriggersOf(raw: number): number;
+/** Whether the TTL input's edges are recorded. */
+declare function isTtlInputEnabled(raw: number): boolean;
+/** Whether every press and release goes to the event channel (modes 4 and 5). */
+declare function recordsButtonPresses(raw: number): boolean;
+/** Whether starting and stopping takes a double press (modes 3 and 4). */
+declare function isDoublePress(raw: number): boolean;
+/** Whether SD logging is off: log triggers 2, which only a non-legacy mode reads. */
+declare function isLoggingDisabled(raw: number): boolean;
+/** Whether the button does nothing, its LED included (mode 1). */
+declare function isButtonDisabled(raw: number): boolean;
+/**
+ * Whether a press starts and stops logging. Starting still has to pass the
+ * firmware's start check, which logging off fails.
+ */
+declare function doesPressToggleLogging(raw: number, userButtonEnable: boolean): boolean;
+/**
+ * Whether leaving the dock, or on Shimmer3R unplugging USB-C, starts logging.
+ * Never with single touch, where the sync centre's press starts every node.
+ */
+declare function doesUndockStartLogging(raw: number, userButtonEnable: boolean, singleTouchStart?: boolean): boolean;
+/**
+ * The `userButtonEnable` the firmware holds byte 217 at for this byte, so a
+ * host or firmware that knows only byte 217 never falls back to an undock
+ * start. 0 only where a press cannot start logging and leaving the dock does;
+ * otherwise 1. A legacy byte leaves `userButtonEnable` as it is.
+ */
+declare function nearestUserButtonEnable(raw: number, userButtonEnable: boolean): boolean;
+/**
+ * Whether single touch can work: it needs a press that can start logging.
+ * The firmware clears `singleTouchStart` when this is false.
+ */
+declare function allowsSingleTouch(raw: number): boolean;
+/**
+ * The corrected byte with press recording taken out, as the firmware does on a
+ * board with no button edges to record (SR48-6-0): a recorded double press
+ * becomes a plain double press, and recording alone becomes disabled.
+ */
+declare function withoutPressRecording(raw: number): number;
+/** The three settings byte 232 holds. */
+interface ButtonLogModeSettings {
+    /** Bits 0-2, {@link BUTTON_MODE}. */
+    buttonMode: number;
+    /** Bits 3-4, {@link LOG_TRIGGERS}. Not read while the button mode is legacy. */
+    logTriggers: number;
+    /** Bit 5. */
+    ttlInput: boolean;
+}
+/** The settings a byte holds, as the firmware reads them (corrected first). */
+declare function decodeButtonLogMode(raw: number): ButtonLogModeSettings;
+/**
+ * The byte for a set of settings, corrected the way the firmware will correct
+ * it, so what a host writes is what it reads back. A legacy button mode drops
+ * the log triggers, and an out-of-range value makes the button mode and log
+ * triggers read as legacy while the TTL bit stands.
+ */
+declare function encodeButtonLogMode(settings: ButtonLogModeSettings): number;
+/** What a byte does, worked out the way the firmware works it out. */
+interface ButtonLogModeBehaviour extends ButtonLogModeSettings {
+    /** The byte as stored. */
+    raw: number;
+    /** The byte the firmware acts on, and writes back. */
+    corrected: number;
+    /** Whether a press starts and stops logging. */
+    pressTogglesLogging: boolean;
+    /** Whether that takes a double press. */
+    doublePress: boolean;
+    /** Whether every press and release is recorded. */
+    recordsPresses: boolean;
+    /** Whether leaving the dock (or unplugging USB-C on Shimmer3R) starts logging. */
+    undockStartsLogging: boolean;
+    /** Whether nothing can start SD logging. */
+    loggingDisabled: boolean;
+    /** Whether the button does nothing, LED included. */
+    buttonDisabled: boolean;
+    /** The `userButtonEnable` the firmware will hold byte 217 at. */
+    userButtonEnable: boolean;
+}
+/**
+ * Everything a byte means for a device, given its `userButtonEnable` (byte 217
+ * bit 5) and `singleTouchStart` (byte 218 bit 7), which decide the legacy
+ * behaviour and gate the undock start.
+ */
+declare function describeButtonLogMode(raw: number, userButtonEnable: boolean, singleTouchStart?: boolean): ButtonLogModeBehaviour;
+/** What a board can record, which the firmware's checks take into account. */
+interface EventChannelBoardSupport {
+    /** Whether the button's edges reach the firmware. Not on SR48-6-0, whose button is used for dock detection. */
+    recordsButtonEdges: boolean;
+    /** Whether the board has the TTL input. Not on SR48-6-0. */
+    ttlInputSupported: boolean;
+}
+/**
+ * What a board supports, from its hardware version and SR identity
+ * (`ShimBrd_isBoardSr48_6_0`, `ShimBrd_isTtlInputSupported`,
+ * log-and-stream-common `Boards/shimmer_boards.c`). Both rules are Shimmer3R
+ * only; a board whose identity is unknown gets everything.
+ */
+declare function eventChannelBoardSupport(hardwareVersion: number, board?: {
+    boardId: number;
+    boardRev: number;
+    specialRev: number;
+} | null): EventChannelBoardSupport;
+/**
+ * Apply, to an InfoMem image about to be written, the checks the firmware makes
+ * on byte 232 when it takes a configuration
+ * (`ShimConfig_checkAndCorrectConfig`, log-and-stream-common
+ * `Configuration/shimmer_config.c`), so that what a host writes is what it
+ * reads back:
+ *
+ * - byte 232 corrected, with press recording and the TTL input taken out where
+ *   the board has neither;
+ * - single touch (byte 218 bit 7) cleared when no press can start logging;
+ * - Start Logging On Button Press (`userButtonEnable`, byte 217 bit 5) held at
+ *   the button mode's nearest equivalent.
+ *
+ * The firmware's other checks are not made here. Does nothing when the layout
+ * has no byte 232.
+ *
+ * @returns the offsets of the bytes it changed
+ */
+declare function applyButtonLogModeRules(image: Uint8Array, layout: InfoMemLayout, board?: EventChannelBoardSupport): number[];
 
 /**
  * Web Bluetooth client for the Verisense sensor platform.
@@ -16362,5 +17343,5 @@ declare function parseShimmerFactoryTestReport(text: string): ShimmerFactoryTest
  */
 declare function shimmerFactoryTestReportToCsvRows(parsed: ShimmerFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
 
-export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, IF820_OTA, IF820_OTA_COMMAND, IF820_OTA_DEFAULT_CHUNK_SIZE, IF820_OTA_FAST_CHUNK_SIZE, IF820_OTA_FIRST_WRITE_TIMEOUT_MS, IF820_OTA_MIN_CHUNK_SIZE, IF820_OTA_MIN_SENSOR_FIRMWARE, IF820_OTA_RECONNECT_ATTEMPTS, IF820_OTA_RECONNECT_DELAY_MS, IF820_OTA_RESPONSE_TIMEOUT_MS, IF820_OTA_SAFE_CHUNK_SIZE, IF820_OTA_SERVICE_UUIDS, IF820_OTA_STATUS, IF820_OTA_TRANSIENT_ERROR_REGEX, IF820_OTA_VERIFY_TIMEOUT_MS, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, If820OtaError, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_LINK_CRC_MIN_FIRMWARE, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE, SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER3_STATUS_PAYLOAD_BYTES, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareIf820Versions, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadCsvBlob, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, hasSensorBit, hhmmToMinutesSinceMidnight, if820OtaSensorSupport, if820OtaStatusText, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isBmp581PresentPerSrNumber, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isIf820OtaTransientError, isIf820UpdateAvailable, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, keepsLinkCrcWhenSensingStops, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runIf820OtaUpdate, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsBatteryRequest, shimmer3SupportsExg, shimmer3SupportsStatusRequest, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, statusPayloadBytesFor, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, twoByteCrcOverrunsStatusPush, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, whenIf820OtaDeviceIdle, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AckVerdict, ApplicableExgPreset, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BluetoothModuleFamily, BluetoothModuleVersion, BluetoothModuleVersionEntry, Bmp180Coefficients, Bmp280Coefficients, Bmp390Coefficients, Bmp581DetectionContext, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibratedGsr, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChannelUnit, ChargingStatus, CompensatedPressure, CrcMode, CsvByteSink, CsvDownload, CsvFileResult, CsvRecorder, CsvRecorderColumn, CsvRecorderFrame, CsvRecorderLog, CsvRecorderOptions, CsvTableWriter, CsvTableWriterOptions, Cyw20820VersionDetails, DebugCommandId, DecodedExgRegisters, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, DrainOptions, DrainResult, DrainVerdict, DropReason, DumpCalibrationsByGroup, EvaluateParsedSplitInput, ExgApplyInput, ExgApplyResult, ExgBanks, ExgCalibrationSource, ExgCalibrationSummary, ExgChannelSettings, ExgChipIndex, ExgFieldName, ExgFieldValue, ExgGainValue, ExgKnobEdit, ExgKnobField, ExgKnobOption, ExgLeadOffSettings, ExgPreset, ExgResolution, ExgRespirationSettings, ExgRldSettings, ExgSampleResolution, ExgStatusBits, ExgTestSignalSettings, ExpansionBoardInfo, FactoryTestClassifier, FactoryTestFailureReason, FactoryTestGrammar, FactoryTestLineContext, FactoryTestLineRule, FactoryTestMetricValue, FactoryTestOverall, FactoryTestReportFamily, FactoryTestReportParsedBase, FactoryTestResult, FactoryTestRunOptions, FactoryTestState, FactoryTestVerdict, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, If820OtaCharacteristicLike, If820OtaDeviceLike, If820OtaGattServerLike, If820OtaOptions, If820OtaProgress, If820OtaResult, If820OtaSensorIdentity, If820OtaSensorSupport, If820OtaServiceLike, ImuCalibration, ImuFamily, ImuRateCoverage, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, MessageLengthFn, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, PressureCalibration, PressureCoefficients, PressureSensorKind, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogPressureSensor, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorAvailability, SensorBitmapShimmer3Key, SensorField, SensorGate, SensorMap, SensorRuleChange, SensorRuleCheck, SensorRuleDescription, SensorRuleKey, SensorRuleState, SensorRuleViolation, SensorStreamStats, SensorToggleResult, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FactoryTestType, Shimmer3FactoryTestTypeInfo, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerFactoryTestIoStatus, ShimmerFactoryTestMcuInfo, ShimmerFactoryTestModelInfo, ShimmerFactoryTestReportFamily, ShimmerFactoryTestReportParsed, ShimmerGeneration, ShimmerHardwareDescription, ShimmerSrBoard, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamCalibrationInfo, StreamCalibrationSource, StreamCalibrationState, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStamp, StreamStatsSnapshot, StreamTimelineOptions, TestModeId, ThroughputTestOptions, ThroughputTestResult, TimelineSource, TimelineState, TimestampBits, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisensePpgLedTestFailureReason, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamCsvColumn, VerisenseStreamCsvFile, VerisenseStreamCsvLayout, VerisenseStreamFileProgress, VerisenseStreamFileResult, VerisenseStreamRecorder, VerisenseStreamRecorderOptions, VerisenseStreamRecordingResult, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
+export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BUTTON_LOG_MODE, BUTTON_MODE, BUTTON_MODE_OPTIONS, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, DERIVED_GYRO_ON_THE_FLY_CAL, EVENT_CHANNEL, EVENT_CHANNEL_OPCODES, EVENT_CHANNEL_STATUS_LENGTH, EVENT_FILE, EVENT_FILE_OPEN_REASON, EVENT_FRAME_LENGTH, EVENT_INPUT, EVENT_RECORD_FLAG, EVENT_RECORD_TYPE, EVENT_TICKS_PER_SECOND, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, EventFileFormatError, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, GYRO_ON_THE_FLY_THRESHOLD_DPS, GyroOnTheFlyCal, IF820_OTA, IF820_OTA_COMMAND, IF820_OTA_DEFAULT_CHUNK_SIZE, IF820_OTA_FAST_CHUNK_SIZE, IF820_OTA_FIRST_WRITE_TIMEOUT_MS, IF820_OTA_MIN_CHUNK_SIZE, IF820_OTA_MIN_SENSOR_FIRMWARE, IF820_OTA_RECONNECT_ATTEMPTS, IF820_OTA_RECONNECT_DELAY_MS, IF820_OTA_RESPONSE_TIMEOUT_MS, IF820_OTA_SAFE_CHUNK_SIZE, IF820_OTA_SERVICE_UUIDS, IF820_OTA_STATUS, IF820_OTA_TRANSIENT_ERROR_REGEX, IF820_OTA_VERIFY_TIMEOUT_MS, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, If820OtaError, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LOG_TRIGGERS, LOG_TRIGGER_OPTIONS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_LINK_CRC_MIN_FIRMWARE, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE, SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_OLD_IMU_MAG_FORMATS, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER3_STATUS_PAYLOAD_BYTES, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, allowsSingleTouch, appendCrc, applyButtonLogModeRules, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, buttonModeOf, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareIf820Versions, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, correctButtonLogMode, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeButtonLogMode, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describeButtonLogMode, describeEventRecord, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, doesPressToggleLogging, doesUndockStartLogging, downloadCsvBlob, downloadSdTree, drainByteStream, encodeButtonLogMode, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, eventChannelBoardSupport, eventFrameLength, eventTicksToUnixMs, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, gyroOnTheFlyWindow, hasSensorBit, hhmmToMinutesSinceMidnight, if820OtaSensorSupport, if820OtaStatusText, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isBmp581PresentPerSrNumber, isButtonDisabled, isCrcMode, isDoublePress, isExgRespirationEnabled, isGenerationSensitiveChannel, isGyroOnTheFlyEnabled, isIf820OtaTransientError, isIf820UpdateAvailable, isLoggingDisabled, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isTtlInputEnabled, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, keepsLinkCrcWhenSensingStops, localCivilUnixSecondsNow, logTriggersOf, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nearestUserButtonEnable, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventChannelStatus, parseEventFile, parseEventFrame, parseEventLogPayload, parseEventRecord, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, recordsButtonPresses, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runIf820OtaUpdate, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsBatteryRequest, shimmer3SupportsExg, shimmer3SupportsStatusRequest, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, statusPayloadBytesFor, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, twoByteCrcOverrunsStatusPush, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, whenIf820OtaDeviceIdle, wiredPacketLength, withoutPressRecording, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AckVerdict, ApplicableExgPreset, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BluetoothModuleFamily, BluetoothModuleVersion, BluetoothModuleVersionEntry, Bmp180Coefficients, Bmp280Coefficients, Bmp390Coefficients, Bmp581DetectionContext, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, ButtonLogModeBehaviour, ButtonLogModeSettings, ButtonMode, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibratedGsr, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChannelUnit, ChargingStatus, CompensatedPressure, CrcMode, CsvByteSink, CsvDownload, CsvFileResult, CsvRecorder, CsvRecorderColumn, CsvRecorderFrame, CsvRecorderLog, CsvRecorderOptions, CsvTableWriter, CsvTableWriterOptions, Cyw20820VersionDetails, DebugCommandId, DecodedExgRegisters, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, DrainOptions, DrainResult, DrainVerdict, DropReason, DumpCalibrationsByGroup, EvaluateParsedSplitInput, EventChannelBoardSupport, EventChannelStatus, EventFile, EventFileHeader, EventRecord, ExgApplyInput, ExgApplyResult, ExgBanks, ExgCalibrationSource, ExgCalibrationSummary, ExgChannelSettings, ExgChipIndex, ExgFieldName, ExgFieldValue, ExgGainValue, ExgKnobEdit, ExgKnobField, ExgKnobOption, ExgLeadOffSettings, ExgPreset, ExgResolution, ExgRespirationSettings, ExgRldSettings, ExgSampleResolution, ExgStatusBits, ExgTestSignalSettings, ExpansionBoardInfo, FactoryTestClassifier, FactoryTestFailureReason, FactoryTestGrammar, FactoryTestLineContext, FactoryTestLineRule, FactoryTestMetricValue, FactoryTestOverall, FactoryTestReportFamily, FactoryTestReportParsedBase, FactoryTestResult, FactoryTestRunOptions, FactoryTestState, FactoryTestVerdict, FieldKind, GenerateInfoMemOptions, GroupDefaults, GyroOnTheFlyInfo, IShimmerClient, If820OtaCharacteristicLike, If820OtaDeviceLike, If820OtaGattServerLike, If820OtaOptions, If820OtaProgress, If820OtaResult, If820OtaSensorIdentity, If820OtaSensorSupport, If820OtaServiceLike, ImuCalibration, ImuFamily, ImuRateCoverage, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LogTriggers, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, MessageLengthFn, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, PressureCalibration, PressureCoefficients, PressureSensorKind, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogPressureSensor, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorAvailability, SensorBitmapShimmer3Key, SensorField, SensorGate, SensorMap, SensorRuleChange, SensorRuleCheck, SensorRuleDescription, SensorRuleKey, SensorRuleState, SensorRuleViolation, SensorStreamStats, SensorToggleResult, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FactoryTestType, Shimmer3FactoryTestTypeInfo, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerFactoryTestIoStatus, ShimmerFactoryTestMcuInfo, ShimmerFactoryTestModelInfo, ShimmerFactoryTestReportFamily, ShimmerFactoryTestReportParsed, ShimmerGeneration, ShimmerHardwareDescription, ShimmerSrBoard, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamCalibrationInfo, StreamCalibrationSource, StreamCalibrationState, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStamp, StreamStatsSnapshot, StreamTimelineOptions, TestModeId, ThroughputTestOptions, ThroughputTestResult, TimelineSource, TimelineState, TimestampBits, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisensePpgLedTestFailureReason, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamCsvColumn, VerisenseStreamCsvFile, VerisenseStreamCsvLayout, VerisenseStreamFileProgress, VerisenseStreamFileResult, VerisenseStreamRecorder, VerisenseStreamRecorderOptions, VerisenseStreamRecordingResult, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };

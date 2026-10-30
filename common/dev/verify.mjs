@@ -3562,6 +3562,7 @@ const SDK_CONSUMERS = [
   "common/bt-module-update.js",
   "common/calibration-editor.js",
   "common/device-clock.js",
+  "common/event-channel-panel.js",
   "common/factory-test-panel.js",
   "common/kinematic-block-editor.js",
   "common/rtc-drift-panel.js",
@@ -6081,6 +6082,192 @@ check(
     /v1\.4\.16\.16/.test(btFail.idBt) &&
     btFail.refresh === false,
   `${btFail.text.slice(0, 70)} | ${btFail.idBt} | Refresh disabled ${btFail.refresh}`,
+);
+
+// ===========================================================================
+// The event channel and configuration byte 232 (DEV-971), on a mock whose
+// firmware has them (`&events=1`). No release has them, so the page asks the
+// sensor with a SET_FEATURE opt-out; every other section runs a mock that
+// NACKs it, which is why their field count stays at 40.
+// ===========================================================================
+console.log("\n--- event channel (byte 232, button and TTL records) ---");
+await goto(`${BASE}?mock=1&events=1`);
+check(
+  "connect to a sensor whose firmware has the event channel",
+  (await evaluate(CONNECT)) === "mock",
+);
+const evtUp = await evaluate(`
+  for (let i = 0; i < 40 && !window.mockTransport.events.optedIn; i++)
+    await new Promise(r => setTimeout(r, 50));
+  await new Promise(r => setTimeout(r, 200));
+  const keys = [...document.querySelectorAll('.field[data-field-key]')].map(n => n.dataset.fieldKey);
+  return {
+    fields: document.querySelectorAll('#configForm .field').length,
+    has: ['buttonMode', 'logTriggers', 'ttlInput'].every(k => keys.includes(k)),
+    support: document.querySelector('#eventCard .muted').textContent,
+    optedIn: window.mockTransport.events.optedIn,
+    rows: [...document.querySelectorAll('#eventTable tbody tr')].map(r => r.cells[1].textContent),
+    summary: document.getElementById('eventChannelSummary')?.textContent ?? null,
+  };
+`);
+check(
+  "the form gains byte 232's three fields, and only then",
+  evtUp.has && evtUp.fields === 43,
+  `${evtUp.fields} fields`,
+);
+check(
+  "the page opts in, and the inputs' state at the opt-in arrives",
+  evtUp.optedIn &&
+    /has the event channel/.test(evtUp.support) &&
+    evtUp.rows.length === 1 &&
+    evtUp.rows[0] === "Initial state",
+  JSON.stringify(evtUp.rows),
+);
+check(
+  "a 0xFF or 0 byte is summarised as Start Logging On Button Press deciding",
+  /Button Mode 0 leaves this to Start Logging On Button Press/.test(
+    evtUp.summary ?? "",
+  ),
+  evtUp.summary,
+);
+
+const evtEdit = await evaluate(`
+  const set = (key, v) => {
+    const s = document.querySelector('.field[data-field-key="' + key + '"] select');
+    s.value = String(v);
+    s.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  set('buttonMode', 4);
+  set('ttlInput', 1);
+  await new Promise(r => setTimeout(r, 100));
+  return {
+    summary: document.getElementById('eventChannelSummary').textContent,
+    config: document.querySelector('#eventCard .field-hint').textContent,
+  };
+`);
+check(
+  "markers with a double press and TTL are spelled out, Start Logging On Button Press included",
+  /A double press starts and stops logging/.test(evtEdit.summary) &&
+    /Every press and release is recorded/.test(evtEdit.summary) &&
+    /Leaving the dock does not start logging/.test(evtEdit.summary) &&
+    /The TTL input is recorded/.test(evtEdit.summary) &&
+    /set Start Logging On Button Press to on/.test(evtEdit.summary) &&
+    /records button presses and the TTL input/.test(evtEdit.config),
+  evtEdit.summary,
+);
+
+const evtApply = await evaluate(`
+  window.confirm = () => true;
+  const btn = document.getElementById('btnApply');
+  btn.click();
+  for (let i = 0; i < 100 && document.getElementById('dirtyPill')?.textContent !== '0 changes'; i++)
+    await new Promise(r => setTimeout(r, 100));
+  await new Promise(r => setTimeout(r, 300));
+  const im = await window.mockClient.readInfoMemBytes();
+  return { b232: im[232], b217: im[217], summary: document.getElementById('eventChannelSummary').textContent };
+`);
+check(
+  "Apply writes 0x24 and holds Start Logging On Button Press on, as the firmware would",
+  evtApply.b232 === 0x24 && (evtApply.b217 & 0x20) === 0x20,
+  `byte 232 0x${evtApply.b232?.toString(16)}, byte 217 0x${evtApply.b217?.toString(16)}`,
+);
+
+const evtStatus = await evaluate(`
+  document.getElementById('btnEventStatus').click();
+  await new Promise(r => setTimeout(r, 600));
+  return document.querySelector('#eventCard .field-hint.mono').textContent;
+`);
+check(
+  "Read status shows the event channel's own view of the link",
+  /^Inputs on: button \+ TTL/.test(evtStatus) &&
+    /stream yes/.test(evtStatus) &&
+    /TTL armed/.test(evtStatus),
+  evtStatus,
+);
+
+const evtStream = await evaluate(`
+  document.getElementById('tabBtnStream').click();
+  document.getElementById('btnStreamStart').click();
+  await new Promise(r => setTimeout(r, 1500));
+  const ev = window.mockTransport.events;
+  ev.button(true);
+  await new Promise(r => setTimeout(r, 120));
+  ev.button(false);
+  await new Promise(r => setTimeout(r, 300));
+  ev.ttl(true);
+  await new Promise(r => setTimeout(r, 40));
+  ev.ttl(false);
+  await new Promise(r => setTimeout(r, 800));
+  const rows = [...document.querySelectorAll('#eventTable tbody tr')].map(r => r.cells[1].textContent + '#' + r.cells[2].textContent);
+  const out = {
+    rows,
+    crcFailures: window.mockClient.crcFailures,
+    loss: [...document.querySelectorAll('#stats *')].map(n => n.textContent).join('|'),
+    logs: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent).filter(l => /event: /.test(l)).length,
+  };
+  document.getElementById('btnStreamStop').click();
+  await new Promise(r => setTimeout(r, 500));
+  return out;
+`);
+check(
+  "button and TTL records arrive mid-stream, in order, and no packet is lost to them",
+  evtStream.rows.slice(0, 4).join(",") ===
+    "TTL low#4,TTL high#3,Button released#2,Button pressed#1" &&
+    evtStream.crcFailures === 0 &&
+    /LOSS\|?0\.0 %/i.test(evtStream.loss) &&
+    evtStream.logs === 4,
+  `${evtStream.rows.slice(0, 4).join(", ")} | crc failures ${evtStream.crcFailures}`,
+);
+
+/* The worked example in log-and-stream-common docs/SHIMMER3_EVENT_CHANNEL.md
+   §5: a Shimmer3R on v1.01.025, both inputs on, a 64-byte header and 17
+   records. */
+const WORKED_EVENT_FILE = [
+  "53 45 56 54 01 40 10 0A 00 20 12 37 72 35 00 00",
+  "00 00 00 00 00 00 00 00 90 5C E4 6A 03 00 01 00",
+  "01 19 00 00 01 03 00 00 00 00 00 00 00 00 00 00",
+  "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+  "01 00 00 00 A4 D0 11 37 72 35 00 00 00 01 00 00",
+  "01 00 01 00 71 DD 11 37 72 35 00 00 00 00 00 00",
+  "01 00 02 00 EC F1 11 37 72 35 00 00 00 01 00 00",
+  "01 00 03 00 48 01 12 37 72 35 00 00 00 00 00 00",
+  "02 00 04 00 00 20 12 37 72 35 00 00 FF 00 00 00",
+  "01 00 05 00 33 53 18 37 72 35 00 00 00 01 00 00",
+  "01 00 06 00 3D 6A 18 37 72 35 00 00 00 00 00 00",
+  "01 01 07 00 04 20 21 37 72 35 00 00 01 02 00 00",
+  "01 01 08 00 4C 21 21 37 72 35 00 00 01 00 00 00",
+  "01 01 09 00 10 A0 28 37 72 35 00 00 01 02 00 00",
+  "01 01 0A 00 58 A1 28 37 72 35 00 00 01 00 00 00",
+  "03 00 0B 00 00 20 4E 37 72 35 00 00 FF 00 00 00",
+  "01 00 0C 00 00 20 5D 37 72 35 00 00 00 01 00 00",
+  "01 00 0D 00 14 2E 5D 37 72 35 00 00 00 00 00 00",
+  "01 00 0E 00 66 46 5D 37 72 35 00 00 00 01 00 00",
+  "01 00 0F 00 7B 54 5D 37 72 35 00 00 00 00 00 00",
+  "03 80 10 00 AE 87 5D 37 72 35 00 00 FF 00 00 00",
+].join(" ");
+const evtFileView = await evaluate(`
+  const bytes = new Uint8Array(${JSON.stringify(WORKED_EVENT_FILE)}.split(" ").map(h => parseInt(h, 16)));
+  const ok = window.eventChannelPanel.loadFile(bytes, "NNN");
+  return {
+    ok,
+    line: [...document.querySelectorAll('#eventCard .field-hint')].map(n => n.textContent).find(t => /^NNN:/.test(t)),
+    rows: [...document.querySelectorAll('#eventTable tbody tr')].map(r => r.cells[1].textContent),
+    kv: document.querySelector('#eventCard .kv').innerText,
+    csv: !document.getElementById('btnEventCsv').disabled,
+  };
+`);
+check(
+  "an event file opens in the card: its header in words, its records in the table",
+  evtFileView.ok &&
+    /Shimmer3R, firmware 1\.01\.025/.test(evtFileView.line ?? "") &&
+    /records button \+ TTL; 17 records\./.test(evtFileView.line ?? "") &&
+    evtFileView.rows.length === 17 &&
+    evtFileView.rows[0] === "End of file" &&
+    evtFileView.rows.filter((r) => r === "TTL high").length === 2 &&
+    /Button edges\s+10/.test(evtFileView.kv) &&
+    /TTL edges\s+4/.test(evtFileView.kv) &&
+    evtFileView.csv,
+  evtFileView.line,
 );
 
 // ===========================================================================
