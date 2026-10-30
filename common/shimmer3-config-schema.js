@@ -64,7 +64,7 @@
  *   rtc: boolean, ranges: boolean,
  *   exg: boolean, sensors: boolean, battery: boolean, status: boolean,
  *   sdTransfer: boolean, branding: boolean, factoryTest: boolean,
- *   ledToggle: boolean, rtcRead: boolean,
+ *   ledToggle: boolean, rtcRead: boolean, eventChannel: boolean,
  * }}
  */
 export function describeShimmer3Caps(client, mode) {
@@ -145,6 +145,12 @@ export function describeShimmer3Caps(client, mode) {
        client reads the clock through a config property rather than a method
        of its own, and can measure drift without being able to set it. */
     rtcRead: has("getRtcTime") || (mode === "usb" && has("getConfig")),
+    /* The event channel and configuration byte 232 (DEV-971), and link-gated:
+       whether a firmware has them is asked with SET_FEATURE, which the dock
+       protocol does not carry, and the records only ever come over Bluetooth.
+       This says the page CAN ask; the sensor's answer decides the rest. */
+    eventChannel:
+      has("supportsEventChannel") && has("setEventStream") && mode !== "usb",
   };
 }
 

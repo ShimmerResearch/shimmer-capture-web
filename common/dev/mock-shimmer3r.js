@@ -105,6 +105,9 @@ const CMD = Object.freeze({
   GET_CALIB_DUMP: 0x9a,
   UPD_CALIB_DUMP: 0x9b,
   SET_FEATURE: 0xb7,
+  GET_EVENT_CHANNEL_STATUS: 0xb9,
+  EVENT_CHANNEL_STATUS_RESPONSE: 0xba,
+  EVENT_RECORD_RESPONSE: 0xbb,
 });
 
 /**
@@ -124,6 +127,7 @@ const FACTORY_TEST_TYPE_COUNT = 4;
 const FEATURE = Object.freeze({
   RN4678_ERROR_LEDS: 1,
   REBOOT_ON_DISCONNECT: 2,
+  EVENT_STREAM: 3,
 });
 
 /** SET_* commands that are accepted, remembered and otherwise inert. */
@@ -823,6 +827,12 @@ export function createMockShimmer3RTransport(opts = {}) {
     (opts.hardwareVersion !== null && !Number.isFinite(opts.hardwareVersion))
       ? 10
       : opts.hardwareVersion;
+  /* Firmware with the event channel and configuration byte 232 (DEV-971).
+     Off by default, as on every release so far: SET_FEATURE 3 is then NACKed
+     and GET_EVENT_CHANNEL_STATUS goes the way of any unknown command. */
+  const eventChannel = !!opts.eventChannel;
+  /** The connection's event stream: opted in, the link's next sequence number, each input's level. */
+  const evt = { optedIn: false, seq: 0, button: false, ttl: false };
 
   /* Which pressure part this mock claims to carry. Defaults to the one the
      platform really would: a Shimmer3R has a BMP390 or BMP581, a Shimmer3 a
@@ -1323,6 +1333,57 @@ export function createMockShimmer3RTransport(opts = {}) {
   function hex(u8) {
     return Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join(" ");
   }
+
+  /**
+   * One event channel record to an opted-in host:
+   * `[0x8A][0xBB][0x10][record][CRC-16]`, with the frame's own CRC and never
+   * the link's (`ShimEvtRec_encodeBtFrame`). Timed by the device's RTC, the
+   * counter whose low 24 bits stamp the stream's packets.
+   */
+  function sendEventRecord(type, channel) {
+    if (!evt.optedIn) return;
+    const rec = new Uint8Array(16);
+    rec[0] = type;
+    rec[1] = channel === 1 ? 0x01 : 0x00; // a TTL edge is timer-latched
+    rec[2] = evt.seq & 0xff;
+    rec[3] = (evt.seq >> 8) & 0xff;
+    let ticks = BigInt(Math.round(deviceNowMs() * 32.768));
+    for (let i = 0; i < 8; i++) {
+      rec[4 + i] = Number(ticks & 0xffn);
+      ticks >>= 8n;
+    }
+    rec[12] = channel;
+    rec[13] = (evt.button ? 1 : 0) | (evt.ttl ? 2 : 0);
+    evt.seq = (evt.seq + 1) & 0xffff;
+    const frame = new Uint8Array(3 + 16);
+    frame.set([0x8a, CMD.EVENT_RECORD_RESPONSE, 16], 0);
+    frame.set(rec, 3);
+    sendBulk(appendCrc(frame, 2), { crc: false });
+  }
+
+  /* Drive the event channel from a test or the console: a press or release
+     of the button, an edge on the TTL input. Sent only while a host is opted
+     in, as the firmware does; whether byte 232 records the input is not
+     checked here. */
+  transport.events = {
+    get supported() {
+      return eventChannel;
+    },
+    get optedIn() {
+      return evt.optedIn;
+    },
+    get nextSeq() {
+      return evt.seq;
+    },
+    button(down) {
+      evt.button = !!down;
+      sendEventRecord(0x01, 0);
+    },
+    ttl(high) {
+      evt.ttl = !!high;
+      sendEventRecord(0x01, 1);
+    },
+  };
 
   // -------------------------------------------------------------------------
   // Device status
@@ -2683,6 +2744,17 @@ export function createMockShimmer3RTransport(opts = {}) {
           reply([ACK]);
           return;
         }
+        if (cmd[1] === FEATURE.EVENT_STREAM && eventChannel) {
+          /* The link counts afresh at every opt-in, and its first record is
+             the inputs' state then (`ShimEvt_setBtStream`). */
+          evt.optedIn = !!cmd[2];
+          evt.seq = 0;
+          reply([ACK]);
+          if (evt.optedIn) {
+            setTimeout(() => sendEventRecord(0x02, 0xff), REPLY_DELAY_MS + 5);
+          }
+          return;
+        }
         /* Every other feature id is NACKed, which is also how firmware built
            before a feature existed answers — the path a page's fallback to
            "power-cycle it by hand" depends on. */
@@ -2690,6 +2762,33 @@ export function createMockShimmer3RTransport(opts = {}) {
           console.warn(`[mock] unknown SET_FEATURE id ${cmd[1]}`);
         }
         reply([NACK]);
+        return;
+      }
+
+      case CMD.GET_EVENT_CHANNEL_STATUS: {
+        if (!eventChannel) break;
+        // [ACK][0xBA][inputs][flags][state][seq u16][dropped u16][link lost u16]
+        const b232 = infoMem[232];
+        const inputs =
+          b232 & 0x80
+            ? 0
+            : (b232 & 0x20 ? 2 : 0) | ([4, 5].includes(b232 & 7) ? 1 : 0);
+        const flags =
+          (evt.optedIn ? 0x01 : 0) | (evt.optedIn && inputs & 2 ? 0x08 : 0);
+        const st = (evt.button ? 1 : 0) | (evt.ttl ? 2 : 0);
+        reply([
+          ACK,
+          CMD.EVENT_CHANNEL_STATUS_RESPONSE,
+          inputs,
+          flags,
+          st,
+          evt.seq & 0xff,
+          evt.seq >> 8,
+          0,
+          0,
+          0,
+          0,
+        ]);
         return;
       }
 

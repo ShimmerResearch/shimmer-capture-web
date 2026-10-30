@@ -451,6 +451,43 @@ counter in ticks, `TIMESTAMP_CAL` as the device's own clock in milliseconds
 (unwrapped), and `Timestamp_Unix_CAL` as wall-clock milliseconds whenever the
 axis has an anchor.
 
+### Button and TTL events
+
+A Shimmer3R whose firmware has the **event channel** records the user button's
+presses and releases, and the TTL input's edges, each with its own time: in an
+event file beside every SD data file, and live to a host that asks. No firmware
+release has it yet, and the builds that do report the version of the release
+before them, so the page asks the sensor when it connects (a `SET_FEATURE`
+opt-out that only such firmware acknowledges).
+
+Where it does, three things change:
+
+- **Configure** gains a **Button and Event Channel** group, configuration byte
+  232: what the button does (as before, disabled, a press or a double press
+  starts and stops logging, with or without every press recorded), what else
+  may start logging (a host command, an undock, or nothing) and whether the
+  TTL input is recorded. The group opens with what the sensor will do, in
+  words, worked out by the firmware's own rules. Apply makes the checks the
+  firmware makes on the byte - including holding **Start Logging On Button
+  Press** at the mode's nearest equivalent - so what is written is what reads
+  back.
+- **Stream & record** gains a **Button and TTL events** card. The page opts in
+  for the connection, so records arrive whether or not the sensor is streaming
+  or logging: the inputs' state at the opt-in first, then every edge. Each is
+  listed with its time and sequence number, and while streaming it is also
+  marked on the plot - orange for the button, blue for the TTL input - placed
+  by the sensor's own clock, so it lines up with the samples. A gap in the
+  sequence numbers is records the link had no room for; the event file still
+  has them. **Read status** asks the sensor what it is recording and whether
+  anything was lost.
+- **Open event file…** decodes an event file copied off the card
+  (`events/<experiment>/<session>/<NNN>`, the partner of the data file with the
+  same path under `data/`): its header in words and every record in the table.
+  **Save as CSV** writes what the table holds.
+
+Over USB the dock protocol cannot ask, so the group and the live records are
+Bluetooth-only; an event file opens from any link.
+
 ## The event log
 
 A drawer docked to the bottom of the viewport carries every command, reply and
@@ -640,6 +677,7 @@ one is a useful thing to be able to see.
 | `&btVersion=`      | What the Bluetooth module replied. Defaults to a CYW20820 line, or an RN4678 banner with `&hw=3`. Empty models a module that never answered.                                                                                       |
 | `&sensors=`        | Preload the enabled-sensor bitmap, `0x0422E6` or decimal — how a calibrated multi-channel stream, or an image that already breaks a sensor rule, is reachable from a URL.                                                          |
 | `&pressure=`       | Which pressure part the mock claims: `390`, `581`, `180`, or `nack` / `silent` for the two ways real firmware fails to serve the coefficients.                                                                                     |
+| `&events=1`        | Firmware with the event channel: byte 232 in the form, and button and TTL records to a host that opts in. `mockTransport.events.button(true/false)` and `.ttl(true/false)` produce them from the console.                          |
 | `&rtcWrapIn=<s>`   | Put the sensor's clock this many seconds short of the point where the 24-bit stream counter rolls over, so a short stream crosses a wrap. It moves the clock, not the counter, because on a Shimmer3R the two are the same number. |
 | `&debug=1`         | Log every command and reply to the browser console.                                                                                                                                                                                |
 

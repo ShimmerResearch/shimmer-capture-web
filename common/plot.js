@@ -204,6 +204,7 @@ function cssVar(node, name, fallback) {
  *   pause: () => void,
  *   resume: () => void,
  *   clear: () => void,
+ *   pushEvent: (tSec: number, label: string, kind?: "button"|"ttl"|"other") => void,
  *   destroy: () => void,
  *   panels: Record<string, {id: string, label: string, wrap: HTMLElement, canvas: HTMLCanvasElement, chart: unknown}>,
  * }}
@@ -257,6 +258,70 @@ export function createStreamPlot(host, opts = {}) {
   let rafId = 0;
   let lastDrawMs = 0;
   let dirty = false;
+
+  /**
+   * Event markers - the sensor's button and TTL records - on the same x as the
+   * samples. Drawn by {@link markerPlugin} over every panel, and kept out of
+   * the datasets on purpose: they are instants, not a signal, and a dataset
+   * would put them in the legend, the decimation and the y range.
+   * @type {{x: number, label: string, kind: string}[]}
+   */
+  let markers = [];
+  /** The most markers kept; older ones go first. */
+  const MAX_MARKERS = 500;
+  const MARKER_COLORS = {
+    button: palette[0],
+    ttl: palette[1],
+    other: palette[2],
+  };
+
+  /**
+   * Draws each marker in the visible window as a dashed vertical line with its
+   * label at the top. A plain Chart.js plugin, so no annotation plugin is
+   * needed in the vendored build.
+   */
+  const markerPlugin = {
+    id: "shimmerEventMarkers",
+    afterDatasetsDraw(chart) {
+      if (!markers.length) return;
+      const x = chart.scales?.x;
+      const area = chart.chartArea;
+      if (!x || !area) return;
+      const ctx = chart.ctx;
+      const ink = themeColors().ink;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(
+        area.left,
+        area.top,
+        area.right - area.left,
+        area.bottom - area.top,
+      );
+      ctx.clip();
+      ctx.lineWidth = 1;
+      ctx.font = "10px sans-serif";
+      ctx.textBaseline = "top";
+      let lastLabelPx = -Infinity;
+      for (const m of markers) {
+        if (m.x < x.min || m.x > x.max) continue;
+        const px = Math.round(x.getPixelForValue(m.x)) + 0.5;
+        ctx.strokeStyle = MARKER_COLORS[m.kind] ?? MARKER_COLORS.other;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(px, area.top);
+        ctx.lineTo(px, area.bottom);
+        ctx.stroke();
+        // Labels only where they will not pile on top of the one before.
+        if (px - lastLabelPx > 40) {
+          ctx.setLineDash([]);
+          ctx.fillStyle = ink;
+          ctx.fillText(m.label, px + 3, area.top + 2);
+          lastLabelPx = px;
+        }
+      }
+      ctx.restore();
+    },
+  };
 
   function ringLength() {
     return Math.max(
@@ -345,6 +410,7 @@ export function createStreamPlot(host, opts = {}) {
     const chart = new ChartCtor(canvas.getContext("2d"), {
       type: "line",
       data: { datasets: [] },
+      plugins: [markerPlugin],
       options: {
         // The fast path: no parsing (points are already {x,y}), no
         // normalisation pass (they are sorted ascending), no animation. All
@@ -628,6 +694,9 @@ export function createStreamPlot(host, opts = {}) {
 
     const tLast = times[(write - 1 + maxPoints) % maxPoints];
     const tMin = tLast - windowSec;
+    if (markers.length && markers[0].x < tMin) {
+      markers = markers.filter((m) => m.x >= tMin);
+    }
     /* While the buffer holds less than a full window, the axis starts at the
      * oldest sample instead of tLast - windowSec. Otherwise the first seconds
      * of a stream draw a trace squeezed against the right edge of a mostly
@@ -819,6 +888,7 @@ export function createStreamPlot(host, opts = {}) {
   function clear(opts = {}) {
     write = 0;
     count = 0;
+    markers = [];
     // A new stream has its own first sample, so the elapsed axis re-bases.
     if (!opts.keepOrigin) originSec = null;
     times.fill(0);
@@ -839,6 +909,26 @@ export function createStreamPlot(host, opts = {}) {
       panel.chart.update("none");
     }
     dirty = false;
+  }
+
+  /**
+   * Mark an instant on every panel: a button or TTL record from the sensor.
+   *
+   * @param {number} tSec on the same x as the samples `push` was given
+   * @param {string} label shown beside the line
+   * @param {"button"|"ttl"|"other"} [kind] picks the colour
+   */
+  function pushEvent(tSec, label, kind = "other") {
+    if (destroyed || !Number.isFinite(tSec)) return;
+    markers.push({ x: tSec, label, kind });
+    // Records can arrive after later samples, so keep them in time order.
+    if (markers.length > 1 && markers[markers.length - 2].x > tSec) {
+      markers.sort((a, b) => a.x - b.x);
+    }
+    if (markers.length > MAX_MARKERS)
+      markers.splice(0, markers.length - MAX_MARKERS);
+    dirty = true;
+    if (!paused) schedule();
   }
 
   /** Tear down the charts, the DOM and the theme subscription. */
@@ -867,6 +957,7 @@ export function createStreamPlot(host, opts = {}) {
     pause,
     resume,
     clear,
+    pushEvent,
     destroy,
     panels,
   };
