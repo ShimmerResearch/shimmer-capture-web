@@ -11077,20 +11077,31 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * arm an enabled TTL input outside a logging session.
      *
      * @returns false when the firmware NACKs feature 3, which is how firmware
-     *   without the event channel answers; true once it is ACKed
+     *   without the event channel answers, or is older than SET_FEATURE itself
+     *   and so is not asked (`_hasSetFeature`); true once it is ACKed
      */
     setEventStream(enabled: boolean): Promise<boolean>;
     /**
      * Ask the device whether its firmware has the event channel, and with it
      * configuration byte 232 (DEV-971): {@link setEventStream} with `false`,
-     * which every Shimmer3R firmware answers - ACK with the event channel, NACK
+     * which firmware with SET_FEATURE answers - ACK with the event channel, NACK
      * without - and which changes nothing, since a connection starts opted out.
+     * Firmware older than SET_FEATURE is not asked, and has no event channel.
      *
      * Pass the answer to the InfoMem context as `eventChannel`, which is what
-     * brings byte 232 into the layout and the field schema. There is no firmware
-     * version to go by: the builds that have it report the release before them.
+     * brings byte 232 into the layout and the field schema. The version alone
+     * cannot say: the builds that have it report the release before them.
      */
     supportsEventChannel(): Promise<boolean>;
+    /**
+     * Whether the firmware has SET_FEATURE (0xB7) and NACKs a feature it does
+     * not know: LogAndStream_Shimmer3R v1.00.052 on, where it came with
+     * log-and-stream-common. Older firmware drops the 0xB7 byte unanswered and
+     * runs the two bytes after it as commands, and feature 3 is then
+     * GET_SAMPLING_RATE_COMMAND, which it ACKs: an event-stream request there
+     * would read as accepted.
+     */
+    private _hasSetFeature;
     /**
      * Read the event channel's status (GET_EVENT_CHANNEL_STATUS_COMMAND 0xB9 →
      * `[ACK][0xBA][9 bytes]`): which inputs the configuration enables, whether
