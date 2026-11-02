@@ -11292,6 +11292,21 @@ function shimmer3SupportsBatteryRequest(fw, hardwareVersion) {
         isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3, FW_ID.LOGANDSTREAM, 0, 5, 9) ||
         isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3, FW_ID.BTSTREAM, 0, 8, 1));
 }
+/**
+ * Whether this firmware has SET_FEATURE (0xB7) and NACKs a feature it does not
+ * know: LogAndStream 1.0.52 on a Shimmer3R and 1.0.17 on a Shimmer3, where it
+ * came with log-and-stream-common (the Java driver's
+ * `ShimmerVerObject.isSupportedSetFeature`).
+ *
+ * Older firmware must not be sent it. It drops the 0xB7 byte unanswered and
+ * runs each byte after it as a command - feature 3 is GET_SAMPLING_RATE_COMMAND,
+ * and a value of 1 is INQUIRY_COMMAND - which it ACKs, so the request would
+ * read as accepted.
+ */
+function shimmer3SupportsSetFeature(fw, hardwareVersion) {
+    return (isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3R, FW_ID.LOGANDSTREAM, 1, 0, 52) ||
+        isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3, FW_ID.LOGANDSTREAM, 1, 0, 17));
+}
 // ---------------------------------------------------------------------------
 // Unframed-stream control-message framing
 // ---------------------------------------------------------------------------
@@ -18886,12 +18901,17 @@ class Shimmer3RClient extends BaseShimmerClient {
      * active SD recording, and clears the request either way - it is strictly
      * one-shot and never carries into a later disconnect.
      *
-     * Requires firmware with FEATURE_REBOOT_ON_DISCONNECT support; older
-     * firmware NACKs the unknown feature id.
+     * Requires firmware with FEATURE_REBOOT_ON_DISCONNECT support; firmware
+     * with SET_FEATURE but not this feature NACKs it. Firmware older than
+     * SET_FEATURE itself (`shimmer3SupportsSetFeature`) is not sent it, and
+     * this throws: there the bytes would run as commands and be ACKed.
      */
     async setRebootOnDisconnect(enabled) {
         if (!this._transport)
             throw new Error('Not connected (RX missing)');
+        if (!(await this._hasSetFeature())) {
+            throw new Error('Reboot-on-disconnect needs SET_FEATURE (LogAndStream_Shimmer3R v1.00.052 or later)');
+        }
         this._emitStatus(`SET_FEATURE reboot-on-disconnect=${enabled ? 1 : 0} → waiting for ACK…`);
         await this._writeExpectingAck(new Uint8Array([OPCODES.SET_FEATURE, BT_FEATURE.REBOOT_ON_DISCONNECT, enabled ? 1 : 0]), 1500);
         this._emitStatus(`Reboot-on-disconnect ${enabled ? 'armed' : 'cleared'}`);
@@ -18949,15 +18969,14 @@ class Shimmer3RClient extends BaseShimmerClient {
     /**
      * Whether the firmware has SET_FEATURE (0xB7) and NACKs a feature it does
      * not know: LogAndStream_Shimmer3R v1.00.052 on, where it came with
-     * log-and-stream-common. Older firmware drops the 0xB7 byte unanswered and
-     * runs the two bytes after it as commands, and feature 3 is then
-     * GET_SAMPLING_RATE_COMMAND, which it ACKs: an event-stream request there
-     * would read as accepted.
+     * log-and-stream-common (`shimmer3SupportsSetFeature`). Older firmware drops
+     * the 0xB7 byte unanswered and runs the two bytes after it as commands, and
+     * ACKs them, so a SET_FEATURE there would read as accepted.
      */
     async _hasSetFeature() {
         try {
             const v = await this.readFwVersion();
-            return v.major * 1000000 + v.minor * 1000 + v.patch >= 1000052;
+            return shimmer3SupportsSetFeature({ firmwareIdentifier: v.fwId, major: v.major, minor: v.minor, internal: v.patch }, HW_ID$1.SHIMMER_3R);
         }
         catch {
             return false;
@@ -25765,13 +25784,20 @@ class Shimmer3Client extends BaseShimmerClient {
      * active SD recording, and clears the request either way - it is strictly
      * one-shot and never carries into a later disconnect.
      *
-     * Requires firmware with FEATURE_REBOOT_ON_DISCONNECT support; older
-     * firmware NACKs the unknown feature id.
+     * Requires firmware with FEATURE_REBOOT_ON_DISCONNECT support; firmware
+     * with SET_FEATURE but not this feature NACKs it. Firmware older than
+     * SET_FEATURE itself ({@link shimmer3SupportsSetFeature}) is not sent it,
+     * and this throws: there the bytes would run as commands and be ACKed.
      */
     async setRebootOnDisconnect(enabled) {
         const link = this._link.current;
         if (!this._linkLive)
             throw new Error('Not connected');
+        const fw = this.firmwareVersion;
+        const hw = this.deviceVersion?.hardwareVersion;
+        if (fw == null || hw == null || !shimmer3SupportsSetFeature(fw, hw)) {
+            throw new Error('Reboot-on-disconnect needs SET_FEATURE (LogAndStream v1.00.017 on a Shimmer3, v1.00.052 on a Shimmer3R)');
+        }
         this._emitStatus(`SET_FEATURE reboot-on-disconnect=${enabled ? 1 : 0} → waiting for ACK…`);
         await this._writeExpectingAck(new Uint8Array([OPCODES.SET_FEATURE, BT_FEATURE.REBOOT_ON_DISCONNECT, enabled ? 1 : 0]), SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS, link);
         this._emitStatus(`Reboot-on-disconnect ${enabled ? 'armed' : 'cleared'}`);
@@ -38373,6 +38399,7 @@ exports.shimmer3FactoryTestTypeInfo = shimmer3FactoryTestTypeInfo;
 exports.shimmer3SensorLabel = shimmer3SensorLabel;
 exports.shimmer3SupportsBatteryRequest = shimmer3SupportsBatteryRequest;
 exports.shimmer3SupportsExg = shimmer3SupportsExg;
+exports.shimmer3SupportsSetFeature = shimmer3SupportsSetFeature;
 exports.shimmer3SupportsStatusRequest = shimmer3SupportsStatusRequest;
 exports.shimmer3UsesThreeByteTimestamp = shimmer3UsesThreeByteTimestamp;
 exports.shimmer3rControlMessageLength = shimmer3rControlMessageLength;
