@@ -6281,7 +6281,7 @@ const evtSdList = await evaluate(
   const rows = [...document.querySelectorAll('[data-sd-role="tree"] > ul > li')].map(li => ({
     path: li.querySelector('label').textContent.trim(),
     meta: li.querySelector(':scope > .sd-size').textContent,
-    events: [...li.querySelectorAll('[data-sd-event-file]')].map(f => f.dataset.sdEventFile),
+    events: [...li.querySelectorAll('[data-sd-companion-file]')].map(f => f.dataset.sdCompanionFile),
   }));
   return { rows, stats: window.__sdStats(),
     cardEvents: window.mockTransport.sdCard.files.filter(f => f.path.startsWith('events/')).length };
@@ -6304,7 +6304,7 @@ check(
       evtSdList.rows[2].path,
     ) &&
     /^no data files; 1 event file\(s\), /.test(evtSdList.rows[2].meta) &&
-    evtSdList.stats.files === "5 + 3 event" &&
+    evtSdList.stats.files === "5 + 3 event file(s)" &&
     evtSdList.cardEvents === 3,
   evtSdList.rows.map((r) => `${r.path} [${r.meta}]`).join(" | ") +
     ` | files ${evtSdList.stats.files}`,

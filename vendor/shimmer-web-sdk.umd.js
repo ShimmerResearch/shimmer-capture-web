@@ -23089,6 +23089,67 @@
         }
         return { trialName: folder.slice(0, idx), configTime: folder.slice(idx + 1) };
     }
+    /** The root the data files are under: `data/<TrialName>_<ConfigTime>/…`. */
+    const SD_DATA_ROOT = 'data';
+    /**
+     * Every kind of companion file that firmware writes, in the order a host
+     * lists them. A new kind is one more entry here, as it is one more entry in
+     * the firmware's table of roots a host may delete under
+     * (`sdFtDeletableRoots`).
+     */
+    const SD_COMPANION_KINDS = Object.freeze([
+        Object.freeze({ root: 'events', label: 'event file', extension: '' }),
+    ]);
+    /**
+     * What follows `root` in `path` (`''` for the root itself, else from its
+     * `/`), or null when `path` is not in that tree. The root's case is ignored,
+     * as FAT and the firmware ignore it; a leading `/` is allowed.
+     */
+    function restUnderRoot(path, root) {
+        const p = path.replace(/^\/+/, '');
+        if (p.slice(0, root.length).toLowerCase() !== root)
+            return null;
+        const rest = p.slice(root.length);
+        return rest === '' || rest.startsWith('/') ? rest : null;
+    }
+    /** The kind of companion file whose tree `path` is in, or null. */
+    function sdCompanionKindOf(path) {
+        return SD_COMPANION_KINDS.find((k) => restUnderRoot(path, k.root) !== null) ?? null;
+    }
+    /**
+     * The path of `kind`'s companion to a data path: a folder's companion folder
+     * (`data/T_1/S-000` → `events/T_1/S-000`, `data` → `events`), or with
+     * `{ file: true }` a data file's companion file, the kind's extension added.
+     *
+     * @returns null when `dataPath` is not under `data/`
+     */
+    function sdCompanionPathFor(dataPath, kind, opts = {}) {
+        const rest = restUnderRoot(dataPath, SD_DATA_ROOT);
+        if (rest === null)
+            return null;
+        return kind.root + rest + (opts.file ? kind.extension : '');
+    }
+    /**
+     * The data path a companion path belongs with, the inverse of
+     * {@link sdCompanionPathFor}: `events/T_1/S-000/001` → `data/T_1/S-000/001`,
+     * the kind's extension dropped from a file name.
+     *
+     * Pairing by path is only a first guess. A copied or renamed file is paired
+     * by its header, whose data-file initial timestamp (`fileOpenTicks` in an
+     * event file) matches the data file's own.
+     *
+     * @returns null when `path` is not under a companion root
+     */
+    function sdDataPathForCompanion(path) {
+        const kind = sdCompanionKindOf(path);
+        if (!kind)
+            return null;
+        let rest = restUnderRoot(path, kind.root);
+        const ext = kind.extension.toLowerCase();
+        if (ext && rest.toLowerCase().endsWith(ext))
+            rest = rest.slice(0, -ext.length);
+        return SD_DATA_ROOT + rest;
+    }
 
     /**
      * High-level SD-card download orchestration for the Shimmer3R.
@@ -37797,6 +37858,8 @@
     exports.SD_BLOCK_PAYLOAD_DEFAULT = SD_BLOCK_PAYLOAD_DEFAULT;
     exports.SD_BLOCK_PAYLOAD_MAX = SD_BLOCK_PAYLOAD_MAX;
     exports.SD_BLOCK_PAYLOAD_MIN = SD_BLOCK_PAYLOAD_MIN;
+    exports.SD_COMPANION_KINDS = SD_COMPANION_KINDS;
+    exports.SD_DATA_ROOT = SD_DATA_ROOT;
     exports.SD_MAX_PATH_LEN = SD_MAX_PATH_LEN;
     exports.SD_STATUS = SD_STATUS;
     exports.SD_TRANSFER_OPCODES = SD_TRANSFER_OPCODES;
@@ -38258,7 +38321,10 @@
     exports.runVerisenseDfuUpdate = runVerisenseDfuUpdate;
     exports.samplingRateHzFromDivider = samplingRateHzFromDivider;
     exports.samplingRateToDivisor = samplingRateToDivisor;
+    exports.sdCompanionKindOf = sdCompanionKindOf;
+    exports.sdCompanionPathFor = sdCompanionPathFor;
     exports.sdCrc16 = sdCrc16;
+    exports.sdDataPathForCompanion = sdDataPathForCompanion;
     exports.sdMessageSpan = sdMessageSpan;
     exports.sdStatusToString = sdStatusToString;
     exports.sdXferStatusToString = sdXferStatusToString;

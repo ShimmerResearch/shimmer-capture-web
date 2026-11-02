@@ -25,17 +25,18 @@
  * is handed, the log it writes to, and the two callbacks below. That is what
  * lets a combined Verisense + Shimmer3 application mount it unchanged.
  *
- * Firmware with the event channel (DEV-971) also writes `events/`, beside
- * `data/`: one event file per data file, at the same path under the other
- * root, holding the button's presses and the TTL input's edges. When the page
- * says the connected firmware has it (`opts.eventFiles`), the card listing
- * takes in `events/` too. Each event file is shown under the session it
- * belongs to, and goes with that session into a "Mirror SD card structure"
- * download (and is deleted after it, when asked). A Consensys Backup download
- * leaves the event files on the card, because Consensys' importer reads the
- * first folder under a device folder as `data/`, whatever it is called. There
- * is no place in that tree where Consensys would not read an `events/` folder
- * as data.
+ * Firmware can also write companion files beside the data files, each at its
+ * data file's path under a root of its own: the event channel (DEV-971) writes
+ * `events/X/NNN` beside `data/X/NNN`. The SDK's `SD_COMPANION_KINDS` lists the
+ * kinds, and `sdCompanionPathFor` / `sdDataPathForCompanion` pair them, so a
+ * new kind needs nothing here. When the page says the connected firmware may
+ * write them (`opts.companionFiles`), the listing takes in each kind's root
+ * too. Each companion file is shown under the session it belongs to, and goes
+ * with that session into a "Mirror SD card structure" download (and is deleted
+ * after it, when asked). A Consensys Backup download leaves them on the card,
+ * because Consensys' importer reads the first folder under a device folder as
+ * `data/`, whatever it is called. There is no place in that tree where
+ * Consensys would not read a companion folder as data.
  *
  * Nothing here touches `document` at import time.
  *
@@ -57,16 +58,18 @@ import * as sdk from "../vendor/shimmer-web-sdk.esm.js";
 const CARD_ROOT = "data";
 
 /**
- * The event channel's tree: `events/<experiment>/<session>/<NNN>` is the
- * partner of the data file at the same path under `data/`. Firmware with the
- * event channel lets a host list, read and delete under it too.
+ * The kinds of companion file, from the SDK. None with a vendored bundle from
+ * before the SDK knew them, which then lists `data/` alone, as before.
  */
-const EVENTS_ROOT = "events";
+const companionKinds = () =>
+  typeof sdk.sdCompanionPathFor === "function"
+    ? (sdk.SD_COMPANION_KINDS ?? [])
+    : [];
 
 /**
  * The raw FatFs results that a listing of an absent folder comes back with.
- * They are how a card with no `events/` folder yet answers, which is not a
- * failure.
+ * They are how a card with no folder for a companion kind yet answers, which
+ * is not a failure.
  */
 const FR_NO_FILE = 4;
 const FR_NO_PATH = 5;
@@ -230,12 +233,12 @@ export function fmtEta(seconds) {
  *   past. So the panel says so, out loud, rather than letting somebody find
  *   out at import time.
  * @param {string} [opts.rootPath="data"] tree to walk on the card
- * @param {boolean|(() => boolean)} [opts.eventFiles] whether the connected
- *   firmware has the event channel. It is passed as a getter, because the page
- *   learns this at connect time. When true, and the root is `data`, the
- *   listing takes in `events/` too and the event files travel with their
- *   sessions. Without it, `events/` is never asked for, so firmware that has
- *   never written one sees no extra traffic.
+ * @param {boolean|(() => boolean)} [opts.companionFiles] whether the connected
+ *   firmware may write companion files, which today means it has the event
+ *   channel. It is passed as a getter, because the page learns this at connect
+ *   time. When true, and the root is `data`, the listing takes in each
+ *   companion root too, and the files travel with their sessions. Without it no
+ *   companion root is asked for, so other firmware sees no extra traffic.
  * @returns {{
  *   refresh: () => Promise<void>,
  *   renderTree: () => void,
@@ -257,10 +260,10 @@ export function createSdBrowser(host, opts = {}) {
   const getMacId =
     typeof opts.macId === "function" ? opts.macId : () => opts.macId ?? null;
   const rootPath = opts.rootPath ?? CARD_ROOT;
-  const getEventFiles =
-    typeof opts.eventFiles === "function"
-      ? opts.eventFiles
-      : () => !!opts.eventFiles;
+  const getCompanionFiles =
+    typeof opts.companionFiles === "function"
+      ? opts.companionFiles
+      : () => !!opts.companionFiles;
 
   /**
    * The MAC as Consensys names its device folders, or null.
@@ -310,8 +313,8 @@ export function createSdBrowser(host, opts = {}) {
 
   /** The last card listing, or null. */
   let tree = null;
-  /** The last listing of `events/`, or null when it was not asked for or is empty. */
-  let eventTree = null;
+  /** Each companion kind the last listing found files of, as `{kind, tree}`. */
+  let companions = [];
   /** The destination directory handle, or null. */
   let destRoot = null;
   /** Non-null only while a download is running. */
@@ -514,71 +517,97 @@ export function createSdBrowser(host, opts = {}) {
   }
 
   // -------------------------------------------------------------------------
-  // Event files
+  // Companion files
   // -------------------------------------------------------------------------
 
   const dirOf = (path) => path.slice(0, path.lastIndexOf("/"));
   const nameOf = (path) => path.slice(path.lastIndexOf("/") + 1);
+  const cap = (text) => text.charAt(0).toUpperCase() + text.slice(1);
 
   /** Whether `path` is `root` or something under it. */
   const isUnder = (path, root) => path === root || path.startsWith(root + "/");
 
-  /** `data/<rest>` → `events/<rest>`. */
-  const eventPathFor = (dataPath) =>
-    EVENTS_ROOT + dataPath.slice(CARD_ROOT.length);
+  /** Every companion file in the last listing, each with its kind. */
+  const companionFiles = () =>
+    companions.flatMap(({ kind, tree: listed }) =>
+      listed.files.map((f) => ({ ...f, kind })),
+    );
 
-  /** `events/<rest>` → `data/<rest>`. */
-  const dataPathFor = (eventPath) =>
-    CARD_ROOT + eventPath.slice(EVENTS_ROOT.length);
+  /** Every file in the last listing, the companion files included. */
+  const allFiles = () => [...(tree?.files ?? []), ...companionFiles()];
 
-  /** Every file in the last listing, the event files included. */
-  const allFiles = () => [...(tree?.files ?? []), ...(eventTree?.files ?? [])];
+  /** The kind of companion file `path` is in the tree of, or null. */
+  const companionKindOf = (path) =>
+    companionKinds().length ? sdk.sdCompanionKindOf(path) : null;
 
-  /** Whether a download in the current layout takes the event files. */
-  const eventsTravel = () => layout === "card";
+  /** The kinds among `paths`, each once. */
+  const kindsIn = (paths) => [
+    ...new Set(paths.map(companionKindOf).filter(Boolean)),
+  ];
+
+  /** Kinds as a phrase: "event files", or "event files and … files". */
+  const kindLabels = (kinds) => kinds.map((k) => `${k.label}s`).join(" and ");
+
+  /** "2 event file(s), 320 B", for each kind among `files`. */
+  const companionCounts = (files) =>
+    companionKinds()
+      .map((kind) => files.filter((f) => f.kind === kind))
+      .filter((same) => same.length)
+      .map(
+        (same) =>
+          `${same.length} ${same[0].kind.label}(s), ` +
+          fmtBytes(same.reduce((n, f) => n + f.size, 0)),
+      );
+
+  /** Whether a download in the current layout takes the companion files. */
+  const companionsTravel = () => layout === "card";
 
   /**
    * The card paths a run over `rootPaths` transfers.
    *
-   * A data path brings its partner under `events/` when the layout takes event
-   * files and the listing found some there. A partner the listing did not find
-   * is not asked for, because a "no such folder" would fail the whole run. An
-   * `events/` path is kept or dropped by the same rule.
+   * A data path brings its partner under each companion root, when the layout
+   * takes companion files and the listing found some there. A partner the
+   * listing did not find is not asked for, because a "no such folder" would
+   * fail the whole run. A companion path is kept or dropped by the same rule.
    */
   function transferRoots(rootPaths) {
     const out = [];
     for (const p of rootPaths) {
-      if (isUnder(p, EVENTS_ROOT)) {
-        if (eventsTravel()) out.push(p);
+      if (companionKindOf(p)) {
+        if (companionsTravel()) out.push(p);
         continue;
       }
       out.push(p);
-      if (eventsTravel() && isUnder(p, CARD_ROOT)) {
-        const partner = eventPathFor(p);
-        if (eventTree?.files.some((f) => isUnder(f.path, partner)))
+      if (!companionsTravel() || !isUnder(p, CARD_ROOT)) continue;
+      for (const { kind, tree: listed } of companions) {
+        const partner = sdk.sdCompanionPathFor(p, kind);
+        if (partner && listed.files.some((f) => isUnder(f.path, partner)))
           out.push(partner);
       }
     }
     return [...new Set(out)];
   }
 
-  /** Every listed event file, or none when the firmware has no event channel. */
-  async function listEventFiles(client) {
-    if (rootPath !== CARD_ROOT || !getEventFiles()) return null;
-    try {
-      const listed = await sdk.enumerateSdTree(client, EVENTS_ROOT);
-      return listed.files.length ? listed : null;
-    } catch (err) {
-      /* No events/ folder yet is the normal state of a card that has never
-         recorded an event. Anything else is a reason to say so, but not a
-         reason to hide the data files that listed fine. */
-      const absent =
-        err instanceof sdk.SdTransferError &&
-        (err.status === FR_NO_PATH || err.status === FR_NO_FILE);
-      if (!absent)
-        log.warn(`Listing the event files failed: ${err?.message ?? err}`);
-      return null;
+  /** Each companion kind with files on the card; none unless the firmware writes them. */
+  async function listCompanionFiles(client) {
+    if (rootPath !== CARD_ROOT || !getCompanionFiles()) return [];
+    const found = [];
+    for (const kind of companionKinds()) {
+      try {
+        const listed = await sdk.enumerateSdTree(client, kind.root);
+        if (listed.files.length) found.push({ kind, tree: listed });
+      } catch (err) {
+        /* No folder for a kind yet is the normal state of a card that has
+           never had one written. Anything else is a reason to say so, but
+           not a reason to hide the data files that listed fine. */
+        const absent =
+          err instanceof sdk.SdTransferError &&
+          (err.status === FR_NO_PATH || err.status === FR_NO_FILE);
+        if (!absent)
+          log.warn(`Listing the ${kind.label}s failed: ${err?.message ?? err}`);
+      }
     }
+    return found;
   }
 
   // -------------------------------------------------------------------------
@@ -593,8 +622,8 @@ export function createSdBrowser(host, opts = {}) {
    * thinks in: one recording. Files are listed underneath, unselectable, so
    * what a tick is about to pull down is visible without a second click.
    *
-   * An event file joins its data file's session. One whose session has no
-   * data files left gets a row of its own, under its `events/` folder, so it
+   * A companion file joins its data file's session. One whose session has no
+   * data files left gets a row of its own, under its companion folder, so it
    * can still be downloaded or cleared. A host that deletes only `data/`
    * leaves files like that behind.
    */
@@ -603,7 +632,7 @@ export function createSdBrowser(host, opts = {}) {
     const bySession = new Map();
     const session = (dir) => {
       if (!bySession.has(dir))
-        bySession.set(dir, { files: [], bytes: 0, events: [], eventBytes: 0 });
+        bySession.set(dir, { files: [], bytes: 0, companions: [] });
       return bySession.get(dir);
     };
     for (const f of tree?.files ?? []) {
@@ -611,13 +640,10 @@ export function createSdBrowser(host, opts = {}) {
       s.files.push(f);
       s.bytes += f.size;
     }
-    for (const f of eventTree?.files ?? []) {
+    for (const f of companionFiles()) {
       const dir = dirOf(f.path);
-      const s = session(
-        bySession.has(dataPathFor(dir)) ? dataPathFor(dir) : dir,
-      );
-      s.events.push(f);
-      s.eventBytes += f.size;
+      const dataDir = sdk.sdDataPathForCompanion(dir);
+      session(bySession.has(dataDir) ? dataDir : dir).companions.push(f);
     }
 
     if (!bySession.size) {
@@ -652,11 +678,7 @@ export function createSdBrowser(host, opts = {}) {
               info.files.length
                 ? `${info.files.length} file(s), ${fmtBytes(info.bytes)}`
                 : "no data files",
-              ...(info.events.length
-                ? [
-                    `${info.events.length} event file(s), ${fmtBytes(info.eventBytes)}`,
-                  ]
-                : []),
+              ...companionCounts(info.companions),
             ].join("; "),
           ),
           el(
@@ -670,15 +692,15 @@ export function createSdBrowser(host, opts = {}) {
                 el("span", { class: "sd-size" }, fmtBytes(f.size)),
               ),
             ),
-            info.events.map((f) =>
+            info.companions.map((f) =>
               el(
                 "li",
                 {
                   class: "sd-file",
                   title: f.path,
-                  dataset: { sdEventFile: f.path },
+                  dataset: { sdCompanionFile: f.path },
                 },
-                `${nameOf(f.path)} (event file)`,
+                `${nameOf(f.path)} (${f.kind.label})`,
                 el("span", { class: "sd-size" }, fmtBytes(f.size)),
               ),
             ),
@@ -693,7 +715,7 @@ export function createSdBrowser(host, opts = {}) {
   /** Forget the card: no listing, no readouts, no progress. */
   function clearCard() {
     tree = null;
-    eventTree = null;
+    companions = [];
     renderTree();
     for (const key of ["free", "capacity", "files", "bytes", "link"]) {
       setStat(key, "–");
@@ -753,31 +775,35 @@ export function createSdBrowser(host, opts = {}) {
     treeState.textContent = "Listing card…";
     try {
       tree = await sdk.enumerateSdTree(client, rootPath);
-      eventTree = await listEventFiles(client);
+      companions = await listCompanionFiles(client);
       renderTree();
-      const events = eventTree?.files.length ?? 0;
       setStat(
         "files",
-        events
-          ? `${tree.files.length} + ${events} event`
-          : String(tree.files.length),
+        [
+          String(tree.files.length),
+          ...companions.map(
+            ({ kind, tree: listed }) =>
+              `${listed.files.length} ${kind.label}(s)`,
+          ),
+        ].join(" + "),
       );
-      setStat(
-        "bytes",
-        fmtBytes(tree.totalBytes + (eventTree?.totalBytes ?? 0)),
-      );
+      setStat("bytes", fmtBytes(allFiles().reduce((n, f) => n + f.size, 0)));
       treeState.textContent = "";
       log.log(
         `card listed: ${tree.files.length} file(s) under ${rootPath}/, ` +
           `${fmtBytes(tree.totalBytes)} in ${tree.dirs.length} folder(s)` +
-          (events
-            ? `; ${events} event file(s) under ${EVENTS_ROOT}/, ${fmtBytes(eventTree.totalBytes)}`
-            : ""),
+          companions
+            .map(
+              ({ kind, tree: listed }) =>
+                `; ${listed.files.length} ${kind.label}(s) under ${kind.root}/, ` +
+                fmtBytes(listed.totalBytes),
+            )
+            .join(""),
       );
       refreshDestPreview();
     } catch (err) {
       tree = null;
-      eventTree = null;
+      companions = [];
       treeHost.replaceChildren();
       /* An SdTransferError carries the firmware's own in-band status byte —
          "SD unavailable (docked, USB-C plugged, no card or bad card)" is a
@@ -818,13 +844,15 @@ export function createSdBrowser(host, opts = {}) {
        assigning the whole class string dropped the `row` — which is what gives
        it its spacing under the destination line. */
     const warn = (on) => destPreview.classList.toggle("preview-warn", on);
-    const events = !!eventTree?.files.length;
     if (layout !== "consensysBackup") {
       destPreview.textContent =
         `Files will be written to ${destRoot.name}/${rootPath}/…` +
-        (events
-          ? `, and event files to ${destRoot.name}/${EVENTS_ROOT}/…`
-          : "");
+        companions
+          .map(
+            ({ kind }) =>
+              `, and ${kind.label}s to ${destRoot.name}/${kind.root}/…`,
+          )
+          .join("");
       warn(false);
       return;
     }
@@ -839,9 +867,13 @@ export function createSdBrowser(host, opts = {}) {
         : `Files will be written to ${destRoot.name}/${stamp}/<ShimmerName>/${rootPath}/… — ` +
           "the sensor's MAC address could not be read, and Consensys expects it " +
           "where the name will be, so this tree will not import.") +
-      (events
-        ? " Event files stay on the card: Consensys would import an events " +
-          "folder as data. Choose Mirror SD card structure to download them."
+      (companions.length
+        ? ` ${cap(kindLabels(companions.map((c) => c.kind)))} stay on the ` +
+          "card: Consensys would import " +
+          companions
+            .map(({ kind }) => `the ${kind.root}/ folder`)
+            .join(" and ") +
+          " as data. Choose Mirror SD card structure to download them."
         : "");
     warn(!mac);
   }
@@ -923,21 +955,23 @@ export function createSdBrowser(host, opts = {}) {
     const doomed = allFiles().filter((f) =>
       rootPaths.some((r) => isUnder(f.path, r)),
     );
-    // A session's event files are in a folder of their own, but the same session.
+    // A session's companion files are in folders of their own, but the same session.
     const sessions = new Set(
       doomed.map((f) =>
-        isUnder(f.path, EVENTS_ROOT)
-          ? dataPathFor(dirOf(f.path))
+        companionKindOf(f.path)
+          ? sdk.sdDataPathForCompanion(dirOf(f.path))
           : dirOf(f.path),
       ),
     );
-    const events = doomed.filter((f) => isUnder(f.path, EVENTS_ROOT)).length;
+    const extra = doomed.filter((f) => companionKindOf(f.path));
     const bytes = doomed.reduce((n, f) => n + f.size, 0);
     return window.confirm(
       "After each file is downloaded and verified it will be DELETED " +
         "from the SD card.\n\nAbout to transfer, then delete:\n" +
         `  ${doomed.length} file(s), ${fmtBytes(bytes)}` +
-        (events ? ` (${events} of them event files)` : "") +
+        (extra.length
+          ? ` (${extra.length} of them ${kindLabels(kindsIn(extra.map((f) => f.path)))})`
+          : "") +
         "\n" +
         `  ${sessions.size} session folder(s)\n\n` +
         'Untick "Delete from card after verified download" to keep the ' +
@@ -973,15 +1007,16 @@ export function createSdBrowser(host, opts = {}) {
     rootPaths = transferRoots(asked);
     if (!rootPaths.length) {
       log.warn(
-        "Only event files are selected, and the Consensys Backup layout leaves " +
-          "them on the card. Choose Mirror SD card structure to download them.",
+        `Only ${kindLabels(kindsIn(asked))} are selected, and the Consensys ` +
+          "Backup layout leaves them on the card. Choose Mirror SD card " +
+          "structure to download them.",
       );
       return;
     }
-    if (!eventsTravel() && asked.some((p) => isUnder(p, EVENTS_ROOT)))
+    if (!companionsTravel() && kindsIn(asked).length)
       log.log(
-        "the event files selected stay on the card: the Consensys Backup " +
-          "layout leaves them there.",
+        `the ${kindLabels(kindsIn(asked))} selected stay on the card: the ` +
+          "Consensys Backup layout leaves them there.",
       );
 
     const deleteAfterVerify = runOpts.deleteVerified ?? chkDelete.checked;
