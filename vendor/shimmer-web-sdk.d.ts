@@ -13175,8 +13175,9 @@ declare function enumerateSdTree(client: Shimmer3RClient, rootPath?: string, opt
 declare function downloadSdTree(client: Shimmer3RClient, destRoot: FileSystemDirectoryHandle, opts?: DownloadSdTreeOptions): Promise<SdTransferSummary>;
 /**
  * Delete verified files from the card (files first, then any directories that
- * emptied out, deepest first). Only paths under `data/` are accepted by the
- * firmware. Returns the paths actually deleted; failures are skipped.
+ * emptied out, deepest first). The firmware accepts only paths under `data/`,
+ * and under `events/` once it has the event channel. Returns the paths
+ * actually deleted; failures are skipped.
  */
 declare function deleteDownloadedFromCard(client: Shimmer3RClient, filePaths: string[], dirPaths?: string[], opts?: {
     signal?: AbortSignal;

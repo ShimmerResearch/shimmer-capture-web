@@ -23375,8 +23375,9 @@
     }
     /**
      * Delete verified files from the card (files first, then any directories that
-     * emptied out, deepest first). Only paths under `data/` are accepted by the
-     * firmware. Returns the paths actually deleted; failures are skipped.
+     * emptied out, deepest first). The firmware accepts only paths under `data/`,
+     * and under `events/` once it has the event channel. Returns the paths
+     * actually deleted; failures are skipped.
      */
     async function deleteDownloadedFromCard(client, filePaths, dirPaths = [], opts = {}) {
         const deleted = [];

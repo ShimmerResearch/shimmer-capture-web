@@ -3870,6 +3870,9 @@
                  because `deviceMac` is filled in during the connect handshake,
                  after this panel is mounted. */
         macId: () => deviceMac,
+        /* Firmware with the event channel writes events/ beside data/. A
+                 getter, because the connect handshake is what finds out. */
+        eventFiles: () => eventChannel,
         onBusyChange: (transferring) => {
           sdBusy = transferring;
           regate();

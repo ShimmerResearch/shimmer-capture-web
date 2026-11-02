@@ -6270,6 +6270,136 @@ check(
   evtFileView.line,
 );
 
+/* The SD tab, on firmware that writes events/ beside data/. The mock's card
+   has two event files for the first session, none for the second, and one
+   for a third session whose data files are gone. */
+const evtSdList = await evaluate(
+  MEMFS +
+    `
+  document.querySelector('.tabs [data-tab="tabSd"]').click();
+  await window.sdBrowser.refresh();
+  const rows = [...document.querySelectorAll('[data-sd-role="tree"] > ul > li')].map(li => ({
+    path: li.querySelector('label').textContent.trim(),
+    meta: li.querySelector(':scope > .sd-size').textContent,
+    events: [...li.querySelectorAll('[data-sd-event-file]')].map(f => f.dataset.sdEventFile),
+  }));
+  return { rows, stats: window.__sdStats(),
+    cardEvents: window.mockTransport.sdCard.files.filter(f => f.path.startsWith('events/')).length };
+`,
+);
+check(
+  "the SD tab lists event files under their sessions, and one with no data files on its own row",
+  evtSdList.rows.length === 3 &&
+    /^data\/DefaultTrial_5f2c1a90\/Shimmer_\w+-000$/.test(
+      evtSdList.rows[0].path,
+    ) &&
+    /^2 file\(s\), 327\.2 KB; 2 event file\(s\), /.test(
+      evtSdList.rows[0].meta,
+    ) &&
+    evtSdList.rows[0].events.length === 2 &&
+    evtSdList.rows[0].events.every((p) => /^events\/.*-000\/00[01]$/.test(p)) &&
+    evtSdList.rows[1].events.length === 0 &&
+    !/event/.test(evtSdList.rows[1].meta) &&
+    /^events\/DefaultTrial_5f2c1a90\/Shimmer_\w+-002$/.test(
+      evtSdList.rows[2].path,
+    ) &&
+    /^no data files; 1 event file\(s\), /.test(evtSdList.rows[2].meta) &&
+    evtSdList.stats.files === "5 + 3 event" &&
+    evtSdList.cardEvents === 3,
+  evtSdList.rows.map((r) => `${r.path} [${r.meta}]`).join(" | ") +
+    ` | files ${evtSdList.stats.files}`,
+);
+
+const evtSdConsensys = await evaluate(`
+  window.sdBrowser.setLayout('consensysBackup');
+  await window.__useFs('EvConsensys');
+  const preview = window.__sdRole('preview').textContent;
+  const orphan = [...document.querySelectorAll('[data-sd-path]')].map(b => b.dataset.sdPath)
+    .find(p => p.startsWith('events/'));
+  await window.sdBrowser.download([orphan], { deleteVerified: true });
+  // The event log flushes on an animation frame.
+  await new Promise(r => requestAnimationFrame(() => setTimeout(r, 60)));
+  const said = [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+    .filter(l => /Consensys Backup layout leaves/.test(l)).join(' | ');
+  return { preview, written: window.__fs.files.size, said,
+    cardEvents: window.mockTransport.sdCard.files.filter(f => f.path.startsWith('events/')).length };
+`);
+check(
+  "a Consensys Backup download leaves the event files on the card, and says so",
+  /Event files stay on the card/.test(evtSdConsensys.preview) &&
+    evtSdConsensys.written === 0 &&
+    /Choose Mirror SD card structure to download them/.test(
+      evtSdConsensys.said,
+    ) &&
+    evtSdConsensys.cardEvents === 3,
+  `${evtSdConsensys.preview} | ${evtSdConsensys.said}`,
+);
+
+const evtSdMirror = await evaluate(`
+  const sdk = await import('/vendor/shimmer-web-sdk.esm.js');
+  window.sdBrowser.setLayout('card');
+  await window.__useFs('EvMirror');
+  const preview = window.__sdRole('preview').textContent;
+  const session = [...document.querySelectorAll('[data-sd-path]')].map(b => b.dataset.sdPath)
+    .find(p => p.endsWith('-000'));
+  await window.sdBrowser.download([session], { deleteVerified: true });
+  const got = [...window.__fs.files.entries()].map(([path, bytes]) => ({ path, size: bytes.length }));
+  const decode = (suffix) => {
+    const key = [...window.__fs.files.keys()].find(k => k.startsWith('events/') && k.endsWith(suffix));
+    if (!key) return null;
+    const f = sdk.parseEventFile(window.__fs.files.get(key));
+    return { records: f.records.length, complete: f.complete, firstSeq: f.header.firstSeq,
+      openReason: f.header.openReason, inputs: f.header.inputs };
+  };
+  return { preview, got, first: decode('-000/000'), split: decode('-000/001'),
+    card: window.mockTransport.sdCard.files.map(f => f.path),
+    dirs: window.mockTransport.sdCard.dirs };
+`);
+check(
+  "a Mirror SD card structure download takes a session's event files with it, and they decode",
+  /, and event files to EvMirror\/events\/…$/.test(evtSdMirror.preview) &&
+    evtSdMirror.got
+      .map((f) => f.path.split("/")[0])
+      .sort()
+      .join() === "data,data,events,events" &&
+    evtSdMirror.first?.records === 8 &&
+    evtSdMirror.first?.complete === true &&
+    evtSdMirror.first?.openReason === 1 &&
+    evtSdMirror.first?.inputs === 3 &&
+    evtSdMirror.split?.records === 4 &&
+    evtSdMirror.split?.firstSeq === 8 &&
+    evtSdMirror.split?.openReason === 2,
+  `${evtSdMirror.got.map((f) => `${f.path} ${f.size}B`).join(" | ")}`,
+);
+/* Only files: a session download leaves the session folder it was asked for,
+   emptied, on both sides of the card -- as it always has under data/. */
+check(
+  "deleting after a verified download clears the session's event files as well as its data files",
+  !evtSdMirror.card.some((p) => /-000\//.test(p)) &&
+    evtSdMirror.card.filter((p) => p.startsWith("events/")).length === 1 &&
+    evtSdMirror.dirs.some((d) => /^events\/.*-000$/.test(d)) ===
+      evtSdMirror.dirs.some((d) => /^data\/.*-000$/.test(d)),
+  `card now ${evtSdMirror.card.join(", ")}`,
+);
+
+// What the Download all button runs.
+const evtSdAll = await evaluate(`
+  await window.__useFs('EvAll');
+  await window.sdBrowser.download(['data'], { deleteVerified: true });
+  return { got: [...window.__fs.files.keys()],
+    card: window.mockTransport.sdCard.files.map(f => f.path),
+    dirs: window.mockTransport.sdCard.dirs };
+`);
+check(
+  "Download all takes every event file, the one with no data files included, and clears the card",
+  evtSdAll.got.filter((k) => k.startsWith("data/")).length === 3 &&
+    evtSdAll.got.filter((k) => k.startsWith("events/")).length === 1 &&
+    evtSdAll.got.some((k) => /^events\/.*-002\/000$/.test(k)) &&
+    evtSdAll.card.length === 0 &&
+    evtSdAll.dirs.join() === "data,events",
+  `${evtSdAll.got.join(" | ")} | card dirs ${evtSdAll.dirs.join(", ")}`,
+);
+
 // ===========================================================================
 console.log("\n--- console ---");
 check(

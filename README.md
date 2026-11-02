@@ -484,6 +484,10 @@ Where it does, three things change:
   (`events/<experiment>/<session>/<NNN>`, the partner of the data file with the
   same path under `data/`): its header in words and every record in the table.
   **Save as CSV** writes what the table holds.
+- **SD card** lists the event files with the data files: each under the
+  session it belongs to, and one whose data files are gone on a row of its
+  own. A **Mirror SD card structure** download takes them with their session
+  (see [The SD card](#the-sd-card)).
 
 Over USB the dock protocol cannot ask, so the group and the live records are
 Bluetooth-only; an event file opens from any link.
@@ -545,6 +549,16 @@ into, so pressing Download again resumes rather than starting a second copy
 alongside the first. A file can optionally be deleted from the card once its
 download has been verified — only verified files, and it says how many before
 it does it.
+
+On firmware with the event channel (see
+[Button and TTL events](#button-and-ttl-events)) the card also has an
+`events/` folder beside `data/`, with an event file per data file at the same
+path. The tree shows each under its session. A session whose data files are
+gone, but whose event files are not, gets a row of its own. A **Mirror SD card
+structure** download takes a session's event files with it, into
+`<destination>/events/…`, and deletes them after it when asked. The **Consensys
+Backup** layout leaves them on the card and says so, because Consensys'
+importer would read an `events/` folder anywhere in that tree as data.
 
 This needs a Bluetooth link and **firmware v1.01.011 or later**. Earlier
 firmware either has no SD file-transfer commands at all or, on v1.01.009 and
