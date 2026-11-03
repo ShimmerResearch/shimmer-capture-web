@@ -3044,7 +3044,9 @@
                  does depends on the triggers, and on Start Logging On Button Press
                  when it is 0 - so the group opens with what the sensor will
                  actually do, worked out by the firmware's own rules. */
-        const eventBody = host.querySelector('[data-group-body="eventChannel"]');
+        const eventBody = host.querySelector(
+          '[data-group-body="eventChannel"]',
+        );
         if (eventBody) {
           eventBody.insertBefore(
             el("div", { class: "field-hint", id: "eventChannelSummary" }),
@@ -3097,12 +3099,13 @@
           return;
         }
         const ube = fieldValue("buttonStart") === 1;
-        const singleTouch = fieldValue("singleTouch") === 1;
-        const d = sdk.describeButtonLogMode(image[at], ube, singleTouch);
+        // Single touch is left out: LogAndStream is built without it, and clears it
+        const d = sdk.describeButtonLogMode(image[at], ube);
         evtPanel.setConfig(image[at]);
         if (!node) return;
         const said = [];
-        if (d.buttonDisabled) said.push("The button does nothing, and its LED stays dark.");
+        if (d.buttonDisabled)
+          said.push("The button does nothing, and its LED stays dark.");
         else if (d.pressTogglesLogging)
           said.push(
             d.doublePress
@@ -3128,6 +3131,11 @@
             `The sensor will set Start Logging On Button Press to ${d.userButtonEnable ? "on" : "off"}, the nearest equivalent for firmware and hosts that know only that setting.`,
           );
         }
+        if (fieldValue("singleTouch") === 1) {
+          said.push(
+            "The sensor will clear Single-Touch Start, which its firmware does not act on.",
+          );
+        }
         if (d.corrected !== image[at] && image[at] !== 0xff) {
           said.push(
             `As stored (0x${image[at].toString(16).padStart(2, "0")}) the sensor reads it as 0x${d.corrected.toString(16).padStart(2, "0")}; that is what Apply writes.`,
@@ -3139,8 +3147,8 @@
       /**
        * Make the checks the firmware makes on byte 232 when it takes a
        * configuration, so what Apply writes is what it reads back: the byte
-       * corrected, single touch and Start Logging On Button Press held to it,
-       * and no press recording or TTL input on a board without them.
+       * corrected, Start Logging On Button Press held to it, single touch
+       * cleared, and no press recording or TTL input on a board without them.
        */
       function conformEventChannel() {
         if (!form || layout?.idxButtonLogMode === undefined) return;
@@ -5200,7 +5208,9 @@
           );
           if (on !== true) {
             client.onEventRecord = null;
-            log.warn("event channel: the sensor did not take the opt-in, so no records will arrive live");
+            log.warn(
+              "event channel: the sensor did not take the opt-in, so no records will arrive live",
+            );
           }
         }
 

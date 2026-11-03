@@ -6131,6 +6131,23 @@ check(
   evtUp.summary,
 );
 
+// An older host can leave single touch (byte 218 bit 7) set. LogAndStream is
+// built without it and clears it, so it must not stop the undock start.
+const evtSingle = await evaluate(`
+  await window.mockClient.writeInfoMem(218, new Uint8Array([0x80]));
+  document.getElementById('btnRead').click();
+  const node = document.getElementById('eventChannelSummary');
+  for (let i = 0; i < 60 && !/Single-Touch/.test(node.textContent); i++)
+    await new Promise(r => setTimeout(r, 50));
+  return node.textContent;
+`);
+check(
+  "a single-touch bit left by an older host is summarised as cleared, and the undock start stands",
+  /Leaving the dock \(or unplugging USB-C\) starts logging/.test(evtSingle) &&
+    /will clear Single-Touch Start/.test(evtSingle),
+  evtSingle,
+);
+
 const evtEdit = await evaluate(`
   const set = (key, v) => {
     const s = document.querySelector('.field[data-field-key="' + key + '"] select');
@@ -6164,12 +6181,14 @@ const evtApply = await evaluate(`
     await new Promise(r => setTimeout(r, 100));
   await new Promise(r => setTimeout(r, 300));
   const im = await window.mockClient.readInfoMemBytes();
-  return { b232: im[232], b217: im[217], summary: document.getElementById('eventChannelSummary').textContent };
+  return { b232: im[232], b217: im[217], b218: im[218], summary: document.getElementById('eventChannelSummary').textContent };
 `);
 check(
-  "Apply writes 0x24 and holds Start Logging On Button Press on, as the firmware would",
-  evtApply.b232 === 0x24 && (evtApply.b217 & 0x20) === 0x20,
-  `byte 232 0x${evtApply.b232?.toString(16)}, byte 217 0x${evtApply.b217?.toString(16)}`,
+  "Apply writes 0x24, holds Start Logging On Button Press on and clears single touch, as the firmware would",
+  evtApply.b232 === 0x24 &&
+    (evtApply.b217 & 0x20) === 0x20 &&
+    (evtApply.b218 & 0x80) === 0,
+  `byte 232 0x${evtApply.b232?.toString(16)}, byte 217 0x${evtApply.b217?.toString(16)}, byte 218 0x${evtApply.b218?.toString(16)}`,
 );
 
 const evtStatus = await evaluate(`

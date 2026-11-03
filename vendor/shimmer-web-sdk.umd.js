@@ -15039,7 +15039,9 @@
     }
     /**
      * Whether single touch can work: it needs a press that can start logging.
-     * The firmware clears `singleTouchStart` when this is false.
+     * Firmware built with single touch clears `singleTouchStart` when this is
+     * false. No LogAndStream release is built with it, and those clear it
+     * whatever the byte ({@link EventChannelBoardSupport.singleTouchSupported}).
      */
     function allowsSingleTouch(raw) {
         const mode = buttonModeOf(raw);
@@ -15091,11 +15093,17 @@
      * Everything a byte means for a device, given its `userButtonEnable` (byte 217
      * bit 5) and `singleTouchStart` (byte 218 bit 7), which decide the legacy
      * behaviour and gate the undock start.
+     *
+     * `singleTouchStart` counts only where `singleTouchSupported` says the firmware
+     * is built with single touch, which no LogAndStream release is
+     * ({@link EventChannelBoardSupport.singleTouchSupported}); everywhere else the
+     * firmware clears it.
      */
-    function describeButtonLogMode(raw, userButtonEnable, singleTouchStart = false) {
-        const ube = nearestUserButtonEnable(raw, userButtonEnable);
-        // The firmware clears single touch where no press can start logging.
-        const singleTouch = singleTouchStart && allowsSingleTouch(raw);
+    function describeButtonLogMode(raw, userButtonEnable, singleTouchStart = false, singleTouchSupported = false) {
+        // The firmware keeps single touch only where a press can start logging, and
+        // turns the button on for it.
+        const singleTouch = singleTouchSupported && singleTouchStart && allowsSingleTouch(raw);
+        const ube = nearestUserButtonEnable(raw, userButtonEnable || singleTouch);
         return {
             ...decodeButtonLogMode(raw),
             raw: raw & 0xff,
@@ -15134,7 +15142,11 @@
      *
      * - byte 232 corrected, with press recording and the TTL input taken out where
      *   the board has neither;
-     * - single touch (byte 218 bit 7) cleared when no press can start logging;
+     * - single touch (byte 218 bit 7) cleared, as every LogAndStream release does.
+     *   Where `board.singleTouchSupported` says the firmware is built with it, it
+     *   is cleared only when no press can start logging, and kept it turns on
+     *   Start Logging On Button Press and Sync When Logging (byte 217 bits 5 and
+     *   2), which it needs;
      * - Start Logging On Button Press (`userButtonEnable`, byte 217 bit 5) held at
      *   the button mode's nearest equivalent.
      *
@@ -15151,7 +15163,8 @@
         const set = (idx, value) => {
             if (image[idx] !== value) {
                 image[idx] = value;
-                changed.push(idx);
+                if (!changed.includes(idx))
+                    changed.push(idx);
             }
         };
         let byte = correctButtonLogMode(image[at]);
@@ -15160,13 +15173,18 @@
         if (!board.ttlInputSupported)
             byte &= ~BUTTON_LOG_MODE.TTL_INPUT & 0xff;
         set(at, byte);
-        const cfg1 = layout.idxSDExperimentConfig1;
-        const singleTouchBit = 1 << BIT_SHIFT.SINGLE_TOUCH;
-        if (image[cfg1] & singleTouchBit && !allowsSingleTouch(byte)) {
-            set(cfg1, image[cfg1] & ~singleTouchBit & 0xff);
-        }
         const cfg0 = layout.idxSDExperimentConfig0;
+        const cfg1 = layout.idxSDExperimentConfig1;
         const ubeBit = 1 << BIT_SHIFT.BUTTON_START;
+        const singleTouchBit = 1 << BIT_SHIFT.SINGLE_TOUCH;
+        if (image[cfg1] & singleTouchBit) {
+            if (!board.singleTouchSupported || !allowsSingleTouch(byte)) {
+                set(cfg1, image[cfg1] & ~singleTouchBit & 0xff);
+            }
+            else {
+                set(cfg0, image[cfg0] | ubeBit | (1 << BIT_SHIFT.SYNC_WHEN_LOGGING));
+            }
+        }
         const ube = nearestUserButtonEnable(byte, (image[cfg0] & ubeBit) !== 0);
         set(cfg0, ube ? image[cfg0] | ubeBit : image[cfg0] & ~ubeBit & 0xff);
         return changed;
@@ -17340,7 +17358,14 @@
             this._desiredCrcMode = CRC_MODE.OFF;
             /** True while the active transport is a byte stream with no message framing. */
             this._unframed = false;
-            /** Re-framing accumulator, used only when {@link _unframed}. */
+            /**
+             * True once this link has asked for event record frames
+             * ({@link setEventStream}), and from then on until the link ends: a frame
+             * queued before an opt-out still arrives after it. While set, inbound bytes
+             * are re-framed even over BLE with no CRC ({@link _reframing}).
+             */
+            this._eventFramesPossible = false;
+            /** Re-framing accumulator, used only while {@link _reframing}. */
             this._ctrlBuf = new Uint8Array(0);
             /**
              * How many bytes a STATUS_RESPONSE payload carries: 2 on a Shimmer3R running
@@ -18071,6 +18096,8 @@
         _resetLinkProtocolState() {
             this._rxBuf = new Uint8Array(0);
             this._ctrlBuf = new Uint8Array(0);
+            // The firmware clears the opt-in on every connect and disconnect
+            this._eventFramesPossible = false;
             this._streaming = false;
             this._streamAligned = false;
             this._streamAlignRejects = 0;
@@ -18173,9 +18200,15 @@
          * would fail every long response. The framer already sizes each message from
          * its opcode and length, and already accumulates across reads, so a CRC just
          * turns on a path that splits correctly.
+         *
+         * **And true once the link has opted in to event records.** A record frame is
+         * 21 bytes sent whenever an input changes, with no regard for the replies
+         * around it, so a notification can cut one in two or carry it behind a reply
+         * or in front of an ACK. Read a notification at a time, the first loses the
+         * record and the others the reply or the ACK a command is waiting for.
          */
         get _reframing() {
-            return this._unframed || this._crcMode !== CRC_MODE.OFF;
+            return this._unframed || this._crcMode !== CRC_MODE.OFF || this._eventFramesPossible;
         }
         /**
          * Whether a chunk beginning with 0xFF is really the ACK being waited for,
@@ -18943,6 +18976,10 @@
                 return false;
             }
             this._emitStatus(`SET_FEATURE event-stream=${enabled ? 1 : 0} → waiting for ACK…`);
+            /* Before the write, not after the ACK: the firmware sends the inputs' state
+             * straight after its ACK, often in the same notification. */
+            if (enabled)
+                this._eventFramesPossible = true;
             try {
                 await this._writeExpectingAck(new Uint8Array([OPCODES.SET_FEATURE, BT_FEATURE.EVENT_STREAM, enabled ? 1 : 0]), 1500);
             }

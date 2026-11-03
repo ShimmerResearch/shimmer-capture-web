@@ -10466,7 +10466,14 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private _desiredCrcMode;
     /** True while the active transport is a byte stream with no message framing. */
     private _unframed;
-    /** Re-framing accumulator, used only when {@link _unframed}. */
+    /**
+     * True once this link has asked for event record frames
+     * ({@link setEventStream}), and from then on until the link ends: a frame
+     * queued before an opt-out still arrives after it. While set, inbound bytes
+     * are re-framed even over BLE with no CRC ({@link _reframing}).
+     */
+    private _eventFramesPossible;
+    /** Re-framing accumulator, used only while {@link _reframing}. */
     private _ctrlBuf;
     /**
      * How many bytes a STATUS_RESPONSE payload carries: 2 on a Shimmer3R running
@@ -10781,6 +10788,12 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * would fail every long response. The framer already sizes each message from
      * its opcode and length, and already accumulates across reads, so a CRC just
      * turns on a path that splits correctly.
+     *
+     * **And true once the link has opted in to event records.** A record frame is
+     * 21 bytes sent whenever an input changes, with no regard for the replies
+     * around it, so a notification can cut one in two or carry it behind a reply
+     * or in front of an ACK. Read a notification at a time, the first loses the
+     * record and the others the reply or the ACK a command is waiting for.
      */
     private get _reframing();
     private _handleNotify;
@@ -16063,7 +16076,9 @@ declare function doesUndockStartLogging(raw: number, userButtonEnable: boolean, 
 declare function nearestUserButtonEnable(raw: number, userButtonEnable: boolean): boolean;
 /**
  * Whether single touch can work: it needs a press that can start logging.
- * The firmware clears `singleTouchStart` when this is false.
+ * Firmware built with single touch clears `singleTouchStart` when this is
+ * false. No LogAndStream release is built with it, and those clear it
+ * whatever the byte ({@link EventChannelBoardSupport.singleTouchSupported}).
  */
 declare function allowsSingleTouch(raw: number): boolean;
 /**
@@ -16115,14 +16130,26 @@ interface ButtonLogModeBehaviour extends ButtonLogModeSettings {
  * Everything a byte means for a device, given its `userButtonEnable` (byte 217
  * bit 5) and `singleTouchStart` (byte 218 bit 7), which decide the legacy
  * behaviour and gate the undock start.
+ *
+ * `singleTouchStart` counts only where `singleTouchSupported` says the firmware
+ * is built with single touch, which no LogAndStream release is
+ * ({@link EventChannelBoardSupport.singleTouchSupported}); everywhere else the
+ * firmware clears it.
  */
-declare function describeButtonLogMode(raw: number, userButtonEnable: boolean, singleTouchStart?: boolean): ButtonLogModeBehaviour;
-/** What a board can record, which the firmware's checks take into account. */
+declare function describeButtonLogMode(raw: number, userButtonEnable: boolean, singleTouchStart?: boolean, singleTouchSupported?: boolean): ButtonLogModeBehaviour;
+/** What a board and its firmware support, which the firmware's checks take into account. */
 interface EventChannelBoardSupport {
     /** Whether the button's edges reach the firmware. Not on SR48-6-0, whose button is used for dock detection. */
     recordsButtonEdges: boolean;
     /** Whether the board has the TTL input. Not on SR48-6-0. */
     ttlInputSupported: boolean;
+    /**
+     * Whether the firmware is built with single touch (`IS_SUPPORTED_SINGLE_TOUCH`,
+     * log-and-stream-common `log_and_stream_definitions.h`). No LogAndStream
+     * release is, so left out it is false, and the firmware clears single touch
+     * (byte 218 bit 7) on every configuration it takes.
+     */
+    singleTouchSupported?: boolean;
 }
 /**
  * What a board supports, from its hardware version and SR identity
@@ -16144,7 +16171,11 @@ declare function eventChannelBoardSupport(hardwareVersion: number, board?: {
  *
  * - byte 232 corrected, with press recording and the TTL input taken out where
  *   the board has neither;
- * - single touch (byte 218 bit 7) cleared when no press can start logging;
+ * - single touch (byte 218 bit 7) cleared, as every LogAndStream release does.
+ *   Where `board.singleTouchSupported` says the firmware is built with it, it
+ *   is cleared only when no press can start logging, and kept it turns on
+ *   Start Logging On Button Press and Sync When Logging (byte 217 bits 5 and
+ *   2), which it needs;
  * - Start Logging On Button Press (`userButtonEnable`, byte 217 bit 5) held at
  *   the button mode's nearest equivalent.
  *
