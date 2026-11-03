@@ -105,6 +105,9 @@ const CMD = Object.freeze({
   GET_CALIB_DUMP: 0x9a,
   UPD_CALIB_DUMP: 0x9b,
   SET_FEATURE: 0xb7,
+  GET_EVENT_CHANNEL_STATUS: 0xb9,
+  EVENT_CHANNEL_STATUS_RESPONSE: 0xba,
+  EVENT_RECORD_RESPONSE: 0xbb,
 });
 
 /**
@@ -124,6 +127,7 @@ const FACTORY_TEST_TYPE_COUNT = 4;
 const FEATURE = Object.freeze({
   RN4678_ERROR_LEDS: 1,
   REBOOT_ON_DISCONNECT: 2,
+  EVENT_STREAM: 3,
 });
 
 /** SET_* commands that are accepted, remembered and otherwise inert. */
@@ -694,6 +698,112 @@ function buildSyntheticCard(shimmerName) {
   });
 }
 
+/**
+ * The event files firmware with the event channel writes beside those data
+ * files (DEV-971): `events/<experiment>/<session>/<NNN>`, partner of the data
+ * file at the same path under `data/`.
+ *
+ * - The first session has one per data file. `001` was opened by a file
+ *   split, so its sequence numbers carry on from `000`'s.
+ * - The second session has none: its configuration recorded nothing.
+ * - A third has an event file and no data files. That is what a host leaves
+ *   behind when it deletes only `data/`.
+ *
+ * Real event files, header and records, so a downloaded one decodes. Each
+ * file holds an initial-state record, then edges, then a final heartbeat.
+ *
+ * @param {string} shimmerName
+ * @returns {{path: string, size: number, bytes: Uint8Array, fdate: number,
+ *   ftime: number}[]}
+ */
+function buildSyntheticEventFiles(shimmerName) {
+  const trial = "events/DefaultTrial_5f2c1a90";
+  const base = new Date(2026, 7, 14, 10, 23, 44);
+  // Edges as [seconds after the file opened, channel (0 button, 1 TTL), level].
+  const spec = [
+    [
+      `${trial}/${shimmerName}-000/000`,
+      0,
+      1,
+      [
+        [2.0, 0, 1],
+        [2.2, 0, 0],
+        [5.0, 1, 1],
+        [5.001, 1, 0],
+        [9.0, 0, 1],
+        [9.15, 0, 0],
+      ],
+    ],
+    [
+      `${trial}/${shimmerName}-000/001`,
+      8,
+      2,
+      [
+        [1.5, 1, 1],
+        [1.501, 1, 0],
+      ],
+    ],
+    [
+      `${trial}/${shimmerName}-002/000`,
+      0,
+      1,
+      [
+        [0.8, 0, 1],
+        [1.1, 0, 0],
+      ],
+    ],
+  ];
+  return spec.map(([path, firstSeq, openReason, edges], i) => {
+    const opened = new Date(base.getTime() + i * 611_000);
+    const bytes = eventFileBytes(opened, firstSeq, openReason, edges);
+    const [fdate, ftime] = fatStamp(opened);
+    return { path, size: bytes.length, bytes, fdate, ftime };
+  });
+}
+
+/**
+ * One event file, as LogAndStream's Events/shimmer_events.c writes it: a
+ * 64-byte header, then 16-byte records, all little-endian. A Shimmer3R's
+ * RTC counts real-world time at 32768 ticks a second, so its RTC offset is 0.
+ */
+function eventFileBytes(opened, firstSeq, openReason, edges) {
+  const records = 2 + edges.length;
+  const out = new Uint8Array(64 + records * 16);
+  const view = new DataView(out.buffer);
+  const openTicks = BigInt(Math.round(opened.getTime() / 1000)) * 32768n;
+  out.set([0x53, 0x45, 0x56, 0x54, 1, 64, 16, 10]); // "SEVT", v1, lengths, Shimmer3R
+  view.setBigUint64(8, openTicks, true);
+  view.setUint32(24, 0x5f2c1a90, true); // config time, as the trial folder's name
+  view.setUint16(28, 3, true); // LogAndStream
+  view.setUint16(30, 1, true);
+  out[32] = 25; // v1.01.025
+  view.setUint16(34, firstSeq, true);
+  out[36] = openReason;
+  out[37] = 0x03; // button and TTL
+
+  let at = 64;
+  let seq = firstSeq;
+  let state = 0;
+  const record = (type, flags, ticks, channel) => {
+    out[at] = type;
+    out[at + 1] = flags;
+    view.setUint16(at + 2, seq++ & 0xffff, true);
+    view.setBigUint64(at + 4, ticks, true);
+    out[at + 12] = channel;
+    out[at + 13] = state;
+    at += 16;
+  };
+  record(2, 0x02, openTicks, 0xff); // the inputs' state at the open
+  for (const [s, channel, level] of edges) {
+    const bit = 1 << channel;
+    state = level ? state | bit : state & ~bit;
+    record(1, 0x00, openTicks + BigInt(Math.round(s * 32768)), channel);
+  }
+  const last = edges.length ? edges[edges.length - 1][0] + 0.5 : 0;
+  record(3, 0x80, openTicks + BigInt(Math.round(last * 32768)), 0xff); // final
+  return out;
+}
+
 /** Pack a Date into the FAT date/time pair the card stores. */
 function fatStamp(d) {
   const fdate =
@@ -823,6 +933,12 @@ export function createMockShimmer3RTransport(opts = {}) {
     (opts.hardwareVersion !== null && !Number.isFinite(opts.hardwareVersion))
       ? 10
       : opts.hardwareVersion;
+  /* Firmware with the event channel and configuration byte 232 (DEV-971).
+     Off by default, as on every release so far: SET_FEATURE 3 is then NACKed
+     and GET_EVENT_CHANNEL_STATUS goes the way of any unknown command. */
+  const eventChannel = !!opts.eventChannel;
+  /** The connection's event stream: opted in, the link's next sequence number, each input's level. */
+  const evt = { optedIn: false, seq: 0, button: false, ttl: false };
 
   /* Which pressure part this mock claims to carry. Defaults to the one the
      platform really would: a Shimmer3R has a BMP390 or BMP581, a Shimmer3 a
@@ -1324,6 +1440,57 @@ export function createMockShimmer3RTransport(opts = {}) {
     return Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join(" ");
   }
 
+  /**
+   * One event channel record to an opted-in host:
+   * `[0x8A][0xBB][0x10][record][CRC-16]`, with the frame's own CRC and never
+   * the link's (`ShimEvtRec_encodeBtFrame`). Timed by the device's RTC, the
+   * counter whose low 24 bits stamp the stream's packets.
+   */
+  function sendEventRecord(type, channel) {
+    if (!evt.optedIn) return;
+    const rec = new Uint8Array(16);
+    rec[0] = type;
+    rec[1] = channel === 1 ? 0x01 : 0x00; // a TTL edge is timer-latched
+    rec[2] = evt.seq & 0xff;
+    rec[3] = (evt.seq >> 8) & 0xff;
+    let ticks = BigInt(Math.round(deviceNowMs() * 32.768));
+    for (let i = 0; i < 8; i++) {
+      rec[4 + i] = Number(ticks & 0xffn);
+      ticks >>= 8n;
+    }
+    rec[12] = channel;
+    rec[13] = (evt.button ? 1 : 0) | (evt.ttl ? 2 : 0);
+    evt.seq = (evt.seq + 1) & 0xffff;
+    const frame = new Uint8Array(3 + 16);
+    frame.set([0x8a, CMD.EVENT_RECORD_RESPONSE, 16], 0);
+    frame.set(rec, 3);
+    sendBulk(appendCrc(frame, 2), { crc: false });
+  }
+
+  /* Drive the event channel from a test or the console: a press or release
+     of the button, an edge on the TTL input. Sent only while a host is opted
+     in, as the firmware does; whether byte 232 records the input is not
+     checked here. */
+  transport.events = {
+    get supported() {
+      return eventChannel;
+    },
+    get optedIn() {
+      return evt.optedIn;
+    },
+    get nextSeq() {
+      return evt.seq;
+    },
+    button(down) {
+      evt.button = !!down;
+      sendEventRecord(0x01, 0);
+    },
+    ttl(high) {
+      evt.ttl = !!high;
+      sendEventRecord(0x01, 1);
+    },
+  };
+
   // -------------------------------------------------------------------------
   // Device status
   // -------------------------------------------------------------------------
@@ -1524,7 +1691,11 @@ export function createMockShimmer3RTransport(opts = {}) {
   /* Mutable, because SD_DELETE removes from it. Files are the source of
      truth; the directory list is derived, so an emptied session folder still
      lists (and still needs deleting) exactly as it does on a real card. */
-  let sdFiles = buildSyntheticCard(`Shimmer_${mac.slice(-4).toUpperCase()}`);
+  const shimmerName = `Shimmer_${mac.slice(-4).toUpperCase()}`;
+  let sdFiles = [
+    ...buildSyntheticCard(shimmerName),
+    ...(eventChannel ? buildSyntheticEventFiles(shimmerName) : []),
+  ];
   let sdDirs = derivedDirs(sdFiles);
 
   /** Every directory implied by the file paths, parents before children. */
@@ -1555,6 +1726,7 @@ export function createMockShimmer3RTransport(opts = {}) {
   }
 
   function sdFileSlice(file, at, len) {
+    if (file.bytes) return file.bytes.slice(at, at + len);
     const out = new Uint8Array(len);
     for (let i = 0; i < len; i++) out[i] = syntheticByte(file.seed, at + i);
     return out;
@@ -1799,9 +1971,10 @@ export function createMockShimmer3RTransport(opts = {}) {
   /**
    * `[0xCB][status]`
    *
-   * The firmware only permits paths strictly under `data/`, and refuses a
-   * directory that still holds something — which is what makes the SDK's
-   * "delete the emptied folders afterwards, deepest first" pass necessary.
+   * The firmware only permits paths strictly under `data/`, or `events/` on
+   * firmware with the event channel, and refuses a directory that still holds
+   * something — which is what makes the SDK's "delete the emptied folders
+   * afterwards, deepest first" pass necessary.
    */
   function sdDeleteResponse(path) {
     const out = new Uint8Array([SD_TRANSFER_OPCODES.DELETE_RESPONSE, 0]);
@@ -1809,7 +1982,10 @@ export function createMockShimmer3RTransport(opts = {}) {
       out[1] = SD_STATUS.BUSY;
       return out;
     }
-    if (!path.startsWith("data/")) {
+    if (
+      !path.startsWith("data/") &&
+      !(eventChannel && path.startsWith("events/"))
+    ) {
       out[1] = SD_STATUS.BAD_ARGS;
       return out;
     }
@@ -2683,6 +2859,17 @@ export function createMockShimmer3RTransport(opts = {}) {
           reply([ACK]);
           return;
         }
+        if (cmd[1] === FEATURE.EVENT_STREAM && eventChannel) {
+          /* The link counts afresh at every opt-in, and its first record is
+             the inputs' state then (`ShimEvt_setBtStream`). */
+          evt.optedIn = !!cmd[2];
+          evt.seq = 0;
+          reply([ACK]);
+          if (evt.optedIn) {
+            setTimeout(() => sendEventRecord(0x02, 0xff), REPLY_DELAY_MS + 5);
+          }
+          return;
+        }
         /* Every other feature id is NACKed, which is also how firmware built
            before a feature existed answers — the path a page's fallback to
            "power-cycle it by hand" depends on. */
@@ -2690,6 +2877,33 @@ export function createMockShimmer3RTransport(opts = {}) {
           console.warn(`[mock] unknown SET_FEATURE id ${cmd[1]}`);
         }
         reply([NACK]);
+        return;
+      }
+
+      case CMD.GET_EVENT_CHANNEL_STATUS: {
+        if (!eventChannel) break;
+        // [ACK][0xBA][inputs][flags][state][seq u16][dropped u16][link lost u16]
+        const b232 = infoMem[232];
+        const inputs =
+          b232 & 0x80
+            ? 0
+            : (b232 & 0x20 ? 2 : 0) | ([4, 5].includes(b232 & 7) ? 1 : 0);
+        const flags =
+          (evt.optedIn ? 0x01 : 0) | (evt.optedIn && inputs & 2 ? 0x08 : 0);
+        const st = (evt.button ? 1 : 0) | (evt.ttl ? 2 : 0);
+        reply([
+          ACK,
+          CMD.EVENT_CHANNEL_STATUS_RESPONSE,
+          inputs,
+          flags,
+          st,
+          evt.seq & 0xff,
+          evt.seq >> 8,
+          0,
+          0,
+          0,
+          0,
+        ]);
         return;
       }
 
