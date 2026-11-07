@@ -65,6 +65,7 @@
  *   exg: boolean, sensors: boolean, battery: boolean, status: boolean,
  *   sdTransfer: boolean, branding: boolean, factoryTest: boolean,
  *   ledToggle: boolean, rtcRead: boolean, eventChannel: boolean,
+ *   audio: boolean,
  * }}
  */
 export function describeShimmer3Caps(client, mode) {
@@ -151,6 +152,11 @@ export function describeShimmer3Caps(client, mode) {
        This says the page CAN ask; the sensor's answer decides the rest. */
     eventChannel:
       has("supportsEventChannel") && has("setEventStream") && mode !== "usb",
+    /* Shimmer3R audio recording and configuration byte 233 (DEV-99), and
+       link-gated the same way: whether a firmware records audio is asked with
+       GET_AUDIO_STATUS, which the dock protocol does not carry. This says the
+       page CAN ask; the sensor's answer decides the rest. */
+    audio: has("supportsAudio") && has("getAudioStatus") && mode !== "usb",
   };
 }
 

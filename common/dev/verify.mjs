@@ -3558,6 +3558,7 @@ console.log("\n--- one SDK copy, reached one way ---");
    starts importing the SDK -- and when something stops. */
 const SDK_CONSUMERS = [
   "index.html",
+  "common/audio-panel.js",
   "common/brand-editor.js",
   "common/bt-module-update.js",
   "common/calibration-editor.js",
@@ -4504,7 +4505,9 @@ const generalIdle = await evaluate(`
     first: btn.dataset.tab,
     label: btn.textContent.trim(),
     selected: document.querySelector('.tabs [aria-selected="true"]').dataset.tab,
-    cards: [...document.querySelectorAll('#tabGeneral .card-title')]
+    /* The cards shown: the audio card joins them only for a sensor whose
+       firmware records audio (DEV-99), which this mock's does not. */
+    cards: [...document.querySelectorAll('#tabGeneral .card:not([hidden]) .card-title')]
       .map(t => t.textContent.trim()),
     /* Every control on it is a device command, so every one is gated on a
        link. A button that is live with nothing connected would fail on its
@@ -6417,6 +6420,309 @@ check(
     evtSdAll.card.length === 0 &&
     evtSdAll.dirs.join() === "data,events",
   `${evtSdAll.got.join(" | ")} | card dirs ${evtSdAll.dirs.join(", ")}`,
+);
+
+// ===========================================================================
+// Shimmer3R audio recording and configuration byte 233 (DEV-99), on a mock
+// whose firmware records audio (`&audio=1`, which reports v1.01.025 as those
+// builds do). No release has it, so the SDK rules older firmware out by version
+// and asks the rest with GET_AUDIO_STATUS (0xBC), which older firmware drops.
+// ===========================================================================
+console.log("\n--- audio recording (byte 233, audio status, audio/ files) ---");
+const AUDIO_OPS = `
+  const audioProbes = () => (window.mockTransport?.writes ?? [])
+    .filter(w => (w.bytes ?? w.data)[0] === 0xbc).length;
+`;
+
+await goto(`${BASE}?mock=1`);
+await evaluate(CONNECT);
+const audOld = await evaluate(
+  AUDIO_OPS +
+    `
+  return {
+    probes: audioProbes(),
+    hidden: document.getElementById('audioCard').hidden,
+    field: !!document.querySelector('.field[data-field-key="audioMode"]'),
+  };
+`,
+);
+check(
+  "firmware older than the builds with audio is not asked, and shows no audio",
+  audOld.probes === 0 && audOld.hidden && !audOld.field,
+  JSON.stringify(audOld),
+);
+
+await goto(`${BASE}?mock=1&fw=1.01.025`);
+await evaluate(CONNECT);
+const audSilent = await evaluate(
+  AUDIO_OPS +
+    `
+  return {
+    probes: audioProbes(),
+    hidden: document.getElementById('audioCard').hidden,
+    fields: document.querySelectorAll('#configForm .field').length,
+    flags: document.getElementById('statusFlags').textContent,
+    said: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+      .filter(l => /audio: /.test(l)).join(' | '),
+  };
+`,
+);
+check(
+  "a v1.01.025 build without audio is asked once, its silence read as no, and the form is unchanged",
+  audSilent.probes === 1 &&
+    audSilent.hidden &&
+    audSilent.fields === 40 &&
+    !/audio/i.test(audSilent.flags) &&
+    /audio: not in this firmware/.test(audSilent.said),
+  JSON.stringify(audSilent),
+);
+
+await goto(`${BASE}?mock=1&audio=1`);
+check(
+  "connect to a sensor whose firmware records audio",
+  (await evaluate(CONNECT)) === "mock",
+);
+const audUp = await evaluate(
+  AUDIO_OPS +
+    `
+  await new Promise(r => setTimeout(r, 200));
+  return {
+    probes: audioProbes(),
+    fields: document.querySelectorAll('#configForm .field').length,
+    field: !!document.querySelector('.field[data-field-key="audioMode"]'),
+    hidden: document.getElementById('audioCard').hidden,
+    support: document.querySelector('#audioCard .muted').textContent,
+    flags: document.getElementById('statusFlags').textContent,
+    summary: document.getElementById('audioSummary')?.textContent ?? null,
+    options: [...document.querySelectorAll('.field[data-field-key="audioMode"] option')].map(o => o.textContent),
+  };
+`,
+);
+check(
+  "the form gains byte 233's Audio Recording field, and the audio card shows",
+  audUp.probes === 1 &&
+    audUp.field &&
+    audUp.fields === 41 &&
+    !audUp.hidden &&
+    /records audio while it logs to SD/.test(audUp.support),
+  `${audUp.fields} fields | ${audUp.support}`,
+);
+check(
+  "the status flags include the recorder's, and the summary says it records nothing",
+  /Recording audio/.test(audUp.flags) &&
+    audUp.summary === "The sensor records no audio." &&
+    audUp.options.length === 4 &&
+    audUp.options.filter((o) => /records speech/.test(o)).length === 2,
+  `${audUp.flags} | ${audUp.summary}`,
+);
+
+const SET_AUDIO = (v) => `
+  {
+    const s = document.querySelector('.field[data-field-key="audioMode"] select');
+    s.value = '${v}';
+    s.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  await new Promise(r => setTimeout(r, 100));
+`;
+const APPLY_AUDIO = `
+  document.getElementById('btnApply').click();
+  for (let i = 0; i < 100 && document.getElementById('dirtyPill')?.textContent !== '0 changes'; i++)
+    await new Promise(r => setTimeout(r, 100));
+  await new Promise(r => setTimeout(r, 300));
+`;
+
+const audDecline = await evaluate(
+  SET_AUDIO(3) +
+    `
+  const summary = document.getElementById('audioSummary').textContent;
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return !/stores raw audio, which records speech/.test(m); };
+  document.getElementById('btnApply').click();
+  await new Promise(r => setTimeout(r, 600));
+  const im = await window.mockClient.readInfoMemBytes();
+  return { summary, asked: window.__asked, b233: im[233],
+    said: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+      .filter(l => /raw audio recording was not confirmed/.test(l)).length };
+`,
+);
+check(
+  "raw audio is spelled out as recording speech, and declining it writes nothing",
+  /raw 16 kHz audio \(\.WAV\)/.test(audDecline.summary) &&
+    /records speech: Apply asks you to confirm/.test(audDecline.summary) &&
+    audDecline.asked.length === 1 &&
+    /stores raw audio, which records speech/.test(audDecline.asked[0]) &&
+    audDecline.b233 === 0 &&
+    audDecline.said === 1,
+  `${audDecline.asked.length} prompt(s) | byte 233 0x${audDecline.b233?.toString(16)}`,
+);
+
+const audAccept = await evaluate(
+  `
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return true; };
+` +
+    APPLY_AUDIO +
+    `
+  const im = await window.mockClient.readInfoMemBytes();
+  return { asked: window.__asked.map(m => m.split('\\n')[0]), b233: im[233] };
+`,
+);
+check(
+  "confirming it writes mode 3, after its own prompt and then the usual one",
+  audAccept.b233 === 3 &&
+    audAccept.asked.length === 2 &&
+    /stores raw audio, which records speech/.test(audAccept.asked[0]) &&
+    /Write this configuration to the sensor\?/.test(audAccept.asked[1]),
+  `${audAccept.asked.join(" / ")} | byte 233 0x${audAccept.b233?.toString(16)}`,
+);
+
+const audFingerprint = await evaluate(
+  SET_AUDIO(1) +
+    `
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return true; };
+` +
+    APPLY_AUDIO +
+    `
+  const im = await window.mockClient.readInfoMemBytes();
+  return { asked: window.__asked.length, speech: window.__asked.filter(m => /stores raw audio/.test(m)).length,
+    b233: im[233], summary: document.getElementById('audioSummary').textContent,
+    config: document.getElementById('audioConfigLine').textContent };
+`,
+);
+check(
+  "the fingerprint alone stores no sound, so it is written without the speech prompt",
+  audFingerprint.b233 === 1 &&
+    audFingerprint.asked === 1 &&
+    audFingerprint.speech === 0 &&
+    /fingerprint \(\.AFP: landmark hashes, no sound\)/.test(
+      audFingerprint.summary,
+    ) &&
+    /records the audio fingerprint only/.test(audFingerprint.config),
+  `byte 233 0x${audFingerprint.b233?.toString(16)} | ${audFingerprint.asked} prompt(s), ${audFingerprint.speech} about speech | ${audFingerprint.summary}`,
+);
+
+const audRecording = await evaluate(`
+  window.mockTransport.audio.setLogging(true);
+  for (let i = 0; i < 40 && !/Recording now/.test(document.getElementById('audioStateLine').textContent); i++)
+    await new Promise(r => setTimeout(r, 50));
+  await new Promise(r => setTimeout(r, 1100));
+  document.getElementById('btnAudioStatus').click();
+  await new Promise(r => setTimeout(r, 600));
+  const on = [...document.querySelectorAll('#statusFlags .flag.on')].map(f => f.textContent);
+  return { on, state: document.getElementById('audioStateLine').textContent,
+    status: document.getElementById('audioStatusLine').textContent };
+`);
+check(
+  "the sensor's push turns Recording audio on, and Read audio status gives the recorder's own view",
+  audRecording.on.includes("Recording audio") &&
+    audRecording.state === "Recording now." &&
+    /^Mode 1 \(Fingerprint\) · Recording · fault: None · [1-9]\d* s recorded/.test(
+      audRecording.status,
+    ),
+  `${audRecording.state} | ${audRecording.status}`,
+);
+
+const audFault = await evaluate(`
+  window.mockTransport.audio.fault(3);
+  for (let i = 0; i < 40 && !document.querySelector('#statusFlags .flag.bad'); i++)
+    await new Promise(r => setTimeout(r, 50));
+  document.getElementById('btnAudioStatus').click();
+  await new Promise(r => setTimeout(r, 600));
+  const out = {
+    bad: [...document.querySelectorAll('#statusFlags .flag.bad')].map(f => f.textContent),
+    on: [...document.querySelectorAll('#statusFlags .flag.on')].map(f => f.textContent),
+    state: document.getElementById('audioStateLine').textContent,
+    status: document.getElementById('audioStatusLine').textContent,
+  };
+  window.mockTransport.audio.setLogging(false);
+  await new Promise(r => setTimeout(r, 300));
+  return out;
+`);
+check(
+  "a write fault is pushed: Audio fault shows as bad, recording stops, and the status names the fault",
+  audFault.bad.includes("Audio fault") &&
+    !audFault.on.includes("Recording audio") &&
+    /Not recording\. This session's audio failed/.test(audFault.state) &&
+    /Stopped by a fault · fault: A write to the card failed/.test(
+      audFault.status,
+    ),
+  `${audFault.bad.join(",")} | ${audFault.status}`,
+);
+
+/* The SD tab, on firmware that writes audio/ beside data/. The mock's card has
+   a WAV and a fingerprint for each of the first session's two data files. */
+const audSdList = await evaluate(
+  MEMFS +
+    `
+  document.querySelector('.tabs [data-tab="tabSd"]').click();
+  await window.sdBrowser.refresh();
+  const rows = [...document.querySelectorAll('[data-sd-role="tree"] > ul > li')].map(li => ({
+    path: li.querySelector('label').textContent.trim(),
+    meta: li.querySelector(':scope > .sd-size').textContent,
+    audio: [...li.querySelectorAll('[data-sd-companion-file]')].map(f => f.dataset.sdCompanionFile),
+  }));
+  return { rows, stats: window.__sdStats() };
+`,
+);
+check(
+  "the SD tab lists each session's audio files under it",
+  audSdList.rows.length === 2 &&
+    /; 4 audio file\(s\), /.test(audSdList.rows[0].meta) &&
+    audSdList.rows[0].audio.length === 4 &&
+    audSdList.rows[0].audio.every((p) =>
+      /^audio\/DefaultTrial_5f2c1a90\/Shimmer_\w+-000\/00[01]\.(WAV|AFP)$/.test(
+        p,
+      ),
+    ) &&
+    audSdList.rows[1].audio.length === 0 &&
+    audSdList.stats.files === "5 + 4 audio file(s)",
+  audSdList.rows.map((r) => `${r.path} [${r.meta}]`).join(" | ") +
+    ` | files ${audSdList.stats.files}`,
+);
+
+const audSdMirror = await evaluate(`
+  const sdk = await import('/vendor/shimmer-web-sdk.esm.js');
+  window.sdBrowser.setLayout('card');
+  await window.__useFs('AudMirror');
+  const preview = window.__sdRole('preview').textContent;
+  const session = [...document.querySelectorAll('[data-sd-path]')].map(b => b.dataset.sdPath)
+    .find(p => p.endsWith('-000'));
+  await window.sdBrowser.download([session], { deleteVerified: true });
+  const keys = [...window.__fs.files.keys()];
+  const file = (suffix) => window.__fs.files.get(keys.find(k => k.startsWith('audio/') && k.endsWith(suffix)));
+  const wav = sdk.parseAudioWavHeader(file('-000/001.WAV'));
+  const afp = sdk.parseAudioFingerprintFile(file('-000/000.AFP'));
+  const dataTs = (path) => sdk.sdDataPathForCompanion(path);
+  return { preview, keys,
+    wav: { mode: wav.mode, closed: wav.closed, samples: wav.samples, fileNumber: wav.fileNumber,
+      openReason: wav.openReason, fw: wav.firmwareVersion.internal },
+    afp: { chunks: afp.chunks.length, records: afp.chunks.reduce((n, c) => n + c.records.length, 0),
+      truncated: afp.lastChunkTruncated, first: afp.chunks[0]?.records[0]?.t1 },
+    paired: keys.filter(k => k.startsWith('audio/')).map(dataTs).every(p => keys.includes(p)),
+    card: window.mockTransport.sdCard.files.map(f => f.path) };
+`);
+check(
+  "a Mirror SD card structure download takes a session's audio files with it, and they decode",
+  /, and audio files to AudMirror\/audio\/…$/.test(audSdMirror.preview) &&
+    audSdMirror.keys.filter((k) => k.startsWith("audio/")).length === 4 &&
+    audSdMirror.wav.mode === 2 &&
+    audSdMirror.wav.closed === true &&
+    audSdMirror.wav.samples === 8000 &&
+    audSdMirror.wav.fileNumber === 1 &&
+    audSdMirror.wav.openReason === 1 &&
+    audSdMirror.afp.chunks === 2 &&
+    audSdMirror.afp.records === 5 &&
+    audSdMirror.afp.truncated === false &&
+    audSdMirror.afp.first === 12 &&
+    audSdMirror.paired,
+  `${audSdMirror.keys.join(" | ")}`,
+);
+check(
+  "deleting after a verified download clears the session's audio files too",
+  !audSdMirror.card.some((p) => p.startsWith("audio/")) &&
+    !audSdMirror.card.some((p) => /-000\//.test(p)),
+  `card now ${audSdMirror.card.join(", ")}`,
 );
 
 // ===========================================================================

@@ -492,6 +492,40 @@ Where it does, three things change:
 Over USB the dock protocol cannot ask, so the group and the live records are
 Bluetooth-only; an event file opens from any link.
 
+### Audio recording
+
+A Shimmer3R whose firmware records audio can record from its microphone while
+it logs to SD, into `audio/` beside each data file: `<NNN>.WAV`, the raw 16 kHz
+audio, and `<NNN>.AFP`, its fingerprint (landmark hashes, which store no
+sound). No firmware release has it yet, and the builds that do report the
+release they were cut from, v1.01.025. So the page sends nothing to older
+firmware, and asks the rest when it connects with the audio status command,
+which firmware without audio leaves unanswered: a second's wait on such a
+sensor, once per connection.
+
+Where it does, four things change:
+
+- **Configure** gains an **Audio Recording** group, configuration byte 233:
+  off, the fingerprint only, the fingerprint and raw audio, or raw audio only.
+  The group says what the chosen mode keeps. A mode that keeps raw audio
+  records speech, so **Apply asks for that on its own** before the usual
+  prompt, and writes nothing if you decline. It does not ask again for the mode
+  the sensor already has.
+- **General** gains an **Audio recording** card: what the configuration
+  records, whether the sensor is recording now, and **Read audio status**, the
+  recorder's own account: its state, the session's first fault, seconds
+  recorded, silence written after an overrun, write errors and fingerprint
+  chunks. The card is hidden for any other sensor.
+- The **Device** flags gain **Recording audio** and **Audio fault**. The sensor
+  pushes its status whenever either changes, so they follow a recording without
+  polling. A fault stays shown until the next session starts.
+- **SD card** lists the audio files with the data files, each under its
+  session, and a **Mirror SD card structure** download takes them with it (see
+  [The SD card](#the-sd-card)).
+
+Over USB the dock protocol cannot ask, so the group and the card are
+Bluetooth-only.
+
 ## The event log
 
 A drawer docked to the bottom of the viewport carries every command, reply and
@@ -559,6 +593,10 @@ structure** download takes a session's event files with it, into
 `<destination>/events/…`, and deletes them after it when asked. The **Consensys
 Backup** layout leaves them on the card and says so, because Consensys'
 importer would read an `events/` folder anywhere in that tree as data.
+
+Firmware that records audio (see [Audio recording](#audio-recording)) writes
+an `audio/` folder beside `data/` in the same way, with a `.WAV` and an `.AFP`
+per data file, and the tab treats it exactly as it treats `events/`.
 
 This needs a Bluetooth link and **firmware v1.01.011 or later**. Earlier
 firmware either has no SD file-transfer commands at all or, on v1.01.009 and
