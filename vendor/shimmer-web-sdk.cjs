@@ -9,7 +9,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.5.11';
+const SDK_VERSION = '0.5.12';
 
 /**
  * Container for a single decoded sensor frame.
@@ -4101,6 +4101,12 @@ const OPCODES = Object.freeze({
     EVENT_CHANNEL_STATUS_RESPONSE: 0xba,
     /** Event channel record frame, under the `0x8A` in-stream prefix. */
     EVENT_RECORD_RESPONSE: 0xbb,
+    /**
+     * Audio recording (DEV-99): `[0xBC]` → `[ACK][0xBD][status × 32]`. Firmware
+     * before DEV-99 has no command 0xBC and drops it unanswered.
+     */
+    GET_AUDIO_STATUS_COMMAND: 0xbc,
+    AUDIO_STATUS_RESPONSE: 0xbd,
     SET_SD_SYNC_COMMAND: 0xe0,
     SD_SYNC_RESPONSE: 0xe1,
     NACK_COMMAND_PROCESSED: 0xfe,
@@ -4599,6 +4605,7 @@ function resolveInfoMemLayout(ctx) {
         idxMacAddress: 128 + 96, // 224
         idxSDConfigDelayFlag: 128 + 102, // 230
         idxButtonLogMode: ctx.eventChannel === true && isSdLoggingFirmware(ctx) ? 128 + 104 : undefined, // 232
+        idxAudioMode: ctx.audio === true && isSdLoggingFirmware(ctx) ? 128 + 105 : undefined, // 233
         idxBtFactoryReset: 0,
         // B page. Java `idxNode0` = 128+128 = 256 with `maxNumOfExperimentNodes`
         // = 21 (→ 256..381). The firmware header's NV_* defines look different
@@ -4754,12 +4761,16 @@ function hex2$1(v) {
  * toggleLedRedCmd, 6 sdBadFile, 5 sdInserted, 4 btStreaming, 3 sdLogging,
  * 2 RTC set, 1 sensing, 0 docked.
  *
- * The second byte (usbPluggedIn) exists only under `#if defined(SHIMMER3R)`, so
+ * The second byte exists only under `#if defined(SHIMMER3R)`, so
  * `STATUS_BYTE_COUNT` is 2 on a Shimmer3R and 1 on a Shimmer3
  * (`Comms/shimmer_bt_uart.h:259-263`), and only from LogAndStream_Shimmer3R
- * v1.00.024 — hence the nullable field rather than a plain boolean. Which
+ * v1.00.024 — hence the nullable fields rather than plain booleans. Which
  * width a given device sends is {@link statusPayloadBytesFor}'s question; this
- * decodes whatever it is handed.
+ * decodes whatever it is handed. Its bit 0 is usbPluggedIn, and from DEV-99
+ * bits 1 and 2 are audio recording and audio fault
+ * (`shimmerStatus.usbPluggedIn | ShimAudio_statusBits()`). Bit 0 alone is
+ * USB: reading the whole byte as USB, as this did before DEV-99, reports a
+ * unit recording audio on battery as plugged in.
  */
 function parseShimmer3StatusBytes(bytes) {
     if (bytes.length < 1)
@@ -4774,7 +4785,9 @@ function parseShimmer3StatusBytes(bytes) {
         sdPresent: (s0 & 0x20) !== 0,
         sdError: (s0 & 0x40) !== 0,
         redLedOn: (s0 & 0x80) !== 0,
-        usbPluggedIn: bytes.length >= 2 ? (bytes[1] & 0xff) !== 0 : null,
+        usbPluggedIn: bytes.length >= 2 ? (bytes[1] & 0x01) !== 0 : null,
+        audioRecording: bytes.length >= 2 ? (bytes[1] & 0x02) !== 0 : null,
+        audioFault: bytes.length >= 2 ? (bytes[1] & 0x04) !== 0 : null,
         raw: new Uint8Array(bytes),
     };
 }
@@ -11307,6 +11320,20 @@ function shimmer3SupportsSetFeature(fw, hardwareVersion) {
     return (isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3R, FW_ID.LOGANDSTREAM, 1, 0, 52) ||
         isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3, FW_ID.LOGANDSTREAM, 1, 0, 17));
 }
+/**
+ * Whether this firmware might record audio (DEV-99), and so is worth asking:
+ * Shimmer3R LogAndStream v1.01.025 or later. False rules it out without
+ * sending anything; true means ask the device
+ * (`Shimmer3RClient.supportsAudio`).
+ *
+ * No release has audio yet, and the builds that do report the release they
+ * were cut from, v1.01.025, so the version can only rule older firmware out.
+ * Once a release carries it, that release's version answers yes on its own.
+ * A Shimmer3 has no microphone.
+ */
+function shimmer3RMayRecordAudio(fw, hardwareVersion) {
+    return isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3R, FW_ID.LOGANDSTREAM, 1, 1, 25);
+}
 // ---------------------------------------------------------------------------
 // Unframed-stream control-message framing
 // ---------------------------------------------------------------------------
@@ -13365,6 +13392,133 @@ function u64le(b, at) {
 }
 
 /**
+ * The Shimmer3R audio recorder's status over Bluetooth (DEV-99): the two bits
+ * it adds to status byte 1, and the answer to `GET_AUDIO_STATUS_COMMAND`.
+ *
+ * Format: log-and-stream-common `docs/SHIMMER3R_AUDIO.md` §5 and
+ * `docs/SHIMMER3_BT_COMMUNICATION_PROTOCOL.md` §5.3; the builder is
+ * shimmer3r-firmware `Shimmer_Driver/hal_AudioRecorder.c` `PlatAudio_buildStatus`.
+ *
+ * HARDWARE-VERIFY: decoded from the firmware source only; no unit has answered
+ * this SDK yet.
+ */
+/** Opcodes of the audio status command and its response. Shimmer3R only. */
+const AUDIO_OPCODES = Object.freeze({
+    /** `[0xBC]` → `[ACK][0xBD][status × 32]`. Answered while streaming too. */
+    GET_AUDIO_STATUS_COMMAND: 0xbc,
+    AUDIO_STATUS_RESPONSE: 0xbd,
+});
+/** Length of the status payload after the 0xBD opcode. */
+const AUDIO_STATUS_LENGTH = 32;
+/** The only payload version this decoder knows. */
+const AUDIO_STATUS_VERSION = 1;
+/** Status byte 1 bits the recorder sets, beside bit 0, USB plugged in. */
+const AUDIO_STATUS_BITS = Object.freeze({
+    /** Audio is being captured for the current log. */
+    RECORDING: 0x02,
+    /** This session's audio failed or was degraded; cleared when the next session starts. */
+    FAULT: 0x04,
+});
+/** Payload byte 2: the recorder's state. */
+const AUDIO_STATE = Object.freeze({
+    /** Not configured, or not logging. */
+    OFF: 0,
+    /** Logging has started and the files and the microphone are coming up. */
+    STARTING: 1,
+    RECORDING: 2,
+    /** The session's recording ended normally. */
+    STOPPED: 3,
+    /** Stopped for the rest of the session by a fault. */
+    FAULT: 4,
+});
+/**
+ * Payload byte 3, and byte 97 of each audio file's header: the session's first
+ * fault. {@link AUDIO_FAULT.OVERRUN} and {@link AUDIO_FAULT.FP_BEHIND} are
+ * degradations, and recording carries on; the others stop it, and logging
+ * carries on.
+ */
+const AUDIO_FAULT = Object.freeze({
+    NONE: 0,
+    /** A directory or file could not be made. */
+    OPEN: 1,
+    /** The microphone would not start. */
+    CAPTURE: 2,
+    /** A write to the card failed. */
+    WRITE: 3,
+    /** The card fell further behind than the capture ring holds; the gap was written as silence. */
+    OVERRUN: 4,
+    /** The fingerprint fell further behind than the ring holds, and skipped chunks. */
+    FP_BEHIND: 5,
+});
+/** A short description of a recorder state. */
+function describeAudioState(state) {
+    switch (state) {
+        case AUDIO_STATE.OFF:
+            return 'Off';
+        case AUDIO_STATE.STARTING:
+            return 'Starting';
+        case AUDIO_STATE.RECORDING:
+            return 'Recording';
+        case AUDIO_STATE.STOPPED:
+            return 'Stopped';
+        case AUDIO_STATE.FAULT:
+            return 'Stopped by a fault';
+        default:
+            return `State ${state}`;
+    }
+}
+/** A short description of a fault. */
+function describeAudioFault(fault) {
+    switch (fault) {
+        case AUDIO_FAULT.NONE:
+            return 'None';
+        case AUDIO_FAULT.OPEN:
+            return 'Could not make an audio directory or file';
+        case AUDIO_FAULT.CAPTURE:
+            return 'The microphone would not start';
+        case AUDIO_FAULT.WRITE:
+            return 'A write to the card failed';
+        case AUDIO_FAULT.OVERRUN:
+            return 'The card fell behind; silence was written';
+        case AUDIO_FAULT.FP_BEHIND:
+            return 'The fingerprint fell behind; chunks were skipped';
+        default:
+            return `Fault ${fault}`;
+    }
+}
+/** Whether a fault stopped the recording, rather than degrading it. */
+function isAudioFaultFatal(fault) {
+    return (fault !== AUDIO_FAULT.NONE && fault !== AUDIO_FAULT.OVERRUN && fault !== AUDIO_FAULT.FP_BEHIND);
+}
+/**
+ * Decode the 32 status bytes that follow `AUDIO_STATUS_RESPONSE`. A later
+ * version's extra bytes are ignored.
+ *
+ * @throws RangeError when fewer than 32 bytes are given
+ */
+function parseAudioStatus(payload) {
+    if (payload.length < AUDIO_STATUS_LENGTH) {
+        throw new RangeError(`Audio status needs ${AUDIO_STATUS_LENGTH} bytes; got ${payload.length}.`);
+    }
+    const u16 = (o) => payload[o] | (payload[o + 1] << 8);
+    const u32 = (o) => (payload[o] | (payload[o + 1] << 8) | (payload[o + 2] << 16)) + payload[o + 3] * 2 ** 24;
+    return {
+        version: payload[0],
+        mode: payload[1],
+        state: payload[2],
+        fault: payload[3],
+        seconds: u32(4),
+        silenceSamples: u32(8),
+        escapeDrains: u16(12),
+        writeErrors: u16(14),
+        adfErrors: u32(16),
+        adfSaturation: u32(20),
+        fingerprintChunks: u32(24),
+        fingerprintChunksSkipped: u32(28),
+    };
+}
+
+/**
  * Wire protocol for Shimmer3R SD-card file transfer over BLE.
  *
  * Mirrors the firmware implementation in
@@ -13509,10 +13663,10 @@ function sdCrc16(data, len = data.length) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-function u16(buf, off) {
+function u16$1(buf, off) {
     return buf[off] | (buf[off + 1] << 8);
 }
-function u32(buf, off) {
+function u32$1(buf, off) {
     return (buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0;
 }
 /** Encode and validate a card path (ASCII, 1..96 bytes). */
@@ -13601,8 +13755,8 @@ function parseListDirRsp(buf) {
         throw new Error('malformed SD_LIST_DIR_RESPONSE');
     }
     const status = buf[1];
-    const startIdx = u16(buf, 2);
-    const entriesLen = u16(buf, 4);
+    const startIdx = u16$1(buf, 2);
+    const entriesLen = u16$1(buf, 4);
     const nEntries = buf[6];
     const hasMore = (buf[7] & 0x01) !== 0;
     const entries = [];
@@ -13612,9 +13766,9 @@ function parseListDirRsp(buf) {
         throw new Error('truncated SD_LIST_DIR_RESPONSE');
     while (off < end && entries.length < nEntries) {
         const attr = buf[off];
-        const size = u32(buf, off + 1);
-        const fdate = u16(buf, off + 5);
-        const ftime = u16(buf, off + 7);
+        const size = u32$1(buf, off + 1);
+        const fdate = u16$1(buf, off + 5);
+        const ftime = u16$1(buf, off + 7);
         const nameLen = buf[off + 9];
         const nameBytes = buf.subarray(off + 10, off + 10 + nameLen);
         entries.push({
@@ -13634,12 +13788,12 @@ function parseStatRsp(buf) {
     if (buf.length < 11 || buf[0] !== SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE) {
         throw new Error('malformed SD_FILE_STAT_RESPONSE');
     }
-    const fdate = u16(buf, 6);
-    const ftime = u16(buf, 8);
+    const fdate = u16$1(buf, 6);
+    const ftime = u16$1(buf, 8);
     return {
         status: buf[1],
         stat: {
-            size: u32(buf, 2),
+            size: u32$1(buf, 2),
             fdate,
             ftime,
             mtime: fatDateTimeToDate(fdate, ftime),
@@ -13651,7 +13805,7 @@ function parseFreeSpaceRsp(buf) {
     if (buf.length < 10 || buf[0] !== SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE) {
         throw new Error('malformed SD_FREE_SPACE_RESPONSE');
     }
-    return { status: buf[1], space: { freeKB: u32(buf, 2), totalKB: u32(buf, 6) } };
+    return { status: buf[1], space: { freeKB: u32$1(buf, 2), totalKB: u32$1(buf, 6) } };
 }
 function parseDeleteRsp(buf) {
     if (buf.length < 2 || buf[0] !== SD_TRANSFER_OPCODES.DELETE_RESPONSE) {
@@ -13669,7 +13823,7 @@ function oneShotLength(buf) {
         case SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE:
             if (buf.length < 6)
                 return 0;
-            return LIST_RSP_HDR_LEN + u16(buf, 4);
+            return LIST_RSP_HDR_LEN + u16$1(buf, 4);
         case SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE:
             return 11;
         case SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE:
@@ -13700,7 +13854,7 @@ function sdMessageSpan(buf) {
         if (buf[1] === SD_TRANSFER_OPCODES.FILE_DATA_RESPONSE) {
             if (buf.length < DATA_FRAME_HEADER_LEN)
                 return NEED_MORE;
-            const len = u16(buf, 5);
+            const len = u16$1(buf, 5);
             if (len === 0 || len > SD_BLOCK_PAYLOAD_MAX)
                 return RESYNC;
             const total = DATA_FRAME_HEADER_LEN + len + FRAME_CRC_LEN;
@@ -13733,8 +13887,8 @@ function tryExtractSdMessage(buf) {
         return { consumed: 1 };
     if (buf[0] === SD_INSTREAM_BYTE) {
         if (buf[1] === SD_TRANSFER_OPCODES.FILE_DATA_RESPONSE) {
-            const len = u16(buf, 5);
-            const crcOk = sdCrc16(buf, DATA_FRAME_HEADER_LEN + len) === u16(buf, DATA_FRAME_HEADER_LEN + len);
+            const len = u16$1(buf, 5);
+            const crcOk = sdCrc16(buf, DATA_FRAME_HEADER_LEN + len) === u16$1(buf, DATA_FRAME_HEADER_LEN + len);
             if (!crcOk)
                 return { consumed: 1, crcError: true };
             return {
@@ -13742,19 +13896,19 @@ function tryExtractSdMessage(buf) {
                 msg: {
                     kind: 'data',
                     sessionId: buf[2],
-                    seq: u16(buf, 3),
+                    seq: u16$1(buf, 3),
                     payload: buf.slice(DATA_FRAME_HEADER_LEN, DATA_FRAME_HEADER_LEN + len),
                     crcOk,
                 },
             };
         }
         // FILE_STATUS_RESPONSE — the only other span sdMessageSpan accepts here.
-        const crcOk = sdCrc16(buf, 8) === u16(buf, 8);
+        const crcOk = sdCrc16(buf, 8) === u16$1(buf, 8);
         if (!crcOk)
             return { consumed: 1, crcError: true };
         return {
             consumed: span,
-            msg: { kind: 'status', sessionId: buf[2], status: buf[3], nextOffset: u32(buf, 4), crcOk },
+            msg: { kind: 'status', sessionId: buf[2], status: buf[3], nextOffset: u32$1(buf, 4), crcOk },
         };
     }
     return { consumed: span, msg: { kind: 'oneshot', opcode: buf[0], body: buf.slice(0, span) } };
@@ -13833,6 +13987,8 @@ const SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS = Object.freeze({
     [OPCODES.ALT_MAG_CALIBRATION_RESPONSE]: 21, // 0xB0
     // 0xBA — the event channel's status, 9 bytes (`ShimEvt_buildStatus`)
     [OPCODES.EVENT_CHANNEL_STATUS_RESPONSE]: EVENT_CHANNEL_STATUS_LENGTH,
+    // 0xBD — the audio recorder's status, 32 bytes (`PlatAudio_buildStatus`)
+    [OPCODES.AUDIO_STATUS_RESPONSE]: AUDIO_STATUS_LENGTH,
 });
 /**
  * SD-transfer response opcodes, which {@link sdMessageSpan} owns.
@@ -14435,6 +14591,7 @@ function emptyConfig(raw) {
             disableBluetooth: false,
         },
         buttonLogMode: 0,
+        audioMode: 0,
         btBaudRate: 0,
         macAddress: '',
         exg1: new Uint8Array(EXG_BANK_LENGTH$1),
@@ -14513,6 +14670,7 @@ function parseInfoMem(bytes, ctx) {
     const numShimmers = layout.supportsSdLogSync ? raw[layout.idxSDNumOfShimmers] & 0xff : 0;
     const macAddress = macToHex(raw, layout.idxMacAddress);
     const buttonLogMode = layout.idxButtonLogMode !== undefined ? raw[layout.idxButtonLogMode] & 0xff : 0;
+    const audioMode = layout.idxAudioMode !== undefined ? raw[layout.idxAudioMode] & 0xff : 0;
     return {
         samplingRateHz,
         enabledSensors,
@@ -14533,6 +14691,7 @@ function parseInfoMem(bytes, ctx) {
             disableBluetooth,
         },
         buttonLogMode,
+        audioMode,
         btBaudRate,
         macAddress,
         exg1,
@@ -14662,6 +14821,10 @@ function writeModelledFields(out, config, layout) {
     // predates the field, rather than writing 0 over whatever the base holds.
     if (layout.idxButtonLogMode !== undefined && typeof config.buttonLogMode === 'number') {
         out[layout.idxButtonLogMode] = config.buttonLogMode & 0xff;
+    }
+    // Byte 233 the same way (DEV-99).
+    if (layout.idxAudioMode !== undefined && typeof config.audioMode === 'number') {
+        out[layout.idxAudioMode] = config.audioMode & 0xff;
     }
     writeImu(out, config, layout);
     writeSd(out, config, layout);
@@ -15184,6 +15347,157 @@ function applyButtonLogModeRules(image, layout, board = { recordsButtonEdges: tr
     const ube = nearestUserButtonEnable(byte, (image[cfg0] & ubeBit) !== 0);
     set(cfg0, ube ? image[cfg0] | ubeBit : image[cfg0] & ~ubeBit & 0xff);
     return changed;
+}
+
+/**
+ * Configuration byte 233 (`NV_AUDIO_MODE`) on a Shimmer3R: whether it records
+ * from its microphone while it logs to SD, and what it keeps (DEV-99).
+ *
+ *    bits 0-1  mode          {@link AUDIO_MODE}
+ *    bits 2-3  gain preset   0, the calibrated default; 1-3 reserved
+ *    bits 4-6  unused, cleared
+ *    bit 7     must be 0
+ *
+ * Anything the firmware cannot act on reads as 0, off: bit 7 set (erased
+ * flash, and firmware before the byte, is 0xFF), a reserved gain preset, or a
+ * mode it does not build. So a host that writes a mode and reads the byte back
+ * learns whether the unit records it. Shimmer3 has no microphone, and its
+ * firmware holds the byte at 0.
+ *
+ * A port of log-and-stream-common `Configuration/shimmer_audio_mode.c`, kept
+ * rule for rule. `docs/SHIMMER3_CONFIGURATION_INFOMEM.md` §8.5 has the table
+ * and `docs/SHIMMER3R_AUDIO.md` the recording itself.
+ *
+ * **Raw audio records speech.** Ask the user to confirm before setting mode 2
+ * or 3 ({@link audioModeRecordsSpeech}); everyone near the device needs to know
+ * it is recording. The fingerprint (mode 1) stores no audio.
+ *
+ * HARDWARE-VERIFY: ported from the firmware source and its host test; no unit
+ * has been configured through this SDK yet.
+ */
+/** Bit masks of configuration byte 233. */
+const AUDIO_MODE_BYTE = Object.freeze({
+    /** InfoMem offset of the byte (`NV_AUDIO_MODE`, 128 + 105). */
+    INFOMEM_OFFSET: 233,
+    MODE_MASK: 0x03,
+    GAIN_SHIFT: 2,
+    GAIN_MASK: 0x0c,
+    INVALID: 0x80,
+});
+/** Byte 233 bits 0-1: what is recorded while logging. */
+const AUDIO_MODE = Object.freeze({
+    OFF: 0,
+    /** The audio fingerprint only: landmark hashes, no audio. */
+    FINGERPRINT: 1,
+    /** The fingerprint and the raw 16 kHz audio. */
+    FINGERPRINT_RAW: 2,
+    /** The raw 16 kHz audio only. */
+    RAW: 3,
+});
+/** Byte 233 bits 2-3. Only the calibrated default is built; 1-3 read as off. */
+const AUDIO_GAIN_PRESET = Object.freeze({
+    DEFAULT: 0,
+});
+/**
+ * The modes the firmware builds, one bit per {@link AUDIO_MODE}
+ * (`AUDIO_MODES_BUILT`). All four are, from DEV-99's fingerprint step on.
+ * Firmware with raw audio only built 0 and 3, and read 1 and 2 back as 0,
+ * which is why a host learns what a unit records by reading the byte back.
+ */
+const AUDIO_MODES_BUILT = 0b1111;
+/** `[value, label]` pairs for an audio-mode selector, in value order. */
+const AUDIO_MODE_OPTIONS = Object.freeze([
+    [AUDIO_MODE.OFF, 'Off'],
+    [AUDIO_MODE.FINGERPRINT, 'Fingerprint only (no audio stored)'],
+    [AUDIO_MODE.FINGERPRINT_RAW, 'Fingerprint and raw audio (records speech)'],
+    [AUDIO_MODE.RAW, 'Raw audio only (records speech)'],
+]);
+/**
+ * The byte the firmware acts on, and writes back after a configuration write:
+ * `raw` with bits 4-6 cleared when it is valid and its mode is built, and 0
+ * otherwise (`ShimAudioMode_correct`).
+ */
+function correctAudioMode(raw) {
+    const byte = raw & 0xff;
+    const mode = byte & AUDIO_MODE_BYTE.MODE_MASK;
+    const gain = (byte & AUDIO_MODE_BYTE.GAIN_MASK) >> AUDIO_MODE_BYTE.GAIN_SHIFT;
+    if (byte & AUDIO_MODE_BYTE.INVALID ||
+        gain !== AUDIO_GAIN_PRESET.DEFAULT ||
+        !(AUDIO_MODES_BUILT & (1 << mode))) {
+        return 0;
+    }
+    return byte & (AUDIO_MODE_BYTE.MODE_MASK | AUDIO_MODE_BYTE.GAIN_MASK);
+}
+/** The mode the firmware acts on, {@link AUDIO_MODE}. */
+function audioModeOf(raw) {
+    return correctAudioMode(raw) & AUDIO_MODE_BYTE.MODE_MASK;
+}
+/** The gain preset the firmware acts on: always 0 until a preset is built. */
+function audioGainPresetOf(raw) {
+    return (correctAudioMode(raw) & AUDIO_MODE_BYTE.GAIN_MASK) >> AUDIO_MODE_BYTE.GAIN_SHIFT;
+}
+/** Whether the unit keeps the fingerprint, an `.AFP` file (modes 1 and 2). */
+function recordsAudioFingerprint(raw) {
+    const mode = audioModeOf(raw);
+    return mode === AUDIO_MODE.FINGERPRINT || mode === AUDIO_MODE.FINGERPRINT_RAW;
+}
+/** Whether the unit keeps raw audio, a `.WAV` file (modes 2 and 3). */
+function recordsRawAudio(raw) {
+    const mode = audioModeOf(raw);
+    return mode === AUDIO_MODE.FINGERPRINT_RAW || mode === AUDIO_MODE.RAW;
+}
+/**
+ * Whether setting this mode records speech, so a host must ask the user to
+ * confirm first: modes 2 and 3, which keep raw audio. Takes a mode (0-3), not
+ * the whole byte.
+ */
+function audioModeRecordsSpeech(mode) {
+    return mode === AUDIO_MODE.FINGERPRINT_RAW || mode === AUDIO_MODE.RAW;
+}
+/**
+ * The byte for a mode at the default gain, corrected the way the firmware
+ * will correct it, so what a host writes is what it reads back from firmware
+ * that builds the mode. A mode outside 0-3 gives 0.
+ */
+function encodeAudioMode(mode) {
+    const m = Math.trunc(mode);
+    if (!(m >= 0 && m <= AUDIO_MODE_BYTE.MODE_MASK))
+        return 0;
+    return correctAudioMode(m);
+}
+/** A short name for a mode: `Off`, `Fingerprint`, `Fingerprint + raw`, `Raw`. */
+function describeAudioMode(mode) {
+    switch (mode) {
+        case AUDIO_MODE.OFF:
+            return 'Off';
+        case AUDIO_MODE.FINGERPRINT:
+            return 'Fingerprint';
+        case AUDIO_MODE.FINGERPRINT_RAW:
+            return 'Fingerprint + raw';
+        case AUDIO_MODE.RAW:
+            return 'Raw';
+        default:
+            return `Mode ${mode}`;
+    }
+}
+/**
+ * Apply, to an InfoMem image about to be written, the firmware's check on
+ * byte 233 (`ShimConfig_checkAndCorrectConfig`): the byte corrected, so what a
+ * host writes is what it reads back from firmware that builds every mode. Pass
+ * `microphone: false` for hardware without one, where the firmware holds the
+ * byte at 0 (every Shimmer3). Does nothing when the layout has no byte 233.
+ *
+ * @returns the offsets of the bytes it changed
+ */
+function applyAudioModeRules(image, layout, microphone = layout.isShimmer3R) {
+    const at = layout.idxAudioMode;
+    if (at === undefined)
+        return [];
+    const value = microphone ? correctAudioMode(image[at]) : 0;
+    if (image[at] === value)
+        return [];
+    image[at] = value;
+    return [at];
 }
 
 /**
@@ -15804,6 +16118,10 @@ const SHIMMER3_INFOMEM_FIELD_GROUPS = Object.freeze([
         id: 'eventChannel',
         title: 'Button and Event Channel',
     },
+    {
+        id: 'audio',
+        title: 'Audio Recording',
+    },
     { id: 'trial', title: 'Trial / Experiment' },
     {
         id: 'sync',
@@ -16309,6 +16627,27 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         appliesTo: ALL,
         configKey: 'buttonLogMode',
     },
+    // ---- Audio recording: configuration byte 233 (DEV-99). Shimmer3R only, and
+    // present only where the firmware has the byte, which the layout decides
+    // (`idxAudioMode`). Bit 7 set - erased memory, or older firmware - or a
+    // reserved gain preset makes the whole byte read as 0, off.
+    {
+        key: 'audioMode',
+        label: 'Audio Recording',
+        desc: 'Byte 233 bits 0-1 (NV_AUDIO_MODE): what the microphone records while logging to SD, ' +
+            'into audio/ beside each data file. Modes 2 and 3 store raw audio, which records ' +
+            'speech: confirm with the user first, and tell everyone near the device. A mode the ' +
+            'firmware does not build reads back as Off.',
+        kind: 'bit',
+        layoutKey: 'idxAudioMode',
+        shift: 0,
+        width: 2,
+        zeroWhenAnySet: AUDIO_MODE_BYTE.INVALID | AUDIO_MODE_BYTE.GAIN_MASK,
+        options: AUDIO_MODE_OPTIONS,
+        group: 'audio',
+        appliesTo: S3R_ONLY,
+        configKey: 'audioMode',
+    },
     // ---- Trial / experiment identity
     {
         key: 'deviceName',
@@ -16682,16 +17021,19 @@ function writeInfoMemFieldValue(bytes, field, layout, value) {
 /**
  * Layout keys a layout may leave undefined, because the byte exists only on
  * firmware the device has said it runs: configuration byte 232, which
- * `InfoMemContext.eventChannel` brings in.
+ * `InfoMemContext.eventChannel` brings in, and byte 233, which
+ * `InfoMemContext.audio` does.
  */
 const CONDITIONAL_LAYOUT_KEYS = new Set([
     'idxButtonLogMode',
+    'idxAudioMode',
 ]);
 /**
  * The schema fields that apply to a given part generation, in schema order.
  *
  * Pass the device's resolved layout to get exactly the fields it has bytes
- * for, byte 232's three included when its firmware has them. Without one,
+ * for, byte 232's three and byte 233's one included when its firmware has
+ * them. Without one,
  * fields on a byte only some firmware has are left out, so a caller that reads
  * every field it is given never meets an offset the layout does not define.
  */
@@ -17180,6 +17522,12 @@ function firmwareTag(major, minor, internal) {
     return `v${major}.${String(minor).padStart(2, '0')}.${String(internal).padStart(3, '0')}`;
 }
 /** {@link Shimmer3RClient.setCrcMode}'s refusal while a stream is running. */
+/**
+ * How long {@link Shimmer3RClient.supportsAudio} waits for the audio status
+ * probe's ACK. Firmware with audio answers at once; firmware without it never
+ * does, so this is what the probe costs there, once per link.
+ */
+const AUDIO_PROBE_TIMEOUT_MS = 1000;
 const CRC_CHANGE_MID_STREAM = 'Cannot change the CRC mode while streaming: it would move every frame boundary.';
 // ---------------------------------------------------------------------------
 // Shimmer3RClient
@@ -17375,6 +17723,12 @@ class Shimmer3RClient extends BaseShimmerClient {
          * a status from the byte after it instead of assuming a width.
          */
         this._statusPayloadBytes = null;
+        /**
+         * What {@link supportsAudio} learnt on this link: `null` until it has asked.
+         * Cleared with the version caches at connect, since a reconnect may reach a
+         * different sensor.
+         */
+        this._audioSupport = null;
         /**
          * The version reads {@link getStatus} has in flight to learn
          * {@link _statusPayloadBytes}, shared so that status reads made together
@@ -17935,6 +18289,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._resetInquiredConfig();
         this._fwVersionCache = null;
         this._deviceVersionCache = null;
+        this._audioSupport = null;
         this._statusPayloadBytes = null;
         this._statusWidthReads = null;
         /* `device` describes the far end exactly as the version caches do, so it
@@ -19044,6 +19399,97 @@ class Shimmer3RClient extends BaseShimmerClient {
             throw new Error(`Malformed event channel status (${rsp.length} bytes).`);
         }
         return parseEventChannelStatus(rsp.subarray(1, 1 + EVENT_CHANNEL_STATUS_LENGTH));
+    }
+    /**
+     * Ask the device whether its firmware records audio (DEV-99): configuration
+     * byte 233, status byte 1's audio bits, and `GET_AUDIO_STATUS_COMMAND`.
+     * Pass the answer to the InfoMem context as `audio`, which is what brings
+     * byte 233 into the layout and the field schema.
+     *
+     * The version alone cannot say. No release has audio yet, and the builds
+     * that do report the release they were cut from, so:
+     *
+     * 1. Firmware older than that, or not LogAndStream, is ruled out by its
+     *    version ({@link shimmer3RMayRecordAudio}) and is sent nothing.
+     * 2. Otherwise this sends `GET_AUDIO_STATUS_COMMAND` (0xBC) and waits a
+     *    second (`AUDIO_PROBE_TIMEOUT_MS`): a status reply is yes, silence no.
+     *
+     * The probe is safe on firmware without audio, which SET_FEATURE was not:
+     * 0xBC was never a command before DEV-99, and it takes no arguments, so
+     * older firmware drops the one byte unanswered and there is nothing after
+     * it to run as a command. The cost is the timeout, once per link: the
+     * answer is cached until the next connect.
+     *
+     * Not while streaming ({@link getAudioStatus}); ask at connect.
+     *
+     * HARDWARE-VERIFY: from the firmware source. Neither answer has been seen
+     * from a unit: not the reply from a DEV-99 build, nor the silence from an
+     * older one.
+     */
+    async supportsAudio() {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (this._audioSupport !== null)
+            return this._audioSupport;
+        const link = this._linkGeneration;
+        let answer = false;
+        if (await this._mayRecordAudio()) {
+            try {
+                await this.getAudioStatus(AUDIO_PROBE_TIMEOUT_MS);
+                answer = true;
+            }
+            catch (e) {
+                const msg = e instanceof Error ? e.message : '';
+                /* Silence is firmware without the command. Anything else - a link
+                   reset, the link busy, a reply that would not parse - says nothing
+                   about the firmware, so it is not remembered. */
+                if (msg !== 'ACK timeout' && msg !== 'NACK received')
+                    throw e;
+                this._emitStatus('Audio recording not supported by this firmware (0xBC unanswered)');
+            }
+        }
+        if (this._linkGeneration === link)
+            this._audioSupport = answer;
+        return answer;
+    }
+    /** Whether the firmware's version leaves room for audio ({@link shimmer3RMayRecordAudio}). */
+    async _mayRecordAudio() {
+        try {
+            const v = await this.readFwVersion();
+            return shimmer3RMayRecordAudio({ firmwareIdentifier: v.fwId, major: v.major, minor: v.minor, internal: v.patch }, HW_ID$1.SHIMMER_3R);
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
+     * Read the audio recorder's status (GET_AUDIO_STATUS_COMMAND 0xBC →
+     * `[ACK][0xBD][32 bytes]`, DEV-99): the mode configured, the recorder's
+     * state and first fault, and this session's counters.
+     *
+     * Firmware without audio does not answer, so this times out there; ask
+     * {@link supportsAudio} first. The firmware answers while streaming too, but
+     * this client's stream parser takes only bare ACKs between packets, so it
+     * refuses while streaming rather than lose the reply.
+     *
+     * HARDWARE-VERIFY: from the firmware source (`PlatAudio_buildStatus`) only.
+     *
+     * @param timeoutMs how long to wait for the ACK, and then the reply
+     */
+    async getAudioStatus(timeoutMs = 1500) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (this._streaming)
+            throw new Error('Cannot read the audio status while streaming');
+        const link = this._linkGeneration;
+        const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_AUDIO_STATUS_COMMAND]), timeoutMs);
+        const rsp = remainder && remainder[0] === OPCODES.AUDIO_STATUS_RESPONSE
+            ? remainder
+            : await this._waitForResponse(OPCODES.AUDIO_STATUS_RESPONSE, timeoutMs, link);
+        if (rsp[0] !== OPCODES.AUDIO_STATUS_RESPONSE || rsp.length < 1 + AUDIO_STATUS_LENGTH) {
+            throw new Error(`Malformed audio status (${rsp.length} bytes).`);
+        }
+        return parseAudioStatus(rsp.subarray(1, 1 + AUDIO_STATUS_LENGTH));
     }
     /**
      * Read the board's SR identity — `{boardId, boardRev, specialRev}`, the
@@ -23174,6 +23620,11 @@ const SD_DATA_ROOT = 'data';
  */
 const SD_COMPANION_KINDS = Object.freeze([
     Object.freeze({ root: 'events', label: 'event file', extensions: Object.freeze([]) }),
+    Object.freeze({
+        root: 'audio',
+        label: 'audio file',
+        extensions: Object.freeze(['.WAV', '.AFP']),
+    }),
 ]);
 /**
  * What follows `root` in `path` (`''` for the root itself, else from its
@@ -23524,8 +23975,9 @@ async function downloadSdTree(client, destRoot, opts = {}) {
 /**
  * Delete verified files from the card (files first, then any directories that
  * emptied out, deepest first). The firmware accepts only paths under `data/`,
- * and under `events/` once it has the event channel. Returns the paths
- * actually deleted; failures are skipped.
+ * under `events/` once it has the event channel, and under `audio/` once it
+ * records audio (DEV-99). Returns the paths actually deleted; failures are
+ * skipped.
  */
 async function deleteDownloadedFromCard(client, filePaths, dirPaths = [], opts = {}) {
     const deleted = [];
@@ -24386,6 +24838,8 @@ function parseImuRanges(bytes, hw) {
 }
 /** Header byte 225, `SDH_BUTTON_LOG_MODE`: configuration byte 232 as acted on. */
 const SDLOG_BUTTON_LOG_MODE_OFFSET = 225;
+/** Header byte 226, `SDH_AUDIO_MODE`: configuration byte 233 as acted on, Shimmer3R only. */
+const SDLOG_AUDIO_MODE_OFFSET = 226;
 /**
  * Read the pressure part from header byte 224 (`SDH_PRESSURE_SENSOR_ID`,
  * DEV-1123), or `sensor: null` when the header does not record one. The byte
@@ -24678,6 +25132,9 @@ function parseSdLog(bytes) {
         pressureSensorId: pressureField.id,
         pressureSensorInferred: pressureField.inferred,
         buttonLogMode: firmwareId === SDLOG_FW_ID.LOGANDSTREAM ? bytes[SDLOG_BUTTON_LOG_MODE_OFFSET] : null,
+        audioMode: firmwareId === SDLOG_FW_ID.LOGANDSTREAM && hardwareVersion === SDLOG_HW_ID.SHIMMER_3R
+            ? bytes[SDLOG_AUDIO_MODE_OFFSET]
+            : null,
         warnings,
     };
     return { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz };
@@ -29569,6 +30026,283 @@ function decodeSdSession(files, opts) {
         truncated: budget.truncated,
         droppedUnstampedRecords: budget.droppedUnstamped,
     };
+}
+
+/**
+ * The Shimmer3R's audio files (DEV-99), which sit beside each SD data file:
+ *
+ *   data/<experimentId>_<configTime>/<shimmerName>-<NNN>/<NNN>
+ *   audio/<experimentId>_<configTime>/<shimmerName>-<NNN>/<NNN>.WAV   modes 2 and 3
+ *   audio/<experimentId>_<configTime>/<shimmerName>-<NNN>/<NNN>.AFP   modes 1 and 2
+ *
+ * The WAV is a standard 16 kHz, mono, 16-bit PCM WAV whose first 512 bytes
+ * also carry a `shim` chunk saying which data file it goes with and when its
+ * first and last samples were captured, on the Shimmer clock. The `.AFP` file
+ * holds the audio fingerprint: audfprint's landmark hashes, in chunks of 5 s
+ * analysed every 4 s.
+ *
+ * Format: log-and-stream-common `docs/SHIMMER3R_AUDIO.md` §3.1 and §3.2; the
+ * encoder is `Audio/shimmer_audio_file.c`, whose host test pins the layout.
+ * All fields are little-endian.
+ *
+ * HARDWARE-VERIFY: decoded from the firmware's encoder and doc only; no file
+ * from a unit has been read through this SDK.
+ */
+/** The audio files' sizes, magics and rates. */
+const AUDIO_FILE = Object.freeze({
+    /** Both headers are 512 bytes, so a WAV's samples start on a card sector. */
+    HEADER_LENGTH: 512,
+    /** The identity block's magic, at offset 44 in both files. */
+    IDENTITY_MAGIC: 'SAUD',
+    /** The only identity format version this decoder knows (byte 48). */
+    FORMAT_VERSION: 1,
+    SAMPLE_RATE_HZ: 16000,
+    /** The Shimmer clock the headers' times count: 32768 ticks a second. */
+    TICKS_PER_SECOND: 32768,
+});
+/** The fingerprint file's layout constants. */
+const AUDIO_FINGERPRINT_FILE = Object.freeze({
+    MAGIC: 'SAFP',
+    /** The only chunk and record layout version this decoder knows (bytes 4-5). */
+    FORMAT_VERSION: 1,
+    CHUNK_HEADER_LENGTH: 16,
+    RECORD_LENGTH: 4,
+    /** `0x4843`, `CH` on the card: finds the chunks again in a file cut short. */
+    CHUNK_MARK: 0x4843,
+    /** A chunk is 5 s of audio, */
+    CHUNK_SAMPLES: 80000,
+    /** one every 4 s, */
+    CHUNK_HOP_SAMPLES: 64000,
+    /** and a record's `t1` counts frames of 256 samples (16 ms). */
+    FRAME_HOP_SAMPLES: 256,
+});
+/** Why an audio file was opened, byte 51. */
+const AUDIO_FILE_OPEN_REASON = Object.freeze({
+    /** The session's first file. */
+    SESSION_START: 0,
+    /** The data file split, and this follows it. */
+    SPLIT: 1,
+});
+/** Thrown for bytes that are not an audio file this decoder can read. */
+class AudioFileFormatError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'AudioFileFormatError';
+    }
+}
+function u16(b, o) {
+    return b[o] | (b[o + 1] << 8);
+}
+function u32(b, o) {
+    return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16)) + b[o + 3] * 2 ** 24;
+}
+function i32(b, o) {
+    return b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24);
+}
+function u64(b, o) {
+    let v = 0n;
+    for (let i = 7; i >= 0; i--)
+        v = (v << 8n) | BigInt(b[o + i]);
+    return v;
+}
+function ascii(b, o, n) {
+    return String.fromCharCode(...b.subarray(o, o + n));
+}
+/** Bytes 44-95 and the summary fields both files share. */
+function parseIdentity(b) {
+    const magic = ascii(b, 44, 4);
+    if (magic !== AUDIO_FILE.IDENTITY_MAGIC) {
+        throw new AudioFileFormatError(`Not a Shimmer audio file: offset 44 holds "${magic}", not "${AUDIO_FILE.IDENTITY_MAGIC}".`);
+    }
+    const formatVersion = b[48];
+    if (formatVersion !== AUDIO_FILE.FORMAT_VERSION) {
+        throw new AudioFileFormatError(`Audio file format version ${formatVersion} is not supported.`);
+    }
+    let macAddress = '';
+    for (let i = 0; i < 6; i++)
+        macAddress += b[74 + i].toString(16).toUpperCase().padStart(2, '0');
+    return {
+        formatVersion,
+        hardwareId: b[49],
+        mode: b[50],
+        openReason: b[51],
+        fileNumber: u16(b, 52),
+        dataFileTicks: u64(b, 56),
+        configTime: u32(b, 64),
+        firmwareId: u16(b, 68),
+        firmwareVersion: { major: u16(b, 70), minor: b[72], internal: b[73] },
+        macAddress,
+        decimation: u32(b, 88),
+        gain: i32(b, 92),
+        closed: b[96] === 1,
+        fault: b[97],
+        escapeDrains: u16(b, 116),
+        writeErrors: u16(b, 118),
+        adfErrors: u32(b, 120),
+        adfSaturation: u32(b, 124),
+        adfOverflow: u32(b, 128),
+    };
+}
+/**
+ * Decode a WAV's header: `audio/<experiment>/<session>/<NNN>.WAV`. Pass the
+ * whole file, or at least its first 512 bytes; with the whole file, a file cut
+ * short gets its sample count from its length.
+ *
+ * @throws AudioFileFormatError when the bytes are not a Shimmer audio WAV
+ */
+function parseAudioWavHeader(bytes) {
+    if (bytes.length < AUDIO_FILE.HEADER_LENGTH) {
+        throw new AudioFileFormatError(`An audio WAV's header is ${AUDIO_FILE.HEADER_LENGTH} bytes; got ${bytes.length}.`);
+    }
+    if (ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WAVE') {
+        throw new AudioFileFormatError('Not a WAV: no RIFF/WAVE header.');
+    }
+    if (ascii(bytes, 36, 4) !== 'shim') {
+        throw new AudioFileFormatError('Not a Shimmer audio WAV: no "shim" chunk at offset 36.');
+    }
+    const identity = parseIdentity(bytes);
+    const samplesInHeader = u32(bytes, 100);
+    const dataBytesInHeader = u32(bytes, 508);
+    // Only a whole file says how long it is; a header alone could be either.
+    const fromLength = bytes.length > AUDIO_FILE.HEADER_LENGTH
+        ? Math.floor((bytes.length - AUDIO_FILE.HEADER_LENGTH) / 2)
+        : null;
+    return {
+        ...identity,
+        dataOffset: AUDIO_FILE.HEADER_LENGTH,
+        samplesInHeader,
+        dataBytesInHeader,
+        samples: identity.closed ? samplesInHeader : fromLength,
+        firstSampleTicks: u64(bytes, 80),
+        lastSampleTicks: u64(bytes, 104),
+        silenceSamples: u32(bytes, 112),
+    };
+}
+/**
+ * The Shimmer clock of sample `n` of a WAV of `count` samples, spread evenly
+ * between the header's first and last sample clocks.
+ *
+ * The audio clock runs from the 16 MHz crystal and the Shimmer clock from the
+ * 32 kHz one, so the two drift apart by however far that unit's 32 kHz crystal
+ * is off, up to about 200 ms an hour. Placing samples at n / 16000 s from the
+ * first would carry that error; this does not.
+ *
+ * @returns the time in ticks, as a fraction; null when the file has no last
+ *   sample clock (a file cut short) or fewer than two samples
+ */
+function audioSampleTicks(header, n, count) {
+    if (count < 2 || header.lastSampleTicks <= header.firstSampleTicks)
+        return null;
+    const first = Number(header.firstSampleTicks);
+    const span = Number(header.lastSampleTicks - header.firstSampleTicks);
+    return first + (n * span) / (count - 1);
+}
+/**
+ * Decode a fingerprint file's header: `audio/<experiment>/<session>/<NNN>.AFP`.
+ *
+ * @throws AudioFileFormatError when the bytes are not a fingerprint file this
+ *   decoder can read
+ */
+function parseAudioFingerprintHeader(bytes) {
+    if (bytes.length < 16)
+        throw new AudioFileFormatError('Too short to be a fingerprint file.');
+    const magic = ascii(bytes, 0, 4);
+    if (magic !== AUDIO_FINGERPRINT_FILE.MAGIC) {
+        throw new AudioFileFormatError(`Not a fingerprint file: starts "${magic}", not "${AUDIO_FINGERPRINT_FILE.MAGIC}".`);
+    }
+    const layoutVersion = u16(bytes, 4);
+    if (layoutVersion !== AUDIO_FINGERPRINT_FILE.FORMAT_VERSION) {
+        throw new AudioFileFormatError(`Fingerprint layout version ${layoutVersion} is not supported.`);
+    }
+    const headerLength = u16(bytes, 6);
+    const chunkHeaderLength = u16(bytes, 12);
+    const recordLength = u16(bytes, 14);
+    if (headerLength < AUDIO_FILE.HEADER_LENGTH ||
+        chunkHeaderLength < AUDIO_FINGERPRINT_FILE.CHUNK_HEADER_LENGTH ||
+        recordLength < AUDIO_FINGERPRINT_FILE.RECORD_LENGTH) {
+        throw new AudioFileFormatError(`Fingerprint header gives a ${headerLength}-byte header, ${chunkHeaderLength}-byte chunk ` +
+            `headers and ${recordLength}-byte records; at least 512, 16 and 4 are needed.`);
+    }
+    if (bytes.length < headerLength) {
+        throw new AudioFileFormatError('Fingerprint file header is cut short.');
+    }
+    return {
+        ...parseIdentity(bytes),
+        layoutVersion,
+        headerLength,
+        sampleRateHz: u16(bytes, 8),
+        frameHopSamples: u16(bytes, 10),
+        chunkHeaderLength,
+        recordLength,
+        chunkSamples: u32(bytes, 16),
+        chunkHopSamples: u32(bytes, 20),
+        firstChunkTicks: u64(bytes, 80),
+        chunks: u32(bytes, 100),
+        lastChunkTicks: u64(bytes, 104),
+        records: u32(bytes, 112),
+        chunksSkipped: u32(bytes, 132),
+    };
+}
+/** Decode one landmark record, a u32. */
+function parseAudioFingerprintRecord(raw) {
+    const v = raw >>> 0;
+    const t1 = v & 0x1ff;
+    const dt = (v >>> 9) & 0x3f;
+    const df = (v >>> 15) & 0x3f;
+    const f1 = (v >>> 21) & 0x7f;
+    return { raw: v, t1, dt, df, f1, hash: ((f1 << 25) | (df << 19) | dt) >>> 0 };
+}
+/**
+ * Decode a fingerprint file: its header, then each chunk header and its
+ * records, by the lengths the header gives, so a later layout with longer
+ * chunk headers or records still decodes.
+ *
+ * A file whose closed byte is 0 was cut short. Its chunks are walked by their
+ * headers all the same, and a last chunk with fewer records than its header
+ * says is kept, flagged {@link AudioFingerprintFile.lastChunkTruncated}, for
+ * the caller to ignore. The walk stops at anything that is not a chunk mark.
+ *
+ * @throws AudioFileFormatError when the header cannot be read
+ */
+function parseAudioFingerprintFile(bytes) {
+    const header = parseAudioFingerprintHeader(bytes);
+    const chunks = [];
+    let pos = header.headerLength;
+    let lastChunkTruncated = false;
+    while (pos + header.chunkHeaderLength <= bytes.length) {
+        if (u16(bytes, pos) !== AUDIO_FINGERPRINT_FILE.CHUNK_MARK)
+            break;
+        const declaredRecords = u16(bytes, pos + 2);
+        const chunk = {
+            index: u32(bytes, pos + 4),
+            startTicks: u64(bytes, pos + 8),
+            declaredRecords,
+            records: [],
+        };
+        pos += header.chunkHeaderLength;
+        for (let i = 0; i < declaredRecords; i++) {
+            if (pos + header.recordLength > bytes.length)
+                break;
+            chunk.records.push(parseAudioFingerprintRecord(u32(bytes, pos)));
+            pos += header.recordLength;
+        }
+        chunks.push(chunk);
+        if (chunk.records.length < declaredRecords) {
+            lastChunkTruncated = true;
+            break;
+        }
+    }
+    return { header, chunks, lastChunkTruncated, trailingBytes: bytes.length - pos };
+}
+/**
+ * The Shimmer clock of a landmark: its chunk's clock plus `t1` frames of 256
+ * samples of audio clock. Over one chunk the two clocks drift by under a
+ * millisecond.
+ */
+function audioFingerprintRecordTicks(chunk, record) {
+    return (Number(chunk.startTicks) +
+        (record.t1 * AUDIO_FINGERPRINT_FILE.FRAME_HOP_SAMPLES * AUDIO_FILE.TICKS_PER_SECOND) /
+            AUDIO_FILE.SAMPLE_RATE_HZ);
 }
 
 /**
@@ -37777,6 +38511,20 @@ exports.ADC_BITS = ADC_BITS;
 exports.ADC_VREF_VOLTS = ADC_VREF_VOLTS;
 exports.ASM_COMMAND = ASM_COMMAND;
 exports.ASM_PROPERTY = ASM_PROPERTY;
+exports.AUDIO_FAULT = AUDIO_FAULT;
+exports.AUDIO_FILE = AUDIO_FILE;
+exports.AUDIO_FILE_OPEN_REASON = AUDIO_FILE_OPEN_REASON;
+exports.AUDIO_FINGERPRINT_FILE = AUDIO_FINGERPRINT_FILE;
+exports.AUDIO_GAIN_PRESET = AUDIO_GAIN_PRESET;
+exports.AUDIO_MODE = AUDIO_MODE;
+exports.AUDIO_MODE_BYTE = AUDIO_MODE_BYTE;
+exports.AUDIO_MODE_OPTIONS = AUDIO_MODE_OPTIONS;
+exports.AUDIO_OPCODES = AUDIO_OPCODES;
+exports.AUDIO_STATE = AUDIO_STATE;
+exports.AUDIO_STATUS_BITS = AUDIO_STATUS_BITS;
+exports.AUDIO_STATUS_LENGTH = AUDIO_STATUS_LENGTH;
+exports.AUDIO_STATUS_VERSION = AUDIO_STATUS_VERSION;
+exports.AudioFileFormatError = AudioFileFormatError;
 exports.BASE_HARDWARE_IDS = BASE_HARDWARE_IDS;
 exports.BATTERY_DIVIDER_RATIO = BATTERY_DIVIDER_RATIO;
 exports.BLE_LINK_MIN_FW = BLE_LINK_MIN_FW;
@@ -38115,6 +38863,7 @@ exports.WebSerialTransport = WebSerialTransport;
 exports.WiredShimmerClient = WiredShimmerClient;
 exports.allowsSingleTouch = allowsSingleTouch;
 exports.appendCrc = appendCrc;
+exports.applyAudioModeRules = applyAudioModeRules;
 exports.applyButtonLogModeRules = applyButtonLogModeRules;
 exports.applyDuplicateSuffix = applyDuplicateSuffix;
 exports.applyExgKnobEdits = applyExgKnobEdits;
@@ -38124,6 +38873,11 @@ exports.applyImuCalibration = applyImuCalibration;
 exports.applySensorToggle = applySensorToggle;
 exports.asmRtcBytesToUnixSeconds = asmRtcBytesToUnixSeconds;
 exports.asmRtcMinutesBytesToUnixSeconds = asmRtcMinutesBytesToUnixSeconds;
+exports.audioFingerprintRecordTicks = audioFingerprintRecordTicks;
+exports.audioGainPresetOf = audioGainPresetOf;
+exports.audioModeOf = audioModeOf;
+exports.audioModeRecordsSpeech = audioModeRecordsSpeech;
+exports.audioSampleTicks = audioSampleTicks;
 exports.badResponseReason = badResponseReason;
 exports.baseHardwareType = baseHardwareType;
 exports.battAdcToVoltage = battAdcToVoltage;
@@ -38192,6 +38946,7 @@ exports.compensatePressure = compensatePressure;
 exports.computeVerisensePairingPin = computeVerisensePairingPin;
 exports.consensysBackupSegments = consensysBackupSegments;
 exports.consensysMacFolderName = consensysMacFolderName;
+exports.correctAudioMode = correctAudioMode;
 exports.correctButtonLogMode = correctButtonLogMode;
 exports.crc16_ccitt_false = crc16_ccitt_false;
 exports.crc32 = crc32;
@@ -38218,6 +38973,9 @@ exports.deriveLsm6dsvAccelGyroRate = deriveLsm6dsvAccelGyroRate;
 exports.deriveLsm6dsvRateOnEnableChange = deriveLsm6dsvRateOnEnableChange;
 exports.deriveShimmer3FirmwareVersionCode = deriveShimmer3FirmwareVersionCode;
 exports.deriveVerisenseMacIdFromName = deriveVerisenseMacIdFromName;
+exports.describeAudioFault = describeAudioFault;
+exports.describeAudioMode = describeAudioMode;
+exports.describeAudioState = describeAudioState;
 exports.describeButtonLogMode = describeButtonLogMode;
 exports.describeEventRecord = describeEventRecord;
 exports.describePlatformSupport = describePlatformSupport;
@@ -38233,6 +38991,7 @@ exports.doesUndockStartLogging = doesUndockStartLogging;
 exports.downloadCsvBlob = downloadCsvBlob;
 exports.downloadSdTree = downloadSdTree;
 exports.drainByteStream = drainByteStream;
+exports.encodeAudioMode = encodeAudioMode;
 exports.encodeButtonLogMode = encodeButtonLogMode;
 exports.encodeExgRegisters = encodeExgRegisters;
 exports.encodeSdPath = encodeSdPath;
@@ -38298,6 +39057,7 @@ exports.inferVerisenseLookupBankCount = inferVerisenseLookupBankCount;
 exports.infoMemFieldsFor = infoMemFieldsFor;
 exports.interpretShimmer3InquiryResponse = interpretShimmer3InquiryResponse;
 exports.isAckCommand = isAckCommand;
+exports.isAudioFaultFatal = isAudioFaultFatal;
 exports.isBadResponse = isBadResponse;
 exports.isBmp581PresentPerSrNumber = isBmp581PresentPerSrNumber;
 exports.isButtonDisabled = isButtonDisabled;
@@ -38348,6 +39108,11 @@ exports.objectClusterColumns = objectClusterColumns;
 exports.objectClusterRow = objectClusterRow;
 exports.padVerisenseOperationalConfig = padVerisenseOperationalConfig;
 exports.parseActiveSlot = parseActiveSlot;
+exports.parseAudioFingerprintFile = parseAudioFingerprintFile;
+exports.parseAudioFingerprintHeader = parseAudioFingerprintHeader;
+exports.parseAudioFingerprintRecord = parseAudioFingerprintRecord;
+exports.parseAudioStatus = parseAudioStatus;
+exports.parseAudioWavHeader = parseAudioWavHeader;
 exports.parseBatteryStatus = parseBatteryStatus;
 exports.parseBleLinkDebugPayload = parseBleLinkDebugPayload;
 exports.parseBluetoothModuleVersion = parseBluetoothModuleVersion;
@@ -38401,7 +39166,9 @@ exports.readExgField = readExgField;
 exports.readExgKnobs = readExgKnobs;
 exports.readInfoMemFieldValue = readInfoMemFieldValue;
 exports.readVerisenseOperationalFieldValue = readVerisenseOperationalFieldValue;
+exports.recordsAudioFingerprint = recordsAudioFingerprint;
 exports.recordsButtonPresses = recordsButtonPresses;
+exports.recordsRawAudio = recordsRawAudio;
 exports.reorderWindowTicks = reorderWindowTicks;
 exports.requireShimmer3FactoryTestType = requireShimmer3FactoryTestType;
 exports.requiresExpansionPower = requiresExpansionPower;
@@ -38433,6 +39200,7 @@ exports.setVerisenseDfuModeWithRetry = setVerisenseDfuModeWithRetry;
 exports.setVerisenseOperationalBitRange = setVerisenseOperationalBitRange;
 exports.shimmer3ControlMessageLength = shimmer3ControlMessageLength;
 exports.shimmer3FactoryTestTypeInfo = shimmer3FactoryTestTypeInfo;
+exports.shimmer3RMayRecordAudio = shimmer3RMayRecordAudio;
 exports.shimmer3SensorLabel = shimmer3SensorLabel;
 exports.shimmer3SupportsBatteryRequest = shimmer3SupportsBatteryRequest;
 exports.shimmer3SupportsExg = shimmer3SupportsExg;
