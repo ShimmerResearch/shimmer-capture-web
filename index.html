@@ -705,6 +705,11 @@
             re-reads at boot.
           </div>
         </div>
+
+        <!-- common/audio-panel.js builds the Shimmer3R audio recording card
+             here (DEV-99): whether the firmware records audio, what the
+             configuration keeps, and the recorder's status. -->
+        <div id="audioPanel"></div>
       </section>
 
       <!-- ================================================= Configure ===== -->
@@ -1148,6 +1153,7 @@
       import { createStreamPlot } from "./common/plot.js";
       import { createStreamStats } from "./common/stream-stats.js";
       import { createEventChannelPanel } from "./common/event-channel-panel.js";
+      import { createAudioPanel } from "./common/audio-panel.js";
       import { createSdBrowser } from "./common/sd-browser.js";
       import { createBrandEditor } from "./common/brand-editor.js";
       import { createCalibrationEditor } from "./common/calibration-editor.js";
@@ -1575,6 +1581,16 @@
        * ask, so it stays false there and the form leaves the byte out.
        */
       let eventChannel = false;
+      /**
+       * Whether the firmware records audio, and with it has configuration
+       * byte 233 (DEV-99), as the sensor answered at connect. No release has
+       * it, and the builds that do report the release they were cut from, so
+       * the SDK rules older firmware out by version and asks the rest with the
+       * audio status command, which older firmware ignores. Over USB the dock
+       * protocol cannot ask, so it stays false there and the form leaves the
+       * byte out.
+       */
+      let audio = false;
       /** The last stream frame's raw device timestamp and its x on the plot, to place event markers. */
       let lastFrameTs = null;
       let lastFrameX = null;
@@ -1823,6 +1839,18 @@
         evtPanel.setEnabled(
           !!client &&
             eventChannel &&
+            !streaming &&
+            !busy &&
+            !sdBusy &&
+            !brandBusy &&
+            !calibBusy &&
+            !testBusy &&
+            !otaBusy,
+        );
+        /* The audio status reply is not taken mid-stream either. */
+        audioPanel.setEnabled(
+          !!client &&
+            audio &&
             !streaming &&
             !busy &&
             !sdBusy &&
@@ -2181,7 +2209,15 @@
         ["rtcSet", "Clock set", false],
         ["redLedOn", "Red LED", false],
         ["usbPluggedIn", "USB plugged in", false],
+        /* Status byte 1 bits 1-2 (DEV-99). Firmware without audio sends 0
+                 there, so they are shown only where the sensor said it records
+                 audio: on any other a 0 is not its word. */
+        ["audioRecording", "Recording audio", false],
+        ["audioFault", "Audio fault", true],
       ];
+
+      /** The status flags that mean something only on firmware that records audio. */
+      const AUDIO_FLAGS = new Set(["audioRecording", "audioFault"]);
 
       /**
        * What the flags panel is showing, and how much it is worth.
@@ -2239,6 +2275,7 @@
           unconfirmedAt: null,
         };
         paintStatus();
+        audioPanel.setStatus(status);
         /* The sensor is the authority on whether it is sensing: a status read
                  is how a host learns its button was pressed while nobody was
                  streaming, and every configuration command is NACKed until it
@@ -2322,6 +2359,7 @@
                      `usbPluggedIn` can be null — and the same rule keeps a flag the
                      page inferred before it ever read one from claiming to be off. */
             .filter(([key]) => typeof status[key] === "boolean")
+            .filter(([key]) => audio || !AUDIO_FLAGS.has(key))
             .map(([key, label, badWhenOn]) => {
               const on = status[key];
               const guessed = inferred.has(key);
@@ -3054,6 +3092,16 @@
           );
         }
 
+        /* Byte 233 (DEV-99): what the chosen mode keeps, and that raw audio
+                 records speech, said where the mode is picked. */
+        const audioBody = host.querySelector('[data-group-body="audio"]');
+        if (audioBody) {
+          audioBody.insertBefore(
+            el("div", { class: "field-hint", id: "audioSummary" }),
+            audioBody.firstChild,
+          );
+        }
+
         /* The two ExG register banks are opaque 10-byte runs, and the ExG
                  preset above is what installs a known-good one. They stay editable
                  for anyone who really does have a register bank to paste, but they
@@ -3075,6 +3123,7 @@
       /** Called after anything changes the working image. */
       function afterImageEdit() {
         syncEventChannel();
+        syncAudio();
         syncSensorGrid();
         syncRateReadout();
         syncRateCoverage();
@@ -3142,6 +3191,86 @@
           );
         }
         node.textContent = said.join(" ");
+      }
+
+      /**
+       * Configuration byte 233 (DEV-99), in words: what the sensor will keep
+       * from its microphone while it logs, as the firmware will read the image
+       * now in the form. Also tells the audio card.
+       */
+      function syncAudio() {
+        const node = $("audioSummary");
+        const at = layout?.idxAudioMode;
+        const image = form?.getImage();
+        if (at === undefined || !image) {
+          if (node) node.textContent = "";
+          audioPanel.setConfig(null);
+          return;
+        }
+        audioPanel.setConfig(image[at]);
+        if (!node) return;
+        const mode = sdk.audioModeOf(image[at]);
+        const said = [];
+        if (mode === sdk.AUDIO_MODE.OFF) {
+          said.push("The sensor records no audio.");
+        } else {
+          const kept = [];
+          if (sdk.recordsAudioFingerprint(image[at]))
+            kept.push("the fingerprint (.AFP: landmark hashes, no sound)");
+          if (sdk.recordsRawAudio(image[at]))
+            kept.push("raw 16 kHz audio (.WAV)");
+          said.push(
+            `While it logs to SD, the sensor records ${kept.join(" and ")} into audio/ beside each data file.`,
+          );
+        }
+        if (sdk.audioModeRecordsSpeech(mode)) {
+          said.push(
+            "Raw audio records speech: Apply asks you to confirm, and everyone near the sensor needs to know it is recording.",
+          );
+        }
+        const fixed = sdk.correctAudioMode(image[at]);
+        if (fixed !== image[at] && image[at] !== 0xff) {
+          said.push(
+            `As stored (0x${image[at].toString(16).padStart(2, "0")}) the sensor reads it as 0x${fixed.toString(16).padStart(2, "0")}; that is what Apply writes.`,
+          );
+        }
+        node.textContent = said.join(" ");
+      }
+
+      /**
+       * Make the firmware's check on byte 233 before a write, so what Apply
+       * writes is what the sensor reads back.
+       */
+      function conformAudio() {
+        if (!form || layout?.idxAudioMode === undefined) return;
+        const changed = sdk.applyAudioModeRules(form.getImage(), layout);
+        if (changed.length) {
+          form.refresh();
+          log.log("byte 233: corrected as the sensor will read it");
+          afterImageEdit();
+        }
+      }
+
+      /**
+       * Raw audio records speech (log-and-stream-common
+       * docs/SHIMMER3R_AUDIO.md), so a write that turns on a mode keeping it is
+       * confirmed on its own, before the general Apply prompt, and says so
+       * plainly. Not asked again for a mode the sensor already has.
+       *
+       * @returns false when the user declined
+       */
+      function confirmAudioMode() {
+        const at = layout?.idxAudioMode;
+        if (at === undefined || !form) return true;
+        const mode = sdk.audioModeOf(form.getImage()[at]);
+        if (!sdk.audioModeRecordsSpeech(mode)) return true;
+        if (deviceImage && sdk.audioModeOf(deviceImage[at]) === mode) return true;
+        return window.confirm(
+          `Audio Recording "${sdk.describeAudioMode(mode)}" stores raw audio, which records speech.\n\n` +
+            "Every time this sensor logs to SD it will record the sound around it into audio/ on its card. " +
+            "Everyone near the sensor needs to know it is recording.\n\n" +
+            "Turn on raw audio recording?",
+        );
       }
 
       /**
@@ -3626,6 +3755,7 @@
        */
       async function applyConfiguration() {
         conformEventChannel();
+        conformAudio();
         const plan = currentPlan();
         if (plan.blocked) {
           showToast(plan.blocked, "warn");
@@ -3635,6 +3765,14 @@
         const changes = describeChanges();
         if (!changes.length) {
           showToast("Nothing has changed since the last read", "info");
+          return;
+        }
+        if (!confirmAudioMode()) {
+          log.log("Apply cancelled: raw audio recording was not confirmed");
+          showToast(
+            "Apply cancelled: raw audio recording was not confirmed",
+            "info",
+          );
           return;
         }
         const confirmed = window.confirm(
@@ -3842,6 +3980,12 @@
         downloadBlob,
         log: (msg) => log.log(msg),
       });
+      /* The Shimmer3R's audio recording (DEV-99): the recorder's state from
+               the status flags, and its own status on request. */
+      const audioPanel = createAudioPanel($("audioPanel"), {
+        onReadStatus: () =>
+          tryDevice("read the audio status", () => client.getAudioStatus()),
+      });
       const recorder = sdk.createCsvRecorder({
         fileNameFn: () => recordFileName(),
         download: downloadBlob,
@@ -3881,7 +4025,9 @@
         /* Firmware with the event channel writes event files, in events/
                  beside data/. A getter, because the connect handshake is what
                  finds out. */
-        companionFiles: () => eventChannel,
+        /* And firmware that records audio (DEV-99) writes audio/ beside
+                 data/ too: the SDK's companion kinds list both. */
+        companionFiles: () => eventChannel || audio,
         onBusyChange: (transferring) => {
           sdBusy = transferring;
           regate();
@@ -5171,6 +5317,28 @@
         }
         evtPanel.setSupport(eventChannel ? "yes" : "no");
 
+        /* Audio recording and configuration byte 233 (DEV-99). Asked of the
+                 sensor too: the SDK sends nothing to firmware older than the builds
+                 that have it, and asks the rest with GET_AUDIO_STATUS, which older
+                 firmware drops unanswered - a second's wait, once per connection. */
+        audio = false;
+        if (caps.audio) {
+          audio =
+            (await tryDevice("ask whether the firmware records audio", () =>
+              client.supportsAudio(),
+            )) === true;
+          log.log(
+            audio
+              ? "audio: this firmware records audio, so the configuration includes byte 233"
+              : "audio: not in this firmware",
+          );
+        }
+        audioPanel.setSupport(audio ? "yes" : "no");
+        /* The status was read before the answer came, and its audio flags
+                 are shown only once the sensor has said it records audio. */
+        paintStatus();
+        audioPanel.setStatus(statusView?.status ?? null);
+
         const ctx = {
           hardwareVersion: hw?.hardwareVersion ?? 10,
           firmwareId: fw?.fwId ?? 3,
@@ -5180,6 +5348,7 @@
             internal: fw?.patch ?? 0,
           },
           eventChannel,
+          audio,
         };
         generation = sdk.inferShimmer3Generation(
           ctx,
@@ -5332,6 +5501,8 @@
                  the firmware has byte 232: the form leaves it out over USB. */
         eventChannel = false;
         evtPanel.setSupport("usb");
+        audio = false;
+        audioPanel.setSupport("usb");
         const ctx = {
           hardwareVersion: id?.hardwareVersion ?? 10,
           firmwareId: version?.firmwareIdentifier ?? 3,
@@ -5451,6 +5622,8 @@
         eventChannel = false;
         evtPanel.setSupport("none");
         evtPanel.resetLink();
+        audio = false;
+        audioPanel.setSupport("none");
         client = null;
         mode = null;
         caps = {};
@@ -5536,6 +5709,10 @@
        *   ?mock=1&clockBase=local  start the sensor's clock on this host's
        *                        civil time instead of UTC, as a sensor set by
        *                        a tool using the other convention reads
+       *   ?mock=1&events=1     firmware with the event channel (DEV-971)
+       *   ?mock=1&audio=1      firmware that records audio (DEV-99): byte 233,
+       *                        the audio status command and audio/ files on
+       *                        the card; reports v1.01.025 unless fw= says
        *   ?mock=1&debug=1      log every command and reply to the console
        */
       function setUpMock() {
@@ -5654,6 +5831,7 @@
             pressure,
             sensors,
             eventChannel: params.get("events") === "1",
+            audio: params.get("audio") === "1",
             debug: params.get("debug") === "1",
           });
           // Hooks for driving the page from the console while developing:
@@ -5673,6 +5851,7 @@
           window.factoryTestPanel = selfTest;
           window.rtcDriftPanel = drift;
           window.eventChannelPanel = evtPanel;
+          window.audioPanel = audioPanel;
           /* Also the client itself, so a link's feature set can be taken
                    apart from the console: shadowing a method on it is how the
                    "this link cannot do X" paths get exercised without owning the
