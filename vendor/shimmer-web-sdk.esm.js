@@ -17519,13 +17519,13 @@ function isAckOrNack(b) {
 function firmwareTag(major, minor, internal) {
     return `v${major}.${String(minor).padStart(2, '0')}.${String(internal).padStart(3, '0')}`;
 }
-/** {@link Shimmer3RClient.setCrcMode}'s refusal while a stream is running. */
 /**
  * How long {@link Shimmer3RClient.supportsAudio} waits for the audio status
  * probe's ACK. Firmware with audio answers at once; firmware without it never
  * does, so this is what the probe costs there, once per link.
  */
 const AUDIO_PROBE_TIMEOUT_MS = 1000;
+/** {@link Shimmer3RClient.setCrcMode}'s refusal while a stream is running. */
 const CRC_CHANGE_MID_STREAM = 'Cannot change the CRC mode while streaming: it would move every frame boundary.';
 // ---------------------------------------------------------------------------
 // Shimmer3RClient
