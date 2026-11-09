@@ -6650,6 +6650,36 @@ check(
   `${audFault.bad.join(",")} | ${audFault.status}`,
 );
 
+/* A log started from this page always streams too, so the push that says
+   recording started arrives between two stream packets, and the SDK has to
+   take it from there. */
+const audStream = await evaluate(`
+  window.confirm = () => true;
+  const flags = () => [...document.querySelectorAll('#statusFlags .flag')].map(f => ({
+    text: f.textContent, on: f.classList.contains('on'), inferred: f.classList.contains('inferred') }));
+  const recording = () => flags().some(f => f.text === 'Recording audio' && f.on);
+  document.getElementById('btnSdStart').click();
+  for (let i = 0; i < 60 && !recording(); i++) await new Promise(r => setTimeout(r, 50));
+  const during = flags();
+  document.getElementById('btnSdStop').click();
+  for (let i = 0; i < 60 && recording(); i++) await new Promise(r => setTimeout(r, 50));
+  await new Promise(r => setTimeout(r, 300));
+  return { during, after: flags() };
+`);
+check(
+  "during Start stream + SD logging, the push mid-stream turns Recording audio on and replaces the inferred flags",
+  audStream.during.some((f) => f.text === "Recording audio" && f.on) &&
+    audStream.during.every((f) => !f.inferred),
+  audStream.during
+    .map((f) => `${f.text}${f.on ? "+" : ""}${f.inferred ? "*" : ""}`)
+    .join(","),
+);
+check(
+  "stopping it turns Recording audio off again",
+  audStream.after.some((f) => f.text === "Recording audio" && !f.on),
+  audStream.after.map((f) => `${f.text}${f.on ? "+" : ""}`).join(","),
+);
+
 /* The SD tab, on firmware that writes audio/ beside data/. The mock's card has
    a WAV and a fingerprint for each of the first session's two data files. */
 const audSdList = await evaluate(
