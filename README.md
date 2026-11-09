@@ -534,7 +534,14 @@ Where it does, four things change:
   chunks. The card is hidden for any other sensor.
 - The **Device** flags gain **Recording audio** and **Audio fault**. The sensor
   pushes its status whenever either changes, so they follow a recording without
-  polling. A fault stays shown until the next session starts.
+  polling. **Stop stream + SD logging** turns Recording audio off itself, marked
+  as the page's own belief, in case the sensor's push is lost. A fault stays
+  shown until the next session starts.
+- A recording needs a log, and the sensor won't start one while it is docked or
+  on USB power, without a card, with an SD file error, or with logging turned
+  off in its configuration. It still accepts **Start stream + SD logging** then
+  and only streams, so that button is disabled while the sensor's last status
+  or configuration says so, with the reason under it.
 - **SD card** lists the audio files with the data files, each under its
   session, and a **Mirror SD card structure** download takes them with it (see
   [The SD card](#the-sd-card)).

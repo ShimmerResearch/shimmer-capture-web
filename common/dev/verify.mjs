@@ -3198,6 +3198,39 @@ check(
   `${docked.before.badge} → ${docked.onDock.badge} → ${docked.onUndock.badge}`,
 );
 
+/* The firmware does not log while docked, yet ACKs Start stream + SD logging
+   and streams, so the page holds that button back, and says why, for as long
+   as the sensor says it is docked. Plain streaming stays available. */
+const sdGate = await evaluate(`
+  const look = () => ({
+    sdStart: !document.getElementById('btnSdStart').disabled,
+    stream: !document.getElementById('btnStreamStart').disabled,
+    note: document.getElementById('sdStartNoteRow').hidden ? null
+      : document.getElementById('sdStartNote').textContent,
+    title: document.getElementById('btnSdStart').title,
+  });
+  const before = look();
+  window.mockTransport.status.setDocked(true);
+  await new Promise(r => setTimeout(r, 400));
+  const onDock = look();
+  window.mockTransport.status.setDocked(false);
+  await new Promise(r => setTimeout(r, 400));
+  return { before, onDock, onUndock: look() };
+`);
+check(
+  "while the sensor says it is docked, Start stream + SD logging is held back with the reason, and plain streaming is not",
+  sdGate.before.sdStart &&
+    sdGate.before.note === null &&
+    !sdGate.onDock.sdStart &&
+    sdGate.onDock.stream &&
+    /docked/.test(sdGate.onDock.note ?? "") &&
+    sdGate.onDock.title === sdGate.onDock.note &&
+    sdGate.onUndock.sdStart &&
+    sdGate.onUndock.note === null &&
+    sdGate.onUndock.title === "",
+  JSON.stringify(sdGate),
+);
+
 /* The push and the answer to GET_STATUS are the same message built by the same
    function — this is the assertion that they stayed that way. */
 check(
@@ -6808,6 +6841,37 @@ check(
   "stopping it turns Recording audio off again",
   audStream.after.some((f) => f.text === "Recording audio" && !f.on),
   audStream.after.map((f) => `${f.text}${f.on ? "+" : ""}`).join(","),
+);
+
+/* The push that says recording stopped can be lost on the way, so the stop
+   turns the flag off itself, as it does SD logging. */
+const audStopNoPush = await evaluate(`
+  window.confirm = () => true;
+  const flags = () => [...document.querySelectorAll('#statusFlags .flag')].map(f => ({
+    text: f.textContent, on: f.classList.contains('on'), inferred: f.classList.contains('inferred') }));
+  const recording = () => flags().some(f => f.text === 'Recording audio' && f.on);
+  // The last stop drains the stream's tail before the page is idle again.
+  const sdStart = document.getElementById('btnSdStart');
+  for (let i = 0; i < 60 && sdStart.disabled; i++) await new Promise(r => setTimeout(r, 50));
+  sdStart.click();
+  for (let i = 0; i < 60 && !recording(); i++) await new Promise(r => setTimeout(r, 50));
+  const during = recording();
+  window.mockTransport.audio.dropStopPush = true;
+  document.getElementById('btnSdStop').click();
+  await new Promise(r => setTimeout(r, 1000));
+  window.mockTransport.audio.dropStopPush = false;
+  return { during, after: flags() };
+`);
+check(
+  "with the stop's push lost, the stop still turns Recording audio off, as the page's own belief",
+  audStopNoPush.during &&
+    audStopNoPush.after.some(
+      (f) => /^Recording audio\b/.test(f.text) && !f.on && f.inferred,
+    ),
+  `recording ${audStopNoPush.during} → ` +
+    audStopNoPush.after
+      .map((f) => `${f.text}${f.on ? "+" : ""}${f.inferred ? "*" : ""}`)
+      .join(","),
 );
 
 /* The SD tab, on firmware that writes audio/ beside data/. The mock's card has

@@ -872,6 +872,9 @@
               Stop stream + SD logging
             </button>
           </div>
+          <div class="row" id="sdStartNoteRow" hidden>
+            <span class="muted" id="sdStartNote"></span>
+          </div>
           <div class="row">
             <label for="selWindow">Window</label>
             <select id="selWindow">
@@ -1799,6 +1802,45 @@
         disconnect: () => disconnectFromSensor(),
       });
 
+      /** Why Start stream + SD logging is held back, as last applied; null when it is not. */
+      let sdStartBlock = null;
+
+      /**
+       * Why the sensor would not start an SD log if asked now, from what it
+       * last said about itself, or null when nothing rules it out.
+       *
+       * The firmware starts a log only with logging allowed by configuration
+       * byte 232, a card in, no bad file, and the sensor neither docked nor on
+       * USB power (`ShimSens_checkStartLoggingConditions`, log-and-stream-common
+       * `Sensing/shimmer_sensing.c`). Otherwise START_SDBT still gets its ACK
+       * and the stream starts, with no log and nothing to say so, since the
+       * firmware sends no status for a change a command caused. Only the
+       * sensor's own word counts here: the status it last sent (docking, USB
+       * and the card are never inferred) and the configuration read from it.
+       */
+      function sdLogBlockedReason() {
+        const s = statusView?.status;
+        if (s?.docked === true) {
+          return "The sensor is docked, and it doesn't log to its SD card while docked. Undock it to log.";
+        }
+        if (s?.usbPluggedIn === true) {
+          return "The sensor is on USB power, and it doesn't log to its SD card while USB is plugged in. Unplug it to log.";
+        }
+        if (s?.sdPresent === false) return "There's no SD card in the sensor.";
+        if (s?.sdError === true) {
+          return "The sensor reports an SD file error, so it won't start a log.";
+        }
+        const at = layout?.idxButtonLogMode;
+        if (
+          deviceImage &&
+          at !== undefined &&
+          sdk.isLoggingDisabled(deviceImage[at])
+        ) {
+          return "SD logging is turned off in the sensor's configuration (SD Logging → Start-up).";
+        }
+        return null;
+      }
+
       /**
        * Re-apply every `data-requires` / `data-cap` gate, then the handful of
        * states no attribute can express.
@@ -1825,6 +1867,16 @@
           busy: busy || sdBusy || brandBusy || calibBusy || testBusy || otaBusy,
           caps,
         });
+
+        /* The firmware ACKs Start stream + SD logging and streams even when
+                 it will not log, so the button is held back where the sensor
+                 has already said it would not, with the reason beside it. */
+        sdStartBlock = client ? sdLogBlockedReason() : null;
+        const sdStart = $("btnSdStart");
+        if (sdStartBlock) sdStart.disabled = true;
+        sdStart.title = sdStartBlock ?? "";
+        $("sdStartNote").textContent = sdStartBlock ?? "";
+        $("sdStartNoteRow").hidden = !sdStartBlock || streaming;
 
         /* Each panel is enabled on everything EXCEPT its own busy flag: this
                  is the floor for whether the LINK can do the thing at all, and each
@@ -2287,6 +2339,8 @@
         };
         paintStatus();
         audioPanel.setStatus(status);
+        /* Docking, USB and the card decide whether a log can start. */
+        if (client && sdLogBlockedReason() !== sdStartBlock) regate();
         /* The sensor is the authority on whether it is sensing: a status read
                  is how a host learns its button was pressed while nobody was
                  streaming, and every configuration command is NACKed until it
@@ -4999,10 +5053,18 @@
         stats.render();
         if (recorder.active) await stopRecording();
         // Same reasoning as the start: only what the command changed, and the
-        // page's own belief until something reads it back.
+        // page's own belief until something reads it back. Audio recording
+        // ends with the log (PlatAudio_sessionStop), so its flag goes too: the
+        // push that says so can be missed, and a lit flag after a stop is the
+        // one thing it must not show. A fault stays until the next log.
         inferStatus(
           withSd
-            ? { sensing: false, streaming: false, sdLogging: false }
+            ? {
+                sensing: false,
+                streaming: false,
+                sdLogging: false,
+                ...(audio ? { audioRecording: false } : {}),
+              }
             : { sensing: false, streaming: false },
         );
         regate();

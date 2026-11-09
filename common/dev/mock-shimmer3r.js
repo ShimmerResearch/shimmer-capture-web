@@ -1157,6 +1157,8 @@ export function createMockShimmer3RTransport(opts = {}) {
     fatal: false,
     silence: 0,
     skipped: 0,
+    /** Lose the push that says recording stopped, as a link can. */
+    dropStopPush: false,
   };
 
   /* Which pressure part this mock claims to carry. Defaults to the one the
@@ -1794,7 +1796,8 @@ export function createMockShimmer3RTransport(opts = {}) {
     if (!audioBuilt || aud.sessionStartMs === null) return;
     const before = audioStatusBits();
     if (aud.sessionEndMs === null) aud.sessionEndMs = Date.now();
-    if (audioStatusBits() !== before) reply(statusResponse());
+    if (audioStatusBits() !== before && !aud.dropStopPush)
+      reply(statusResponse());
   }
 
   /** `[0xBD][32 bytes]` (`PlatAudio_buildStatus`). */
@@ -1836,6 +1839,10 @@ export function createMockShimmer3RTransport(opts = {}) {
     },
     get mode() {
       return audioMode();
+    },
+    /** Lose the push that says recording stopped, as a link can, or stop losing it. */
+    set dropStopPush(on) {
+      aud.dropStopPush = !!on;
     },
     /** Start or stop SD logging as the user button would, and push the status. */
     setLogging(on) {
@@ -3329,10 +3336,17 @@ export function createMockShimmer3RTransport(opts = {}) {
 
       case CMD.START_SDBT:
         state.streaming = true;
-        state.logging = true;
+        /* The firmware starts the log only undocked, off USB, with a card in
+           and no bad file (ShimSens_checkStartLoggingConditions), and ACKs
+           the command and streams either way. */
+        state.logging =
+          !state.docked &&
+          !state.usbPluggedIn &&
+          state.sdInserted &&
+          !state.sdBadFile;
         reply([ACK]);
         startStreaming();
-        audioSessionStart();
+        if (state.logging) audioSessionStart();
         return;
 
       case CMD.STOP_STREAMING:
