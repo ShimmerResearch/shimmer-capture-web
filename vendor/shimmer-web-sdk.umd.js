@@ -4105,12 +4105,6 @@
         EVENT_CHANNEL_STATUS_RESPONSE: 0xba,
         /** Event channel record frame, under the `0x8A` in-stream prefix. */
         EVENT_RECORD_RESPONSE: 0xbb,
-        /**
-         * Audio recording (DEV-99): `[0xBC]` → `[ACK][0xBD][status × 32]`. Firmware
-         * before DEV-99 has no command 0xBC and drops it unanswered.
-         */
-        GET_AUDIO_STATUS_COMMAND: 0xbc,
-        AUDIO_STATUS_RESPONSE: 0xbd,
         SET_SD_SYNC_COMMAND: 0xe0,
         SD_SYNC_RESPONSE: 0xe1,
         NACK_COMMAND_PROCESSED: 0xfe,
@@ -4771,7 +4765,7 @@
      * v1.00.024 — hence the nullable fields rather than plain booleans. Which
      * width a given device sends is {@link statusPayloadBytesFor}'s question; this
      * decodes whatever it is handed. Its bit 0 is usbPluggedIn, and from DEV-99
-     * bits 1 and 2 are audio recording and audio fault
+     * bits 1, 2 and 3 are audio recording, audio fault and audio available
      * (`shimmerStatus.usbPluggedIn | ShimAudio_statusBits()`). Bit 0 alone is
      * USB: reading the whole byte as USB, as this did before DEV-99, reports a
      * unit recording audio on battery as plugged in.
@@ -4792,6 +4786,7 @@
             usbPluggedIn: bytes.length >= 2 ? (bytes[1] & 0x01) !== 0 : null,
             audioRecording: bytes.length >= 2 ? (bytes[1] & 0x02) !== 0 : null,
             audioFault: bytes.length >= 2 ? (bytes[1] & 0x04) !== 0 : null,
+            audioAvailable: bytes.length >= 2 ? (bytes[1] & 0x08) !== 0 : null,
             raw: new Uint8Array(bytes),
         };
     }
@@ -11325,14 +11320,14 @@
             isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3, FW_ID.LOGANDSTREAM, 1, 0, 17));
     }
     /**
-     * Whether this firmware might record audio (DEV-99), and so is worth asking:
-     * Shimmer3R LogAndStream v1.01.025 or later. False rules it out without
-     * sending anything; true means ask the device
-     * (`Shimmer3RClient.supportsAudio`).
+     * Whether this firmware might record audio (DEV-99), and so whether status
+     * byte 1 bit 3 is to be believed: Shimmer3R LogAndStream v1.01.025 or later.
+     * False rules it out; true means the status says
+     * (`Shimmer3RClient.supportsAudio`), which also covers a board without a
+     * microphone.
      *
      * No release has audio yet, and the builds that do report the release they
      * were cut from, v1.01.025, so the version can only rule older firmware out.
-     * Once a release carries it, that release's version answers yes on its own.
      * A Shimmer3 has no microphone.
      */
     function shimmer3RMayRecordAudio(fw, hardwareVersion) {
@@ -13396,133 +13391,6 @@
     }
 
     /**
-     * The Shimmer3R audio recorder's status over Bluetooth (DEV-99): the two bits
-     * it adds to status byte 1, and the answer to `GET_AUDIO_STATUS_COMMAND`.
-     *
-     * Format: log-and-stream-common `docs/SHIMMER3R_AUDIO.md` §5 and
-     * `docs/SHIMMER3_BT_COMMUNICATION_PROTOCOL.md` §5.3; the builder is
-     * shimmer3r-firmware `Shimmer_Driver/hal_AudioRecorder.c` `PlatAudio_buildStatus`.
-     *
-     * HARDWARE-VERIFY: decoded from the firmware source only; no unit has answered
-     * this SDK yet.
-     */
-    /** Opcodes of the audio status command and its response. Shimmer3R only. */
-    const AUDIO_OPCODES = Object.freeze({
-        /** `[0xBC]` → `[ACK][0xBD][status × 32]`. Answered while streaming too. */
-        GET_AUDIO_STATUS_COMMAND: 0xbc,
-        AUDIO_STATUS_RESPONSE: 0xbd,
-    });
-    /** Length of the status payload after the 0xBD opcode. */
-    const AUDIO_STATUS_LENGTH = 32;
-    /** The only payload version this decoder knows. */
-    const AUDIO_STATUS_VERSION = 1;
-    /** Status byte 1 bits the recorder sets, beside bit 0, USB plugged in. */
-    const AUDIO_STATUS_BITS = Object.freeze({
-        /** Audio is being captured for the current log. */
-        RECORDING: 0x02,
-        /** This session's audio failed or was degraded; cleared when the next session starts. */
-        FAULT: 0x04,
-    });
-    /** Payload byte 2: the recorder's state. */
-    const AUDIO_STATE = Object.freeze({
-        /** Not configured, or not logging. */
-        OFF: 0,
-        /** Logging has started and the files and the microphone are coming up. */
-        STARTING: 1,
-        RECORDING: 2,
-        /** The session's recording ended normally. */
-        STOPPED: 3,
-        /** Stopped for the rest of the session by a fault. */
-        FAULT: 4,
-    });
-    /**
-     * Payload byte 3, and byte 97 of each audio file's header: the session's first
-     * fault. {@link AUDIO_FAULT.OVERRUN} and {@link AUDIO_FAULT.FP_BEHIND} are
-     * degradations, and recording carries on; the others stop it, and logging
-     * carries on.
-     */
-    const AUDIO_FAULT = Object.freeze({
-        NONE: 0,
-        /** A directory or file could not be made. */
-        OPEN: 1,
-        /** The microphone would not start. */
-        CAPTURE: 2,
-        /** A write to the card failed. */
-        WRITE: 3,
-        /** The card fell further behind than the capture ring holds; the gap was written as silence. */
-        OVERRUN: 4,
-        /** The fingerprint fell further behind than the ring holds, and skipped chunks. */
-        FP_BEHIND: 5,
-    });
-    /** A short description of a recorder state. */
-    function describeAudioState(state) {
-        switch (state) {
-            case AUDIO_STATE.OFF:
-                return 'Off';
-            case AUDIO_STATE.STARTING:
-                return 'Starting';
-            case AUDIO_STATE.RECORDING:
-                return 'Recording';
-            case AUDIO_STATE.STOPPED:
-                return 'Stopped';
-            case AUDIO_STATE.FAULT:
-                return 'Stopped by a fault';
-            default:
-                return `State ${state}`;
-        }
-    }
-    /** A short description of a fault. */
-    function describeAudioFault(fault) {
-        switch (fault) {
-            case AUDIO_FAULT.NONE:
-                return 'None';
-            case AUDIO_FAULT.OPEN:
-                return 'Could not make an audio directory or file';
-            case AUDIO_FAULT.CAPTURE:
-                return 'The microphone would not start';
-            case AUDIO_FAULT.WRITE:
-                return 'A write to the card failed';
-            case AUDIO_FAULT.OVERRUN:
-                return 'The card fell behind; silence was written';
-            case AUDIO_FAULT.FP_BEHIND:
-                return 'The fingerprint fell behind; chunks were skipped';
-            default:
-                return `Fault ${fault}`;
-        }
-    }
-    /** Whether a fault stopped the recording, rather than degrading it. */
-    function isAudioFaultFatal(fault) {
-        return (fault !== AUDIO_FAULT.NONE && fault !== AUDIO_FAULT.OVERRUN && fault !== AUDIO_FAULT.FP_BEHIND);
-    }
-    /**
-     * Decode the 32 status bytes that follow `AUDIO_STATUS_RESPONSE`. A later
-     * version's extra bytes are ignored.
-     *
-     * @throws RangeError when fewer than 32 bytes are given
-     */
-    function parseAudioStatus(payload) {
-        if (payload.length < AUDIO_STATUS_LENGTH) {
-            throw new RangeError(`Audio status needs ${AUDIO_STATUS_LENGTH} bytes; got ${payload.length}.`);
-        }
-        const u16 = (o) => payload[o] | (payload[o + 1] << 8);
-        const u32 = (o) => (payload[o] | (payload[o + 1] << 8) | (payload[o + 2] << 16)) + payload[o + 3] * 2 ** 24;
-        return {
-            version: payload[0],
-            mode: payload[1],
-            state: payload[2],
-            fault: payload[3],
-            seconds: u32(4),
-            silenceSamples: u32(8),
-            escapeDrains: u16(12),
-            writeErrors: u16(14),
-            adfErrors: u32(16),
-            adfSaturation: u32(20),
-            fingerprintChunks: u32(24),
-            fingerprintChunksSkipped: u32(28),
-        };
-    }
-
-    /**
      * Wire protocol for Shimmer3R SD-card file transfer over BLE.
      *
      * Mirrors the firmware implementation in
@@ -13991,8 +13859,6 @@
         [OPCODES.ALT_MAG_CALIBRATION_RESPONSE]: 21, // 0xB0
         // 0xBA — the event channel's status, 9 bytes (`ShimEvt_buildStatus`)
         [OPCODES.EVENT_CHANNEL_STATUS_RESPONSE]: EVENT_CHANNEL_STATUS_LENGTH,
-        // 0xBD — the audio recorder's status, 32 bytes (`PlatAudio_buildStatus`)
-        [OPCODES.AUDIO_STATUS_RESPONSE]: AUDIO_STATUS_LENGTH,
     });
     /**
      * SD-transfer response opcodes, which {@link sdMessageSpan} owns.
@@ -17525,12 +17391,6 @@
     function firmwareTag(major, minor, internal) {
         return `v${major}.${String(minor).padStart(2, '0')}.${String(internal).padStart(3, '0')}`;
     }
-    /**
-     * How long {@link Shimmer3RClient.supportsAudio} waits for the audio status
-     * probe's ACK. Firmware with audio answers at once; firmware without it never
-     * does, so this is what the probe costs there, once per link.
-     */
-    const AUDIO_PROBE_TIMEOUT_MS = 1000;
     /** {@link Shimmer3RClient.setCrcMode}'s refusal while a stream is running. */
     const CRC_CHANGE_MID_STREAM = 'Cannot change the CRC mode while streaming: it would move every frame boundary.';
     // ---------------------------------------------------------------------------
@@ -17863,10 +17723,13 @@
              * {@link getStatus}, which reads them itself. Until both are known a
              * one-byte push is reported as it is, because it may be complete.
              *
-             * **Only fires while idle.** Once streaming, every inbound byte belongs to the
-             * data plane and goes to the schema parser, which has no way to tell a status
-             * push from sample bytes and will consume it. Do not rely on this callback to
-             * notice that a recording stopped mid-stream; poll {@link getStatus} instead.
+             * **While streaming too.** The firmware queues a push between two packets, and
+             * the stream parser takes it there once it knows the status length (the
+             * versions are read at connect): with a link CRC it is checked by the CRC,
+             * without one by the packet that follows it. So a host sees SD logging,
+             * docking and the audio bits change during a stream as it does when idle. A
+             * push that lands while the parser is still finding the packet boundary, at
+             * the start of a stream, can still be lost.
              */
             this.onDeviceStatus = null;
             /**
@@ -17985,6 +17848,21 @@
                         remainder[0] === OPCODES.INSTREAM_CMD_RESPONSE &&
                         remainder[1] === OPCODES.EVENT_RECORD_RESPONSE) {
                         this._maybeEmitEventRecords(remainder);
+                        remainder = new Uint8Array(0);
+                    }
+                    /* Nor is a status push, unless a status read is waiting for one. Without
+                       a CRC, BLE delivers the firmware's `[ACK][0x8A][0x71][status]` push as
+                       this shape, and it cannot be told from a command's ACK with a push
+                       behind it, so the ACK is taken as the command's. The status still has
+                       to reach onDeviceStatus, rather than be handed to a command that does
+                       not read it. */
+                    if (remainder.length >= 2 &&
+                        remainder[0] === OPCODES.INSTREAM_CMD_RESPONSE &&
+                        remainder[1] === OPCODES.STATUS_RESPONSE &&
+                        this._statusReadsInFlight === 0 &&
+                        // Test traffic is never a status push, whatever its first bytes (below).
+                        !this._dataRateTestActive) {
+                        this._maybeEmitDeviceStatus(remainder);
                         remainder = new Uint8Array(0);
                     }
                     this._lastAckRemainder = remainder.length ? remainder : null;
@@ -19406,51 +19284,37 @@
         }
         /**
          * Ask the device whether its firmware records audio (DEV-99): configuration
-         * byte 233, status byte 1's audio bits, and `GET_AUDIO_STATUS_COMMAND`.
-         * Pass the answer to the InfoMem context as `audio`, which is what brings
-         * byte 233 into the layout and the field schema.
+         * byte 233 and status byte 1's audio bits. Pass the answer to the InfoMem
+         * context as `audio`, which is what brings byte 233 into the layout and the
+         * field schema.
          *
-         * The version alone cannot say. No release has audio yet, and the builds
-         * that do report the release they were cut from, so:
+         * 1. Firmware older than the first that may have audio, or not LogAndStream,
+         *    is ruled out by its version ({@link shimmer3RMayRecordAudio}).
+         * 2. Otherwise this reads the status ({@link getStatus}): status byte 1 bit 3,
+         *    `audioAvailable`, is set by firmware that records audio on a board with
+         *    a microphone. Older firmware sends 0 there.
          *
-         * 1. Firmware older than that, or not LogAndStream, is ruled out by its
-         *    version ({@link shimmer3RMayRecordAudio}) and is sent nothing.
-         * 2. Otherwise this sends `GET_AUDIO_STATUS_COMMAND` (0xBC) and waits a
-         *    second (`AUDIO_PROBE_TIMEOUT_MS`): a status reply is yes, silence no.
+         * No command is sent that the firmware might not know: the status is a read
+         * every firmware answers. The answer is cached until the next connect.
          *
-         * The probe is safe on firmware without audio, which SET_FEATURE was not:
-         * 0xBC was never a command before DEV-99, and it takes no arguments, so
-         * older firmware drops the one byte unanswered and there is nothing after
-         * it to run as a command. The cost is the timeout, once per link: the
-         * answer is cached until the next connect.
+         * Not while streaming; ask at connect.
          *
-         * Not while streaming ({@link getAudioStatus}); ask at connect.
-         *
-         * HARDWARE-VERIFY: from the firmware source. Neither answer has been seen
-         * from a unit: not the reply from a DEV-99 build, nor the silence from an
-         * older one.
+         * HARDWARE-VERIFY: from the firmware source. No unit has been asked.
          */
         async supportsAudio() {
             if (!this._transport)
                 throw new Error('Not connected (RX missing)');
             if (this._audioSupport !== null)
                 return this._audioSupport;
+            if (this._streaming)
+                throw new Error('Cannot ask whether the firmware records audio while streaming');
             const link = this._linkGeneration;
             let answer = false;
             if (await this._mayRecordAudio()) {
-                try {
-                    await this.getAudioStatus(AUDIO_PROBE_TIMEOUT_MS);
-                    answer = true;
-                }
-                catch (e) {
-                    const msg = e instanceof Error ? e.message : '';
-                    /* Silence is firmware without the command. Anything else - a link
-                       reset, the link busy, a reply that would not parse - says nothing
-                       about the firmware, so it is not remembered. */
-                    if (msg !== 'ACK timeout' && msg !== 'NACK received')
-                        throw e;
-                    this._emitStatus('Audio recording not supported by this firmware (0xBC unanswered)');
-                }
+                const status = await this.getStatus();
+                answer = status.audioAvailable === true;
+                if (!answer)
+                    this._emitStatus('Audio recording not supported (status byte 1 bit 3 clear)');
             }
             if (this._linkGeneration === link)
                 this._audioSupport = answer;
@@ -19465,35 +19329,6 @@
             catch {
                 return false;
             }
-        }
-        /**
-         * Read the audio recorder's status (GET_AUDIO_STATUS_COMMAND 0xBC →
-         * `[ACK][0xBD][32 bytes]`, DEV-99): the mode configured, the recorder's
-         * state and first fault, and this session's counters.
-         *
-         * Firmware without audio does not answer, so this times out there; ask
-         * {@link supportsAudio} first. The firmware answers while streaming too, but
-         * this client's stream parser takes only bare ACKs between packets, so it
-         * refuses while streaming rather than lose the reply.
-         *
-         * HARDWARE-VERIFY: from the firmware source (`PlatAudio_buildStatus`) only.
-         *
-         * @param timeoutMs how long to wait for the ACK, and then the reply
-         */
-        async getAudioStatus(timeoutMs = 1500) {
-            if (!this._transport)
-                throw new Error('Not connected (RX missing)');
-            if (this._streaming)
-                throw new Error('Cannot read the audio status while streaming');
-            const link = this._linkGeneration;
-            const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_AUDIO_STATUS_COMMAND]), timeoutMs);
-            const rsp = remainder && remainder[0] === OPCODES.AUDIO_STATUS_RESPONSE
-                ? remainder
-                : await this._waitForResponse(OPCODES.AUDIO_STATUS_RESPONSE, timeoutMs, link);
-            if (rsp[0] !== OPCODES.AUDIO_STATUS_RESPONSE || rsp.length < 1 + AUDIO_STATUS_LENGTH) {
-                throw new Error(`Malformed audio status (${rsp.length} bytes).`);
-            }
-            return parseAudioStatus(rsp.subarray(1, 1 + AUDIO_STATUS_LENGTH));
         }
         /**
          * Read the board's SR identity — `{boardId, boardRev, specialRev}`, the
@@ -21491,6 +21326,9 @@
          * in flight, in any CRC mode or over any link.
          */
         _streamReplyLength(buf, at) {
+            const push = this._streamStatusPushLength(buf, at);
+            if (push !== RESYNC)
+                return push;
             const op = buf[at];
             /* An event record frame, which the firmware queues into the same ring. It
                carries its own CRC whatever the link's mode, so it vouches for itself as
@@ -21512,6 +21350,59 @@
             const after = buf[at + 1];
             return after === OPCODES.DATA_PACKET || isAckOrNack(after) ? 1 : RESYNC;
         }
+        /**
+         * The length of the status push at `buf[at]`, `[ACK][0x8A][0x71][status]` and
+         * the link CRC: `RESYNC` when `buf[at]` does not start one, `NEED_MORE` when
+         * the buffer ends before that can be told.
+         *
+         * The firmware sends it whenever docking, logging, streaming, the USB rail or
+         * the audio bits change, streaming or not, into the same transmit ring as the
+         * packets (`ShimBt_instreamStatusRespSend`, `Comms/shimmer_bt_uart.c`). The
+         * ACK is there only while the in-stream ACK prefix is on, which is the
+         * default. The CRC, when the link has one, covers every byte from the ACK.
+         *
+         * With a CRC, the CRC tells, as for a bare ACK. With none, the push says
+         * nothing for itself, so it is taken only where the byte after it starts a
+         * data packet or another reply, and it never vouches for the packet in front
+         * of it: that packet's end is still found by the timestamp test.
+         *
+         * The width is the status's, 1 or 2 bytes ({@link statusPayloadBytesFor});
+         * until the versions are read it is unknown, and nothing is taken.
+         *
+         * HARDWARE-VERIFY: from the firmware source, and run against a scripted
+         * device only.
+         */
+        _streamStatusPushLength(buf, at) {
+            let i = at;
+            if (buf[i] === OPCODES.ACK_COMMAND_PROCESSED) {
+                if (buf.length < i + 2)
+                    return NEED_MORE;
+                i++;
+            }
+            if (buf[i] !== OPCODES.INSTREAM_CMD_RESPONSE)
+                return RESYNC;
+            if (buf.length < i + 2)
+                return NEED_MORE;
+            if (buf[i + 1] !== OPCODES.STATUS_RESPONSE)
+                return RESYNC;
+            const width = this._statusPayloadBytes;
+            if (width === null)
+                return RESYNC;
+            const trailer = crcTrailerBytes(this._crcMode);
+            const len = i - at + 2 + width + trailer;
+            if (buf.length < at + len)
+                return NEED_MORE;
+            if (trailer > 0)
+                return verifyCrc(buf.subarray(at, at + len), this._crcMode) ? len : RESYNC;
+            if (buf.length < at + len + 1)
+                return NEED_MORE;
+            const after = buf[at + len];
+            return after === OPCODES.DATA_PACKET ||
+                isAckOrNack(after) ||
+                after === OPCODES.INSTREAM_CMD_RESPONSE
+                ? len
+                : RESYNC;
+        }
         /** How many bytes of bare replies run from `buf[at]`, each as {@link _streamReplyLength} measures it. */
         _streamRepliesLength(buf, at) {
             let end = at;
@@ -21531,6 +21422,18 @@
          * {@link toggleLed}, which does not wait for it while streaming.
          */
         _takeStreamReply(op, frame) {
+            /* A status push, whose ACK prefix acknowledges no command: reported as an
+               idle one is, and never counted against a command waiting for its ACK. */
+            const msg = frame ? withoutLeadingAck(frame) : null;
+            if (frame &&
+                msg &&
+                msg.length >= 2 &&
+                msg[0] === OPCODES.INSTREAM_CMD_RESPONSE &&
+                msg[1] === OPCODES.STATUS_RESPONSE) {
+                const trailer = crcTrailerBytes(this._crcMode);
+                this._maybeEmitDeviceStatus(frame.subarray(0, frame.length - trailer));
+                return;
+            }
             if (op === OPCODES.INSTREAM_CMD_RESPONSE) {
                 if (frame)
                     this._emitEventRecord(frame);
@@ -21605,8 +21508,10 @@
                     buf.length > wireBytes &&
                     buf[wireBytes] !== preamble) {
                     /* An event frame's own CRC vouches for it on any link, as a reply's
-                       does on a CRC'd one. */
-                    const eventFrame = buf[wireBytes] === OPCODES.INSTREAM_CMD_RESPONSE;
+                       does on a CRC'd one. A status push has no CRC of its own, so it
+                       vouches only on a CRC'd link (_streamStatusPushLength). */
+                    const eventFrame = buf[wireBytes] === OPCODES.INSTREAM_CMD_RESPONSE &&
+                        buf[wireBytes + 1] !== OPCODES.STATUS_RESPONSE;
                     const vouchable = (crcBytes > 0 || eventFrame) && this._streamAligned;
                     const replies = vouchable
                         ? this._streamReplyLength(buf, wireBytes)
@@ -30030,6 +29935,70 @@
             truncated: budget.truncated,
             droppedUnstampedRecords: budget.droppedUnstamped,
         };
+    }
+
+    /**
+     * The Shimmer3R audio recorder's status (DEV-99): the bits it adds to status
+     * byte 1, which are all a host is told over Bluetooth, and the fault codes the
+     * session's audio files carry.
+     *
+     * Format: log-and-stream-common `docs/SHIMMER3R_AUDIO.md` §5 and
+     * `docs/SHIMMER3_BT_COMMUNICATION_PROTOCOL.md` §5.3; the bits are
+     * `ShimAudio_statusBits` (`Audio/shimmer_audio.c`).
+     *
+     * HARDWARE-VERIFY: decoded from the firmware source only; no unit has answered
+     * this SDK yet.
+     */
+    /** Status byte 1 bits the recorder sets, beside bit 0, USB plugged in. */
+    const AUDIO_STATUS_BITS = Object.freeze({
+        /** Audio is being captured for the current log. */
+        RECORDING: 0x02,
+        /** This session's audio failed or was degraded; cleared when the next session starts. */
+        FAULT: 0x04,
+        /** This firmware records audio and this board has a microphone. Never changes while it runs. */
+        AVAILABLE: 0x08,
+    });
+    /**
+     * Byte 97 of each audio file's header: the session's first fault. Status byte
+     * 1's fault bit says only that there was one. {@link AUDIO_FAULT.OVERRUN} and {@link AUDIO_FAULT.FP_BEHIND} are
+     * degradations, and recording carries on; the others stop it, and logging
+     * carries on.
+     */
+    const AUDIO_FAULT = Object.freeze({
+        NONE: 0,
+        /** A directory or file could not be made. */
+        OPEN: 1,
+        /** The microphone would not start. */
+        CAPTURE: 2,
+        /** A write to the card failed. */
+        WRITE: 3,
+        /** The card fell further behind than the capture ring holds; the gap was written as silence. */
+        OVERRUN: 4,
+        /** The fingerprint fell further behind than the ring holds, and skipped chunks. */
+        FP_BEHIND: 5,
+    });
+    /** A short description of a fault. */
+    function describeAudioFault(fault) {
+        switch (fault) {
+            case AUDIO_FAULT.NONE:
+                return 'None';
+            case AUDIO_FAULT.OPEN:
+                return 'Could not make an audio directory or file';
+            case AUDIO_FAULT.CAPTURE:
+                return 'The microphone would not start';
+            case AUDIO_FAULT.WRITE:
+                return 'A write to the card failed';
+            case AUDIO_FAULT.OVERRUN:
+                return 'The card fell behind; silence was written';
+            case AUDIO_FAULT.FP_BEHIND:
+                return 'The fingerprint fell behind; chunks were skipped';
+            default:
+                return `Fault ${fault}`;
+        }
+    }
+    /** Whether a fault stopped the recording, rather than degrading it. */
+    function isAudioFaultFatal(fault) {
+        return (fault !== AUDIO_FAULT.NONE && fault !== AUDIO_FAULT.OVERRUN && fault !== AUDIO_FAULT.FP_BEHIND);
     }
 
     /**
@@ -38523,11 +38492,7 @@
     exports.AUDIO_MODE = AUDIO_MODE;
     exports.AUDIO_MODE_BYTE = AUDIO_MODE_BYTE;
     exports.AUDIO_MODE_OPTIONS = AUDIO_MODE_OPTIONS;
-    exports.AUDIO_OPCODES = AUDIO_OPCODES;
-    exports.AUDIO_STATE = AUDIO_STATE;
     exports.AUDIO_STATUS_BITS = AUDIO_STATUS_BITS;
-    exports.AUDIO_STATUS_LENGTH = AUDIO_STATUS_LENGTH;
-    exports.AUDIO_STATUS_VERSION = AUDIO_STATUS_VERSION;
     exports.AudioFileFormatError = AudioFileFormatError;
     exports.BASE_HARDWARE_IDS = BASE_HARDWARE_IDS;
     exports.BATTERY_DIVIDER_RATIO = BATTERY_DIVIDER_RATIO;
@@ -38979,7 +38944,6 @@
     exports.deriveVerisenseMacIdFromName = deriveVerisenseMacIdFromName;
     exports.describeAudioFault = describeAudioFault;
     exports.describeAudioMode = describeAudioMode;
-    exports.describeAudioState = describeAudioState;
     exports.describeButtonLogMode = describeButtonLogMode;
     exports.describeEventRecord = describeEventRecord;
     exports.describePlatformSupport = describePlatformSupport;
@@ -39115,7 +39079,6 @@
     exports.parseAudioFingerprintFile = parseAudioFingerprintFile;
     exports.parseAudioFingerprintHeader = parseAudioFingerprintHeader;
     exports.parseAudioFingerprintRecord = parseAudioFingerprintRecord;
-    exports.parseAudioStatus = parseAudioStatus;
     exports.parseAudioWavHeader = parseAudioWavHeader;
     exports.parseBatteryStatus = parseBatteryStatus;
     exports.parseBleLinkDebugPayload = parseBleLinkDebugPayload;
