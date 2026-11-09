@@ -15579,6 +15579,15 @@
         return mode === AUDIO_MODE.FINGERPRINT_RAW || mode === AUDIO_MODE.RAW;
     }
     /**
+     * The mode that keeps exactly `parts`. Every combination is a mode, so a host
+     * can offer byte 233 as two enables, as Shimmer Capture's Microphone tile does.
+     */
+    function joinAudioMode(parts) {
+        if (parts.fingerprint)
+            return parts.raw ? AUDIO_MODE.FINGERPRINT_RAW : AUDIO_MODE.FINGERPRINT;
+        return parts.raw ? AUDIO_MODE.RAW : AUDIO_MODE.OFF;
+    }
+    /**
      * Whether setting this mode records speech, so a host must ask the user to
      * confirm first: modes 2 and 3, which keep raw audio. Takes a mode (0-3), not
      * the whole byte.
@@ -16228,12 +16237,6 @@
     const SHIMMER3_INFOMEM_FIELD_GROUPS = Object.freeze([
         { id: 'sampling', title: 'Sampling', openByDefault: true },
         { id: 'sensors', title: 'Sensor Enables', openByDefault: true },
-        /* Beside the sensor enables, where the microphone is looked for, and open:
-           a mode that keeps raw audio records speech. A group of its own rather than
-           an enable, because it records only while logging to SD, into audio/, and
-           never into the stream or the data file. Present only on firmware that
-           records audio (`InfoMemContext.audio`). */
-        { id: 'audio', title: 'Audio Recording', openByDefault: true },
         { id: 'lnAccel', title: 'Low-Noise Accelerometer' },
         { id: 'wrAccel', title: 'Wide-Range Accelerometer' },
         { id: 'gyro', title: 'Gyroscope' },
@@ -16753,7 +16756,12 @@
         // ---- Audio recording: configuration byte 233 (DEV-99). Shimmer3R only, and
         // present only where the firmware has the byte, which the layout decides
         // (`idxAudioMode`). Bit 7 set - erased memory, or older firmware - or a
-        // reserved gain preset makes the whole byte read as 0, off.
+        // reserved gain preset makes the whole byte read as 0, off. In Sensor
+        // Enables, with what is recorded, where the microphone is looked for: it is
+        // never sampled into the stream or the data file, but recorded beside it
+        // while logging, as the event markers are. The four modes are every
+        // combination of the fingerprint and raw audio, so a host can offer them as
+        // two enables (`joinAudioMode`).
         {
             key: 'audioMode',
             label: 'Audio Recording',
@@ -16767,7 +16775,7 @@
             width: 2,
             zeroWhenAnySet: AUDIO_MODE_BYTE.INVALID | AUDIO_MODE_BYTE.GAIN_MASK,
             options: AUDIO_MODE_OPTIONS,
-            group: 'audio',
+            group: 'sensors',
             appliesTo: S3R_ONLY,
             configKey: 'audioMode',
         },
@@ -39306,6 +39314,7 @@
     exports.isVerisenseLipoBatteryHardware = isVerisenseLipoBatteryHardware;
     exports.isVerisensePpgLedTestError = isVerisensePpgLedTestError;
     exports.isVerisenseSecondGenerationHardware = isVerisenseSecondGenerationHardware;
+    exports.joinAudioMode = joinAudioMode;
     exports.joinButtonMode = joinButtonMode;
     exports.keepsLinkCrcWhenSensingStops = keepsLinkCrcWhenSensingStops;
     exports.localCivilUnixSecondsNow = localCivilUnixSecondsNow;
