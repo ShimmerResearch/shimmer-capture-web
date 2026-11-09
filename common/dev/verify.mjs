@@ -398,7 +398,7 @@ check(
 );
 check(
   "form + sensor grid + hex view built",
-  ident.fields === 40 &&
+  ident.fields === 39 &&
     ident.sensorBoxes === 17 &&
     ident.checked === 3 &&
     ident.hexRows === 24,
@@ -1231,7 +1231,7 @@ check(
     un.mac === "000666668091" &&
     un.imPill === "384 bytes read" &&
     un.rate === "102.4 Hz" &&
-    un.fields === 40,
+    un.fields === 39,
   JSON.stringify(un),
 );
 
@@ -1829,7 +1829,7 @@ check(
      what the BLE cap assertions below prove — an unidentified sensor keeps the
      shorter Shimmer3 cap, which is safe on either platform. */
   brandUnknown.idHw === "GSR+ (SR48-3-0)" &&
-    brandUnknown.fields === 40 &&
+    brandUnknown.fields === 39 &&
     brandUnknown.contextHw === 8 &&
     brandUnknown.maxAttr === 8 &&
     brandUnknown.derived === "AcmeWris" &&
@@ -6088,32 +6088,97 @@ check(
 // The event channel and configuration byte 232 (DEV-971), on a mock whose
 // firmware has them (`&events=1`). No release has them, so the page asks the
 // sensor with a SET_FEATURE opt-out; every other section runs a mock that
-// NACKs it, which is why their field count stays at 40.
+// NACKs it, which is why their field count stays at 39.
+//
+// Press recording and the TTL input are event markers in Sensor Enables; how
+// a log starts is SD Logging's Start-up. The TCXO is not offered.
 // ===========================================================================
 console.log("\n--- event channel (byte 232, button and TTL records) ---");
+const LAYOUT = `
+  const vis = (el) => !!el && el.offsetParent !== null;
+  const fieldsIn = (id) => [...document.querySelectorAll('[data-subgroup-id="' + id + '"] .field:not(.page-owned)')]
+    .map(f => f.querySelector('label, .field-editor-label')?.textContent.trim());
+  const groups = [...document.querySelectorAll('#configForm details')]
+    .filter(d => !d.hidden).map(d => d.querySelector(':scope > summary')?.textContent.trim());
+`;
+await goto(`${BASE}?mock=1`);
+await evaluate(CONNECT);
+const evtNone = await evaluate(
+  LAYOUT +
+    `
+  document.querySelector('.tabs [data-tab="tabConfig"]').click();
+  await new Promise(r => setTimeout(r, 200));
+  return { groups, startup: fieldsIn('sdLogging.startup'), duration: fieldsIn('sdLogging.duration'),
+    tile: !!document.getElementById('eventMarkerGroup'), select: !!document.getElementById('buttonLogging'),
+    tcxo: !!document.querySelector('.field[data-field-key="tcxo"]') };
+`,
+);
+check(
+  "SD Logging's Start-up and Duration hold their fields, the TCXO is not offered, and without the event channel there are no markers",
+  !evtNone.groups.includes("Button and Event Channel") &&
+    evtNone.startup.join("|") ===
+      "Start Logging On Button Press|Single-Touch Start" &&
+    evtNone.duration.join("|") ===
+      "Estimated Experiment Length (seconds)|Maximum Experiment Length, auto-stop (minutes)" &&
+    !evtNone.tcxo &&
+    !evtNone.tile &&
+    !evtNone.select,
+  `start-up ${evtNone.startup.join(", ")} | duration ${evtNone.duration.join(", ")}`,
+);
+
 await goto(`${BASE}?mock=1&events=1`);
 check(
   "connect to a sensor whose firmware has the event channel",
   (await evaluate(CONNECT)) === "mock",
 );
-const evtUp = await evaluate(`
+const evtUp = await evaluate(
+  LAYOUT +
+    `
   for (let i = 0; i < 40 && !window.mockTransport.events.optedIn; i++)
     await new Promise(r => setTimeout(r, 50));
   await new Promise(r => setTimeout(r, 200));
   const keys = [...document.querySelectorAll('.field[data-field-key]')].map(n => n.dataset.fieldKey);
+  const disabled = (k) => document.querySelector('.field[data-field-key="' + k + '"] select, .field[data-field-key="' + k + '"] input')?.disabled;
   return {
-    fields: document.querySelectorAll('#configForm .field').length,
+    fields: document.querySelectorAll('#configForm .field[data-field-key]').length,
     has: ['buttonMode', 'logTriggers', 'ttlInput'].every(k => keys.includes(k)),
+    pageOwned: ['buttonMode', 'ttlInput'].map(k => getComputedStyle(document.querySelector('.field[data-field-key="' + k + '"]')).display),
+    tile: document.getElementById('eventMarkerGroup')?.querySelector('h3').textContent,
+    markers: [...document.querySelectorAll('#eventMarkerGroup label')].map(l => l.textContent.trim()),
+    startup: fieldsIn('sdLogging.startup'),
+    groups,
+    logging: document.getElementById('buttonLogging')?.value,
+    options: [...(document.getElementById('buttonLogging')?.options ?? [])].map(o => o.textContent),
+    triggersOff: disabled('logTriggers'),
+    buttonStartOff: disabled('buttonStart'),
     support: document.querySelector('#eventCard .muted').textContent,
     optedIn: window.mockTransport.events.optedIn,
     rows: [...document.querySelectorAll('#eventTable tbody tr')].map(r => r.cells[1].textContent),
     summary: document.getElementById('eventChannelSummary')?.textContent ?? null,
   };
-`);
+`,
+);
 check(
   "the form gains byte 232's three fields, and only then",
-  evtUp.has && evtUp.fields === 43,
+  evtUp.has && evtUp.fields === 41,
   `${evtUp.fields} fields`,
+);
+check(
+  "button presses and the TTL input are event markers in Sensor Enables, and how a log starts is in Start-up",
+  evtUp.tile === "Event markers" &&
+    evtUp.markers.join("|") === "Button presses|TTL input" &&
+    evtUp.pageOwned.every((d) => d === "none") &&
+    !evtUp.groups.includes("Button and Event Channel") &&
+    evtUp.startup.join("|") ===
+      "Button Starts and Stops Logging|Start Logging On Button Press|Single-Touch Start|What Else Starts Logging" &&
+    evtUp.options.length === 4 &&
+    evtUp.logging === "asBefore",
+  `${evtUp.markers.join(", ")} | start-up ${evtUp.startup.join(", ")}`,
+);
+check(
+  "as before, What Else Starts Logging is greyed out, as the sensor does not read it",
+  evtUp.triggersOff === true && evtUp.buttonStartOff === false,
+  `triggers disabled ${evtUp.triggersOff}, Start Logging On Button Press disabled ${evtUp.buttonStartOff}`,
 );
 check(
   "the page opts in, and the inputs' state at the opt-in arrives",
@@ -6125,16 +6190,17 @@ check(
 );
 check(
   "a 0xFF or 0 byte is summarised as Start Logging On Button Press deciding",
-  /Button Mode 0 leaves this to Start Logging On Button Press/.test(
+  /As before leaves this to Start Logging On Button Press/.test(
     evtUp.summary ?? "",
   ),
   evtUp.summary,
 );
 
 // An older host can leave single touch (byte 218 bit 7) set. LogAndStream is
-// built without it and clears it, so it must not stop the undock start.
+// built without it and clears it, so it must not stop the undock start. The
+// TCXO (bit 4) is set too: no build supports it, and Apply clears it below.
 const evtSingle = await evaluate(`
-  await window.mockClient.writeInfoMem(218, new Uint8Array([0x80]));
+  await window.mockClient.writeInfoMem(218, new Uint8Array([0x90]));
   document.getElementById('btnRead').click();
   const node = document.getElementById('eventChannelSummary');
   for (let i = 0; i < 60 && !/Single-Touch/.test(node.textContent); i++)
@@ -6149,19 +6215,45 @@ check(
 );
 
 const evtEdit = await evaluate(`
-  const set = (key, v) => {
-    const s = document.querySelector('.field[data-field-key="' + key + '"] select');
-    s.value = String(v);
-    s.dispatchEvent(new Event('change', { bubbles: true }));
+  const wait = () => new Promise(r => setTimeout(r, 100));
+  const select = document.getElementById('buttonLogging');
+  const choose = (s, v) => { s.value = String(v); s.dispatchEvent(new Event('change', { bubbles: true })); };
+  const disabled = (k) => document.querySelector('.field[data-field-key="' + k + '"] select, .field[data-field-key="' + k + '"] input')?.disabled;
+  document.getElementById('markerButton').click();
+  await wait();
+  const ticked = {
+    logging: select.value,
+    disabled: [...select.options].filter(o => o.disabled).map(o => o.value),
+    options: select.options.length,
+    note: document.getElementById('buttonLoggingNote').textContent,
+    moved: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+      .filter(l => /Button presses recorded/.test(l)).length,
+    triggersOff: disabled('logTriggers'),
+    buttonStartOff: disabled('buttonStart'),
   };
-  set('buttonMode', 4);
-  set('ttlInput', 1);
-  await new Promise(r => setTimeout(r, 100));
+  choose(select, 'doublePress');
+  await wait();
+  choose(document.querySelector('.field[data-field-key="logTriggers"] select'), 0);
+  await wait();
+  document.getElementById('markerTtl').click();
+  await wait();
   return {
+    ticked,
     summary: document.getElementById('eventChannelSummary').textContent,
     config: document.querySelector('#eventCard .field-hint').textContent,
   };
 `);
+check(
+  "ticking Button presses moves the button off As before, and marks As before and Single press disabled rather than removing them",
+  evtEdit.ticked.logging === "none" &&
+    evtEdit.ticked.disabled.join("|") === "asBefore|singlePress" &&
+    evtEdit.ticked.options === 4 &&
+    /a single press cannot start or stop logging/.test(evtEdit.ticked.note) &&
+    evtEdit.ticked.moved === 1 &&
+    evtEdit.ticked.triggersOff === false &&
+    evtEdit.ticked.buttonStartOff === true,
+  JSON.stringify(evtEdit.ticked).slice(0, 200),
+);
 check(
   "markers with a double press and TTL are spelled out, Start Logging On Button Press included",
   /A double press starts and stops logging/.test(evtEdit.summary) &&
@@ -6181,13 +6273,15 @@ const evtApply = await evaluate(`
     await new Promise(r => setTimeout(r, 100));
   await new Promise(r => setTimeout(r, 300));
   const im = await window.mockClient.readInfoMemBytes();
-  return { b232: im[232], b217: im[217], b218: im[218], summary: document.getElementById('eventChannelSummary').textContent };
+  return { b232: im[232], b217: im[217], b218: im[218], summary: document.getElementById('eventChannelSummary').textContent,
+    tcxoLogged: [...document.querySelectorAll('#log .log-line')].some(l => /TCXO: cleared/.test(l.textContent)) };
 `);
 check(
-  "Apply writes 0x24, holds Start Logging On Button Press on and clears single touch, as the firmware would",
+  "Apply writes 0x24, holds Start Logging On Button Press on and clears single touch and the TCXO, as the firmware would",
   evtApply.b232 === 0x24 &&
     (evtApply.b217 & 0x20) === 0x20 &&
-    (evtApply.b218 & 0x80) === 0,
+    (evtApply.b218 & 0x90) === 0 &&
+    evtApply.tcxoLogged,
   `byte 232 0x${evtApply.b232?.toString(16)}, byte 217 0x${evtApply.b217?.toString(16)}, byte 218 0x${evtApply.b218?.toString(16)}`,
 );
 
@@ -6417,6 +6511,24 @@ check(
     evtSdAll.card.length === 0 &&
     evtSdAll.dirs.join() === "data,events",
   `${evtSdAll.got.join(" | ")} | card dirs ${evtSdAll.dirs.join(", ")}`,
+);
+
+await goto(`${BASE}?mock=1&events=1&srBoard=48-6-0`);
+await evaluate(CONNECT);
+const evtBoard = await evaluate(`
+  await new Promise(r => setTimeout(r, 300));
+  return {
+    press: document.getElementById('markerButton')?.disabled,
+    ttl: document.getElementById('markerTtl')?.disabled,
+    why: document.getElementById('markerTtlLabel')?.title,
+  };
+`);
+check(
+  "on an SR48-6-0 board both event markers are shown, disabled",
+  evtBoard.press === true &&
+    evtBoard.ttl === true &&
+    /no TTL input/.test(evtBoard.why ?? ""),
+  JSON.stringify(evtBoard),
 );
 
 // ===========================================================================
