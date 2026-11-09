@@ -6606,7 +6606,11 @@ const audUp = await evaluate(
     support: document.querySelector('#audioCard .muted').textContent,
     flags: document.getElementById('statusFlags').textContent,
     summary: document.getElementById('audioSummary')?.textContent ?? null,
-    options: [...document.querySelectorAll('.field[data-field-key="audioMode"] option')].map(o => o.textContent),
+    tile: document.querySelector('#microphoneGroup h3')?.textContent ?? null,
+    boxes: [...document.querySelectorAll('#microphoneGroup label')].map(l => l.textContent.trim()),
+    inSensors: !!document.querySelector('[data-group-body="sensors"] #microphoneGroup'),
+    audioGroup: [...document.querySelectorAll('#configForm details > summary')].some(s => s.textContent.trim() === 'Audio Recording'),
+    fieldShown: getComputedStyle(document.querySelector('.field[data-field-key="audioMode"]')).display !== 'none',
   };
 `,
 );
@@ -6622,17 +6626,29 @@ check(
 check(
   "the status flags include the recorder's, and the summary says it records nothing",
   /Recording audio/.test(audUp.flags) &&
-    audUp.summary === "The sensor records no audio." &&
-    audUp.options.length === 4 &&
-    audUp.options.filter((o) => /records speech/.test(o)).length === 2,
+    audUp.summary === "The sensor records no audio.",
   `${audUp.flags} | ${audUp.summary}`,
 );
+check(
+  "byte 233 is a Microphone tile in Sensor Enables, its two boxes the four modes, with no group of its own",
+  audUp.tile === "Microphone" &&
+    audUp.inSensors &&
+    audUp.boxes.join("|") ===
+      "Audio fingerprint (no sound stored)|Raw audio (records speech)" &&
+    !audUp.audioGroup &&
+    !audUp.fieldShown,
+  `${audUp.tile} | ${audUp.boxes.join(", ")} | group ${audUp.audioGroup}`,
+);
 
+/* Byte 233 through the Microphone tile: mode 1 is the fingerprint, 2 both,
+   3 raw audio, 0 neither. */
 const SET_AUDIO = (v) => `
   {
-    const s = document.querySelector('.field[data-field-key="audioMode"] select');
-    s.value = '${v}';
-    s.dispatchEvent(new Event('change', { bubbles: true }));
+    const want = { micFingerprint: ${v} === 1 || ${v} === 2, micRaw: ${v} === 2 || ${v} === 3 };
+    for (const [id, on] of Object.entries(want)) {
+      const box = document.getElementById(id);
+      if (box.checked !== on) box.click();
+    }
   }
   await new Promise(r => setTimeout(r, 100));
 `;
@@ -6699,7 +6715,8 @@ const audFingerprint = await evaluate(
   const im = await window.mockClient.readInfoMemBytes();
   return { asked: window.__asked.length, speech: window.__asked.filter(m => /stores raw audio/.test(m)).length,
     b233: im[233], summary: document.getElementById('audioSummary').textContent,
-    config: document.getElementById('audioConfigLine').textContent };
+    config: document.getElementById('audioConfigLine').textContent,
+    boxes: [document.getElementById('micFingerprint').checked, document.getElementById('micRaw').checked] };
 `,
 );
 check(
@@ -6710,7 +6727,8 @@ check(
     /fingerprint \(\.AFP: landmark hashes, no sound\)/.test(
       audFingerprint.summary,
     ) &&
-    /records the audio fingerprint only/.test(audFingerprint.config),
+    /records the audio fingerprint only/.test(audFingerprint.config) &&
+    audFingerprint.boxes.join() === "true,false",
   `byte 233 0x${audFingerprint.b233?.toString(16)} | ${audFingerprint.asked} prompt(s), ${audFingerprint.speech} about speech | ${audFingerprint.summary}`,
 );
 

@@ -519,13 +519,14 @@ sensor, once per connection.
 
 Where it does, four things change:
 
-- **Configure** gains an **Audio Recording** group, directly under Sensor
-  Enables and open, configuration byte 233:
-  off, the fingerprint only, the fingerprint and raw audio, or raw audio only.
-  The group says what the chosen mode keeps. A mode that keeps raw audio
-  records speech, so **Apply asks for that on its own** before the usual
-  prompt, and writes nothing if you decline. It does not ask again for the mode
-  the sensor already has.
+- **Configure → Sensor Enables** gains a **Microphone** tile, configuration
+  byte 233: **Audio fingerprint** (landmark hashes, no sound stored) and **Raw
+  audio** (records speech). Every combination of the two is one of the
+  firmware's four modes. The tile says what the chosen combination keeps, and
+  that it is recorded only while logging to SD, into `audio/`, never into the
+  stream or the data file. Raw audio records speech, so **Apply asks for that
+  on its own** before the usual prompt, and writes nothing if you decline. It
+  does not ask again for the mode the sensor already has.
 - **General** gains an **Audio recording** card: what the configuration
   records, whether the sensor is recording now, and **Read audio status**, the
   recorder's own account: its state, the session's first fault, seconds

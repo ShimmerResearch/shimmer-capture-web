@@ -2698,6 +2698,55 @@
             ),
           );
         }
+        /* Byte 233 (DEV-99): what the microphone keeps, as two enables. The
+                 four modes are every combination of the fingerprint and raw
+                 audio (`joinAudioMode`). Recorded only while logging to SD, into
+                 audio/, never sampled into the stream or the data file. Only on
+                 Shimmer3R firmware that records audio. */
+        if (layout?.idxAudioMode !== undefined) {
+          grid.appendChild(
+            el(
+              "div",
+              {
+                class: "sensor-group",
+                id: "microphoneGroup",
+                title:
+                  "Configuration byte 233. The fingerprint keeps landmark hashes in an .AFP " +
+                  "file, which store no sound. Raw audio keeps the 16 kHz audio in a .WAV " +
+                  "file, which records speech: Apply asks you to confirm, and everyone near " +
+                  "the sensor needs to know it is recording.",
+              },
+              el("h3", {}, "Microphone"),
+              el(
+                "label",
+                {},
+                el("input", {
+                  type: "checkbox",
+                  id: "micFingerprint",
+                  onchange: onMicToggle,
+                }),
+                "Audio fingerprint (no sound stored)",
+              ),
+              el(
+                "label",
+                {},
+                el("input", {
+                  type: "checkbox",
+                  id: "micRaw",
+                  onchange: onMicToggle,
+                }),
+                "Raw audio (records speech)",
+              ),
+              el("div", {
+                class: "field-hint muted",
+                text:
+                  "Recorded only while logging to SD, into audio/ beside each data file. " +
+                  "Not streamed, and not in the data file.",
+              }),
+              el("div", { class: "field-hint", id: "audioSummary" }),
+            ),
+          );
+        }
         /* Byte 232's two recorded inputs, as enables beside the sensors
                  (DEV-971). They are events, not samples: time-stamped records
                  beside the data file, in events/, and sent to this page while
@@ -2739,6 +2788,24 @@
           );
         }
         return grid;
+      }
+
+      /**
+       * A Microphone box moved: byte 233's mode is the two boxes together
+       * (`joinAudioMode`). Written through the schema's Audio Recording field,
+       * which stays in the form, hidden, so it is listed as a change and
+       * Apply still asks before turning raw audio on.
+       */
+      function onMicToggle() {
+        const field = fields.find((f) => f.key === "audioMode");
+        if (!field || !form || !layout) return;
+        const mode = sdk.joinAudioMode({
+          fingerprint: $("micFingerprint").checked,
+          raw: $("micRaw").checked,
+        });
+        sdk.writeInfoMemFieldValue(form.getImage(), field, layout, mode);
+        form.refresh();
+        afterImageEdit();
       }
 
       /**
@@ -3247,15 +3314,13 @@
           );
         }
 
-        /* Byte 233 (DEV-99): what the chosen mode keeps, and that raw audio
-                 records speech, said where the mode is picked. */
-        const audioBody = host.querySelector('[data-group-body="audio"]');
-        if (audioBody) {
-          audioBody.insertBefore(
-            el("div", { class: "field-hint", id: "audioSummary" }),
-            audioBody.firstChild,
-          );
-        }
+        /* Byte 233 (DEV-99) is the Microphone tile in Sensor Enables, which
+                 says what the chosen mode keeps and that raw audio records speech.
+                 The schema's Audio Recording field stays in the form, hidden,
+                 because the page draws its control. */
+        host
+          .querySelector('.field[data-field-key="audioMode"]')
+          ?.classList.add("page-owned");
 
         /* The two ExG register banks are opaque 10-byte runs, and the ExG
                  preset above is what installs a known-good one. They stay editable
@@ -3364,6 +3429,11 @@
           return;
         }
         audioPanel.setConfig(image[at]);
+        const fingerprint = $("micFingerprint");
+        const raw = $("micRaw");
+        if (fingerprint)
+          fingerprint.checked = sdk.recordsAudioFingerprint(image[at]);
+        if (raw) raw.checked = sdk.recordsRawAudio(image[at]);
         if (!node) return;
         const mode = sdk.audioModeOf(image[at]);
         const said = [];
@@ -3420,7 +3490,8 @@
         if (at === undefined || !form) return true;
         const mode = sdk.audioModeOf(form.getImage()[at]);
         if (!sdk.audioModeRecordsSpeech(mode)) return true;
-        if (deviceImage && sdk.audioModeOf(deviceImage[at]) === mode) return true;
+        if (deviceImage && sdk.audioModeOf(deviceImage[at]) === mode)
+          return true;
         return window.confirm(
           `Audio Recording "${sdk.describeAudioMode(mode)}" stores raw audio, which records speech.\n\n` +
             "Every time this sensor logs to SD it will record the sound around it into audio/ on its card. " +
