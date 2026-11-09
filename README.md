@@ -137,7 +137,9 @@ low-power and high-resolution mode, GSR range, expansion-board power, the
 pressure sensor's oversampling, the Bluetooth baud rate, the SD-logging
 start-up and duration settings, the trial and experiment identifiers, the
 multi-sensor sync settings and the stored calibration blocks. Every control
-carries the byte and bit it lives in, on hover.
+carries the byte and bit it lives in, on hover. The TCXO setting is not
+offered: no firmware supports it, and the sensor clears it, so Apply clears it
+too.
 
 The **Calibration** group in that form is the six 21-byte kinematic blocks the
 image holds, and they are laid out the way the Calibration tab lays out the
@@ -462,15 +464,27 @@ opt-out that only such firmware acknowledges).
 
 Where it does, three things change:
 
-- **Configure** gains a **Button and Event Channel** group, configuration byte
-  232: what the button does (as before, disabled, a press or a double press
-  starts and stops logging, with or without every press recorded), what else
-  may start logging (a host command, an undock, or nothing) and whether the
-  TTL input is recorded. The group opens with what the sensor will do, in
-  words, worked out by the firmware's own rules. Apply makes the checks the
-  firmware makes on the byte - including holding **Start Logging On Button
-  Press** at the mode's nearest equivalent - so what is written is what reads
-  back.
+- **Configure** shows configuration byte 232 in two places.
+  - **Sensor Enables** gains an **Event markers** tile: **Button presses**
+    and **TTL input**. They are recorded as time-stamped events beside the
+    data file, not sampled, so they add no columns and do not change the rate.
+    On an SR48-6-0 board both are disabled: its button is used for dock
+    detection and it has no TTL input.
+  - **SD Logging → Start-up** holds how a log starts: **Button Starts and
+    Stops Logging** (as before, no, a single press or a double press), **Start
+    Logging On Button Press** and **What Else Starts Logging** (a host command,
+    an undock, or nothing). It opens with what the sensor will do, in words,
+    worked out by the firmware's own rules.
+  - **The two depend on each other.** With **Button presses** recorded, a
+    single press cannot start or stop logging, so that a marker can never stop
+    a recording, and as before has no setting that records. Those two choices
+    stay in the list, disabled. Ticking **Button presses** moves the button to
+    the nearest choice that can go with it and says so in the log.
+  - **A setting the sensor does not read is greyed out:** What Else Starts
+    Logging while the button is as before, and Start Logging On Button Press
+    while it is not, since the sensor then holds it at the nearest equivalent.
+  - Apply makes the checks the firmware makes on the byte, so what is written
+    is what reads back.
 - **Stream & record** gains a **Button and TTL events** card. The page opts in
   for the connection, so records arrive whether or not the sensor is streaming
   or logging: the inputs' state at the opt-in first, then every edge. Each is
@@ -505,7 +519,8 @@ sensor, once per connection.
 
 Where it does, four things change:
 
-- **Configure** gains an **Audio Recording** group, configuration byte 233:
+- **Configure** gains an **Audio Recording** group, directly under Sensor
+  Enables and open, configuration byte 233:
   off, the fingerprint only, the fingerprint and raw audio, or raw audio only.
   The group says what the chosen mode keeps. A mode that keeps raw audio
   records speech, so **Apply asks for that on its own** before the usual

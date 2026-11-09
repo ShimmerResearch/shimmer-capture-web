@@ -15029,6 +15029,38 @@ function writeName(out, offset, name) {
 }
 
 /**
+ * The TCXO setting, ExperimentConfig1 bit 4 (InfoMem byte 218, FW `tcxo`).
+ *
+ * It asked the firmware to clock sampling from a temperature-compensated
+ * crystal oscillator. No LogAndStream build supports one: the firmware clears
+ * the bit when it takes a configuration (log-and-stream-common
+ * `Configuration/shimmer_config.c`, `ShimConfig_checkAndCorrectConfig`, under
+ * `#if !IS_SUPPORTED_TCXO`, which holds on Shimmer3, where `main.c` defines it
+ * as 0, and on Shimmer3R, which does not define it). So the field schema does
+ * not offer it, and a host clears it before a write, which writes what the
+ * sensor will read back.
+ *
+ * HARDWARE-VERIFY: from the firmware source; no unit with the bit set has been
+ * configured through this SDK.
+ */
+/**
+ * Clear the TCXO bit in `image`, as the firmware does when it takes the
+ * configuration. Only on LogAndStream and SDLog layouts, where byte 218 holds
+ * the experiment configuration. Returns the indices of the bytes it changed:
+ * empty, or the one byte.
+ */
+function applyTcxoRule(image, layout) {
+    if (!layout.isSdLoggingFirmware)
+        return [];
+    const at = layout.idxSDExperimentConfig1;
+    const bit = 1 << BIT_SHIFT.TCXO;
+    if (!(image[at] & bit))
+        return [];
+    image[at] = image[at] & ~bit & 0xff;
+    return [at];
+}
+
+/**
  * Configuration byte 232 (`NV_BUTTON_LOG_MODE`) on a Shimmer3 or Shimmer3R:
  * what the user button does, what else may start SD logging, and whether the
  * TTL input is recorded.
@@ -15224,6 +15256,102 @@ function withoutPressRecording(raw) {
         default:
             return fixed;
     }
+}
+/**
+ * What a press does to logging: the other half of bits 0-2, beside whether
+ * presses are recorded. A host that offers press recording as an event-marker
+ * enable, beside the sensor enables, offers this as a setting of its own.
+ */
+const BUTTON_LOGGING = Object.freeze({
+    /** `userButtonEnable` decides, as before the byte existed (mode 0). */
+    AS_BEFORE: 'asBefore',
+    /** A press never starts or stops logging (modes 1 and 5). */
+    NONE: 'none',
+    /** A press starts and stops logging (mode 2). */
+    SINGLE_PRESS: 'singlePress',
+    /** A double press starts and stops logging (modes 3 and 4). */
+    DOUBLE_PRESS: 'doublePress',
+});
+/** `[value, label]` pairs for a "button starts and stops logging" selector. */
+const BUTTON_LOGGING_OPTIONS = Object.freeze([
+    [BUTTON_LOGGING.AS_BEFORE, 'As before (Start Logging On Button Press decides)'],
+    [BUTTON_LOGGING.NONE, 'No'],
+    [BUTTON_LOGGING.SINGLE_PRESS, 'Single press'],
+    [BUTTON_LOGGING.DOUBLE_PRESS, 'Double press'],
+]);
+/** The two settings bits 0-2 hold, as the firmware reads them (corrected first). */
+function splitButtonMode(raw) {
+    switch (buttonModeOf(raw)) {
+        case BUTTON_MODE.DISABLED:
+            return { recordsPresses: false, logging: BUTTON_LOGGING.NONE };
+        case BUTTON_MODE.SINGLE_PRESS:
+            return { recordsPresses: false, logging: BUTTON_LOGGING.SINGLE_PRESS };
+        case BUTTON_MODE.DOUBLE_PRESS:
+            return { recordsPresses: false, logging: BUTTON_LOGGING.DOUBLE_PRESS };
+        case BUTTON_MODE.DOUBLE_RECORDED:
+            return { recordsPresses: true, logging: BUTTON_LOGGING.DOUBLE_PRESS };
+        case BUTTON_MODE.RECORDED:
+            return { recordsPresses: true, logging: BUTTON_LOGGING.NONE };
+        default:
+            return { recordsPresses: false, logging: BUTTON_LOGGING.AS_BEFORE };
+    }
+}
+/**
+ * Whether presses can be recorded while the button does `logging`. Not where a
+ * single press starts and stops logging, because a marker press must never
+ * stop a recording, and not as before, where byte 217 decides what a press
+ * does and there is no mode that records.
+ */
+function canRecordPressesWith(logging) {
+    return logging === BUTTON_LOGGING.NONE || logging === BUTTON_LOGGING.DOUBLE_PRESS;
+}
+/** The button mode for the two settings, or null where they cannot go together. */
+function joinButtonMode(parts) {
+    if (parts.recordsPresses) {
+        if (parts.logging === BUTTON_LOGGING.DOUBLE_PRESS)
+            return BUTTON_MODE.DOUBLE_RECORDED;
+        if (parts.logging === BUTTON_LOGGING.NONE)
+            return BUTTON_MODE.RECORDED;
+        return null;
+    }
+    switch (parts.logging) {
+        case BUTTON_LOGGING.NONE:
+            return BUTTON_MODE.DISABLED;
+        case BUTTON_LOGGING.SINGLE_PRESS:
+            return BUTTON_MODE.SINGLE_PRESS;
+        case BUTTON_LOGGING.DOUBLE_PRESS:
+            return BUTTON_MODE.DOUBLE_PRESS;
+        default:
+            return BUTTON_MODE.LEGACY;
+    }
+}
+/**
+ * The corrected byte with press recording turned on, the button's part in
+ * logging moved to the nearest that can go with it: a single press becomes a
+ * double press. As before becomes a double press, starting logging on a host
+ * command, where `userButtonEnable` let a press start logging, and otherwise no
+ * press, with leaving the dock still starting logging, as before. The TTL input,
+ * and the log triggers of a byte that was not as before, stand. The inverse of
+ * {@link withoutPressRecording}.
+ */
+function withPressRecording(raw, userButtonEnable) {
+    const fixed = correctButtonLogMode(raw);
+    const ttlInput = (fixed & BUTTON_LOG_MODE.TTL_INPUT) !== 0;
+    let logTriggers = logTriggersOf(fixed);
+    let buttonMode;
+    switch (splitButtonMode(fixed).logging) {
+        case BUTTON_LOGGING.NONE:
+            buttonMode = BUTTON_MODE.RECORDED;
+            break;
+        case BUTTON_LOGGING.SINGLE_PRESS:
+        case BUTTON_LOGGING.DOUBLE_PRESS:
+            buttonMode = BUTTON_MODE.DOUBLE_RECORDED;
+            break;
+        default:
+            buttonMode = userButtonEnable ? BUTTON_MODE.DOUBLE_RECORDED : BUTTON_MODE.RECORDED;
+            logTriggers = userButtonEnable ? LOG_TRIGGERS.HOST : LOG_TRIGGERS.HOST_UNDOCK;
+    }
+    return encodeButtonLogMode({ buttonMode, logTriggers, ttlInput });
 }
 /** The settings a byte holds, as the firmware reads them (corrected first). */
 function decodeButtonLogMode(raw) {
@@ -16096,6 +16224,12 @@ const ON_OFF = [
 const SHIMMER3_INFOMEM_FIELD_GROUPS = Object.freeze([
     { id: 'sampling', title: 'Sampling', openByDefault: true },
     { id: 'sensors', title: 'Sensor Enables', openByDefault: true },
+    /* Beside the sensor enables, where the microphone is looked for, and open:
+       a mode that keeps raw audio records speech. A group of its own rather than
+       an enable, because it records only while logging to SD, into audio/, and
+       never into the stream or the data file. Present only on firmware that
+       records audio (`InfoMemContext.audio`). */
+    { id: 'audio', title: 'Audio Recording', openByDefault: true },
     { id: 'lnAccel', title: 'Low-Noise Accelerometer' },
     { id: 'wrAccel', title: 'Wide-Range Accelerometer' },
     { id: 'gyro', title: 'Gyroscope' },
@@ -16109,18 +16243,13 @@ const SHIMMER3_INFOMEM_FIELD_GROUPS = Object.freeze([
     {
         id: 'sdLogging',
         title: 'SD Logging',
+        /* Start-up holds how a log starts: the button and byte 232's other
+           triggers. Duration holds how long it runs. Byte 232's TTL input is in
+           Sensor Enables, with what gets recorded. */
         subgroups: [
             { id: 'sdLogging.startup', title: 'Start-up' },
             { id: 'sdLogging.duration', title: 'Duration' },
         ],
-    },
-    {
-        id: 'eventChannel',
-        title: 'Button and Event Channel',
-    },
-    {
-        id: 'audio',
-        title: 'Audio Recording',
     },
     { id: 'trial', title: 'Trial / Experiment' },
     {
@@ -16509,7 +16638,9 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         appliesTo: ALL,
         configKey: 'trial.disableBluetooth',
     },
-    // ---- SD logging
+    // ---- SD logging. Not the TCXO (ExperimentConfig1 bit 4): no LogAndStream
+    // build supports it and the firmware clears it (`applyTcxoRule`), so it is
+    // not offered at all.
     {
         key: 'buttonStart',
         label: 'Start Logging On Button Press',
@@ -16519,7 +16650,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         shift: 5,
         width: 1,
         options: ON_OFF,
-        group: 'sdLogging',
+        group: 'sdLogging.startup',
         appliesTo: ALL,
         configKey: 'trial.buttonStart',
     },
@@ -16532,26 +16663,11 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         shift: 7,
         width: 1,
         options: ON_OFF,
-        group: 'sdLogging',
+        group: 'sdLogging.startup',
         appliesTo: ALL,
         readOnly: true,
         readOnlyReason: 'Deprecated - no longer acted on by current firmware.',
         configKey: 'trial.singleTouch',
-    },
-    {
-        key: 'tcxo',
-        label: 'TCXO',
-        desc: 'Use the temperature-compensated crystal oscillator — ExperimentConfig1 bit 4 (bitShiftTCX0=4, FW tcxo).',
-        kind: 'bit',
-        layoutKey: 'idxSDExperimentConfig1',
-        shift: 4,
-        width: 1,
-        options: ON_OFF,
-        group: 'sdLogging',
-        appliesTo: ALL,
-        readOnly: true,
-        readOnlyReason: 'Deprecated - the TCXO is not fitted on current hardware.',
-        configKey: 'trial.tcxo',
     },
     {
         key: 'estimatedExpLength',
@@ -16561,7 +16677,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxEstimatedExpLengthMsb',
         min: 0,
         max: 0xffff,
-        group: 'sdLogging',
+        group: 'sdLogging.duration',
         appliesTo: ALL,
         configKey: 'sd.estimatedExpLengthSec',
     },
@@ -16573,14 +16689,17 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxMaxExpLengthMsb',
         min: 0,
         max: 0xffff,
-        group: 'sdLogging',
+        group: 'sdLogging.duration',
         appliesTo: ALL,
         configKey: 'sd.maxExpLengthMin',
     },
-    // ---- Button and event channel: configuration byte 232 (DEV-971). Present
-    // only where the firmware has the byte, which the layout decides
+    // ---- Button, logging and TTL input: configuration byte 232 (DEV-971).
+    // Present only where the firmware has the byte, which the layout decides
     // (`idxButtonLogMode`). Bit 7 set - erased memory, or older firmware - makes
-    // the whole byte read as 0, "as before".
+    // the whole byte read as 0, "as before". The button mode and the log triggers
+    // say how a log starts, so they are in SD Logging's Start-up; the TTL input
+    // says what is recorded, so it is in Sensor Enables. A host that shows press
+    // recording as an enable too splits the button mode with `splitButtonMode`.
     {
         key: 'buttonMode',
         label: 'Button Mode',
@@ -16593,7 +16712,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         width: 3,
         zeroWhenAnySet: BUTTON_LOG_MODE.INVALID,
         options: BUTTON_MODE_OPTIONS,
-        group: 'eventChannel',
+        group: 'sdLogging.startup',
         appliesTo: ALL,
         configKey: 'buttonLogMode',
     },
@@ -16608,7 +16727,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         width: 2,
         zeroWhenAnySet: BUTTON_LOG_MODE.INVALID,
         options: LOG_TRIGGER_OPTIONS,
-        group: 'eventChannel',
+        group: 'sdLogging.startup',
         appliesTo: ALL,
         configKey: 'buttonLogMode',
     },
@@ -16623,7 +16742,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         width: 1,
         zeroWhenAnySet: BUTTON_LOG_MODE.INVALID,
         options: ON_OFF,
-        group: 'eventChannel',
+        group: 'sensors',
         appliesTo: ALL,
         configKey: 'buttonLogMode',
     },
@@ -38631,6 +38750,8 @@ exports.BRAND_RECORD_SIZE = BRAND_RECORD_SIZE;
 exports.BRAND_USB_MANUFACTURER_MAX_CHARS = BRAND_USB_MANUFACTURER_MAX_CHARS;
 exports.BRAND_USB_PRODUCT_MAX_CHARS = BRAND_USB_PRODUCT_MAX_CHARS;
 exports.BT_FEATURE = BT_FEATURE;
+exports.BUTTON_LOGGING = BUTTON_LOGGING;
+exports.BUTTON_LOGGING_OPTIONS = BUTTON_LOGGING_OPTIONS;
 exports.BUTTON_LOG_MODE = BUTTON_LOG_MODE;
 exports.BUTTON_MODE = BUTTON_MODE;
 exports.BUTTON_MODE_OPTIONS = BUTTON_MODE_OPTIONS;
@@ -38961,6 +39082,7 @@ exports.applyExgMustBeBits = applyExgMustBeBits;
 exports.applyExgPreset = applyExgPreset;
 exports.applyImuCalibration = applyImuCalibration;
 exports.applySensorToggle = applySensorToggle;
+exports.applyTcxoRule = applyTcxoRule;
 exports.asmRtcBytesToUnixSeconds = asmRtcBytesToUnixSeconds;
 exports.asmRtcMinutesBytesToUnixSeconds = asmRtcMinutesBytesToUnixSeconds;
 exports.audioFingerprintRecordTicks = audioFingerprintRecordTicks;
@@ -39013,6 +39135,7 @@ exports.calibrateStreamFrame = calibrateStreamFrame;
 exports.calibrateU12AdcValue = calibrateU12AdcValue;
 exports.calibrateVector3 = calibrateVector3;
 exports.calibrationBlobCrc = calibrationBlobCrc;
+exports.canRecordPressesWith = canRecordPressesWith;
 exports.channelFormatsFor = channelFormatsFor;
 exports.channelIdToSensorBit = channelIdToSensorBit;
 exports.channelLayoutDiffersByGeneration = channelLayoutDiffersByGeneration;
@@ -39179,6 +39302,7 @@ exports.isVerisenseLightDarkChannelEnabled = isVerisenseLightDarkChannelEnabled;
 exports.isVerisenseLipoBatteryHardware = isVerisenseLipoBatteryHardware;
 exports.isVerisensePpgLedTestError = isVerisensePpgLedTestError;
 exports.isVerisenseSecondGenerationHardware = isVerisenseSecondGenerationHardware;
+exports.joinButtonMode = joinButtonMode;
 exports.keepsLinkCrcWhenSensingStops = keepsLinkCrcWhenSensingStops;
 exports.localCivilUnixSecondsNow = localCivilUnixSecondsNow;
 exports.logTriggersOf = logTriggersOf;
@@ -39304,6 +39428,7 @@ exports.shimmerUartCrcCalc = shimmerUartCrcCalc;
 exports.shimmerUartCrcCheck = shimmerUartCrcCheck;
 exports.shouldOverrideCalibration = shouldOverrideCalibration;
 exports.slipEncode = slipEncode;
+exports.splitButtonMode = splitButtonMode;
 exports.statusPayloadBytesFor = statusPayloadBytesFor;
 exports.summariseExgBanks = summariseExgBanks;
 exports.summariseExgCalibration = summariseExgCalibration;
@@ -39327,6 +39452,7 @@ exports.verisenseStreamCsvKey = verisenseStreamCsvKey;
 exports.verisenseStreamCsvLayout = verisenseStreamCsvLayout;
 exports.whenIf820OtaDeviceIdle = whenIf820OtaDeviceIdle;
 exports.wiredPacketLength = wiredPacketLength;
+exports.withPressRecording = withPressRecording;
 exports.withoutPressRecording = withoutPressRecording;
 exports.writeInfoMemFieldValue = writeInfoMemFieldValue;
 exports.writeVerisenseOperationalFieldValue = writeVerisenseOperationalFieldValue;
