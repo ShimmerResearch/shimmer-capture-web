@@ -17610,6 +17610,16 @@
      * complete packets before it (10) that fix the alignment, with room to spare.
      */
     const DATA_RATE_TAIL_BYTES = 24;
+    /**
+     * How long a re-framed link must stay quiet after a stop before the stream
+     * plane hands the link back to commands ({@link Shimmer3RClient} `_drainStreamTail`),
+     * and the longest the drain waits for that. The same values as the Shimmer3
+     * client's stop drain. On a bench Shimmer3R the last packet, the stop's ACK and
+     * the status push that closes a log all arrived within 150 ms of the stop.
+     */
+    const STOP_DRAIN_QUIET_MS = 300;
+    const STOP_DRAIN_MAX_MS = 3000;
+    const STOP_DRAIN_POLL_MS = 50;
     // ---------------------------------------------------------------------------
     // Stray-ACK tolerance
     // ---------------------------------------------------------------------------
@@ -17842,6 +17852,16 @@
             this._eventFramesPossible = false;
             /** Re-framing accumulator, used only while {@link _reframing}. */
             this._ctrlBuf = new Uint8Array(0);
+            /** Bumped once per inbound chunk, for {@link _drainStreamTail}'s quiet test. */
+            this._rxSeq = 0;
+            /** A stop's drain of the stream tail, while one runs; commands wait for it. */
+            this._streamTailDrain = null;
+            /**
+             * Set only for the last parse of a drained stream tail. The link has gone
+             * quiet, so a reply that ends the buffer ends the transmission, which is as
+             * good as the next packet's preamble for telling where it stops.
+             */
+            this._streamTailQuiet = false;
             /**
              * How many bytes a STATUS_RESPONSE payload carries: 2 on a Shimmer3R running
              * LogAndStream v1.00.024 or later, 1 on anything else
@@ -18033,6 +18053,7 @@
                 this._emitDisconnect(reason);
             };
             this._handleNotify = (chunk) => {
+                this._rxSeq++;
                 let bytes = chunk;
                 if (this._dataRateTestActive && bytes.length > 0) {
                     this._dataRateTestLastRxAt = Date.now();
@@ -21175,24 +21196,114 @@
          */
         async stopStreaming() {
             this._emitStatus('STOP_STREAM → sending (no ACK wait)…');
-            const link = this._linkGeneration;
-            try {
-                await this._writeOnLink(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]), link);
-                this._emitStatus('STOP_STREAM command sent (skipped ACK wait).');
-            }
-            catch (err) {
-                this._emitStatus(`STOP_STREAM write failed: ${err.message}`);
-            }
-            /* `_endStreamPlane`, not the two fields by hand. It also clears
-               `_streamAligned`, and leaving that set is not cosmetic: `_parseBySchema`
-               is gated on `schema`, NOT on `_streaming`, and a chunk starting with
-               DATA_PACKET is still appended to `_rxBuf` while not streaming. So frames
-               already in flight when the stop was sent get parsed with alignment still
-               claimed, skipping acquisition entirely and accepting whatever offset they
-               happen to land on. Not across a link reset, as in startStreaming. */
-            if (this._linkGeneration === link)
-                this._endStreamPlane();
+            await this._stopStreamPlane(OPCODES.STOP_STREAMING_COMMAND, (err) => {
+                if (err)
+                    this._emitStatus(`STOP_STREAM write failed: ${err.message}`);
+                else
+                    this._emitStatus('STOP_STREAM command sent (skipped ACK wait).');
+            });
             this._emitStatus('Streaming stopped.');
+        }
+        /**
+         * Write a stop, `op`, and end the stream plane: at once on a framed link, and
+         * on a re-framed one ({@link _reframing}: a byte stream, or any link with a
+         * CRC on) once the stream's tail has been drained ({@link _drainStreamTail}).
+         *
+         * On a re-framed link every other command waits from before the stop is
+         * written until the plane has ended ({@link _write}). Held only from after
+         * the write, a command sent alongside the stop could go out first and have
+         * its reply land among the last packets, where it is lost.
+         *
+         * `_endStreamPlane`, not the two fields by hand. It also clears
+         * `_streamAligned`, and leaving that set is not cosmetic: `_parseBySchema` is
+         * gated on `schema`, NOT on `_streaming`, and a chunk starting with
+         * DATA_PACKET is still appended to `_rxBuf` while not streaming. So frames
+         * already in flight when the stop was sent got parsed with alignment still
+         * claimed, skipping acquisition entirely and accepting whatever offset they
+         * happened to land on. Not across a link reset, as in startStreaming.
+         *
+         * @param written told once the write has settled: with its error, if it failed
+         */
+        async _stopStreamPlane(op, written) {
+            const link = this._linkGeneration;
+            let release = () => { };
+            const gate = this._streaming && this._reframing
+                ? new Promise((resolve) => {
+                    release = resolve;
+                })
+                : null;
+            if (gate)
+                this._streamTailDrain = gate;
+            try {
+                try {
+                    await this._writeOnLink(new Uint8Array([op]), link, true);
+                    written();
+                }
+                catch (err) {
+                    written(err);
+                }
+                if (this._linkGeneration !== link)
+                    return;
+                if (gate && this._streaming)
+                    await this._drainStreamTail(link);
+                else
+                    this._endStreamPlane();
+            }
+            finally {
+                release();
+                if (gate && this._streamTailDrain === gate)
+                    this._streamTailDrain = null;
+            }
+        }
+        /**
+         * Keep parsing what arrives after a stop as stream data until the link has
+         * been quiet for {@link STOP_DRAIN_QUIET_MS}, then end the stream plane.
+         *
+         * Packets go on arriving for a while after the stop, and with them the stop's
+         * ACK and the status push the firmware sends when the log closes. On a
+         * re-framed link, ending the plane at once handed that tail to the control
+         * framer, part-way through a packet. Its first byte is any sample byte, and
+         * one that reads as a reply opcode with a length field swallows everything
+         * behind it: on a bench Shimmer3R the tail began 0xC1, an SD directory
+         * listing 2,840 bytes long by its own header, so the push was lost and the
+         * next command timed out. The stream parser knows where the packets end, so
+         * it takes the tail instead, as the Shimmer3 client's stop already does.
+         *
+         * Once quiet, the tail is parsed one last time with {@link _streamTailQuiet}
+         * set, so a packet or reply that ends the transmission is taken without the
+         * next packet behind it. Whatever is left is discarded. Not across a link
+         * reset: that has ended the plane already, and the bytes are the next link's.
+         */
+        async _drainStreamTail(link) {
+            const start = Date.now();
+            let seq = this._rxSeq;
+            let quietSince = start;
+            for (;;) {
+                await new Promise((r) => setTimeout(r, STOP_DRAIN_POLL_MS));
+                if (this._linkGeneration !== link)
+                    return;
+                if (this._rxSeq !== seq) {
+                    seq = this._rxSeq;
+                    quietSince = Date.now();
+                }
+                if (Date.now() - quietSince >= STOP_DRAIN_QUIET_MS)
+                    break;
+                if (Date.now() - start >= STOP_DRAIN_MAX_MS) {
+                    this._log('stop drain: the link was still busy after', STOP_DRAIN_MAX_MS, 'ms');
+                    break;
+                }
+            }
+            this._streamTailQuiet = true;
+            try {
+                this._parseStreamIfPossible();
+            }
+            finally {
+                this._streamTailQuiet = false;
+            }
+            if (this._rxBuf.length) {
+                this._log('stop drain: discarding', this._rxBuf.length, 'residual byte(s)');
+            }
+            this._endStreamPlane();
         }
         /** Start streaming AND SD card logging simultaneously. */
         async startStreamingAndLogging() {
@@ -21240,15 +21351,10 @@
          */
         async stopStreamingAndLogging() {
             this._emitStatus('STOP_BT_STREAM_SD_LOGGING → sending…');
-            const link = this._linkGeneration;
-            try {
-                await this._writeOnLink(new Uint8Array([OPCODES.STOP_SDBT_COMMAND]), link);
-            }
-            catch (err) {
-                this._emitStatus(`STOP_BT_STREAM_SD_LOGGING write failed: ${err.message}`);
-            }
-            if (this._linkGeneration === link)
-                this._endStreamPlane();
+            await this._stopStreamPlane(OPCODES.STOP_SDBT_COMMAND, (err) => {
+                if (err)
+                    this._emitStatus(`STOP_BT_STREAM_SD_LOGGING write failed: ${err.message}`);
+            });
             this._emitStatus('Streaming + logging stopped.');
         }
         // ---------------------------------------------------------------------------
@@ -21657,8 +21763,9 @@
             }
             if (op === OPCODES.NACK_COMMAND_PROCESSED)
                 return 1;
+            // A last ACK at the end of a drained tail: nothing is coming after it.
             if (buf.length < at + 2)
-                return NEED_MORE;
+                return this._streamTailQuiet ? 1 : NEED_MORE;
             const after = buf[at + 1];
             return after === OPCODES.DATA_PACKET || isAckOrNack(after) ? 1 : RESYNC;
         }
@@ -21681,8 +21788,10 @@
          * The width is the status's, 1 or 2 bytes ({@link statusPayloadBytesFor});
          * until the versions are read it is unknown, and nothing is taken.
          *
-         * HARDWARE-VERIFY: from the firmware source, and run against a scripted
-         * device only.
+         * Checked against bytes captured from a Shimmer3R on DEV-99 firmware over
+         * classic Bluetooth, with no CRC and a 1-byte CRC: the push that starts audio
+         * recording, between two packets, and the one that ends it, in the stop's
+         * tail. HARDWARE-VERIFY: over BLE, and with a 2-byte CRC.
          */
         _streamStatusPushLength(buf, at) {
             let i = at;
@@ -21706,8 +21815,10 @@
                 return NEED_MORE;
             if (trailer > 0)
                 return verifyCrc(buf.subarray(at, at + len), this._crcMode) ? len : RESYNC;
-            if (buf.length < at + len + 1)
-                return NEED_MORE;
+            // At the end of a drained tail, the end of the transmission tells instead.
+            if (buf.length < at + len + 1) {
+                return this._streamTailQuiet && buf.length === at + len ? len : NEED_MORE;
+            }
             const after = buf[at + len];
             return after === OPCODES.DATA_PACKET ||
                 isAckOrNack(after) ||
@@ -21833,6 +21944,17 @@
                     vouched = vouchable && replies !== RESYNC;
                     if (!vouched)
                         next += replies;
+                }
+                /* The last parse of a drained tail (_streamTailQuiet): a packet at a
+                   known boundary with nothing behind it, or only replies running exactly
+                   to the end, ends the transmission. There is no next packet to test its
+                   timestamp against, and none is coming. */
+                if (!vouched &&
+                    this._streamTailQuiet &&
+                    this._streamAligned &&
+                    buf[0] === preamble &&
+                    next === buf.length) {
+                    vouched = true;
                 }
                 if (!vouched && buf.length < Math.max(wireBytes * 2, next + 1 + tsBytes))
                     break;
@@ -21993,7 +22115,21 @@
         // ---------------------------------------------------------------------------
         // Low-level transport helpers
         // ---------------------------------------------------------------------------
-        async _write(u8) {
+        /** Resolve once no stop is ending the stream plane ({@link _stopStreamPlane}). */
+        async _afterStopDrain() {
+            while (this._streamTailDrain)
+                await this._streamTailDrain;
+        }
+        /**
+         * @param isStop the stop that holds the other commands back while it ends the
+         *   stream plane ({@link _stopStreamPlane}), which must not wait for itself
+         */
+        async _write(u8, isStop = false) {
+            /* A stop is ending the stream plane: what this command gets back would
+               land among the last packets, where only bare ACKs and status pushes are
+               taken. */
+            if (!isStop)
+                await this._afterStopDrain();
             if (!this._transport)
                 throw new Error('Not connected (RX missing)');
             /*
@@ -22020,14 +22156,14 @@
          * caller's cleanup against whatever link had replaced it by then: a held
          * START_STREAMING ended the next link's stream.
          */
-        _writeOnLink(u8, link) {
+        _writeOnLink(u8, link, isStop = false) {
             const gone = () => new Error('The link was reset while the command was being sent');
             if (link !== this._linkGeneration)
                 return Promise.reject(gone());
             return new Promise((resolve, reject) => {
                 const onReset = () => reject(gone());
                 this._linkWaiters.add(onReset);
-                this._write(u8).then(() => {
+                this._write(u8, isStop).then(() => {
                     this._linkWaiters.delete(onReset);
                     resolve();
                 }, (e) => {
@@ -22042,6 +22178,9 @@
          *   on - which fails the step at once if that link has since been reset.
          */
         async _writeExpectingAck(u8, ackTimeoutMs = 1000, link = this._linkGeneration) {
+            /* Before it is counted: the stop's own ACK, among the last packets, would
+               otherwise be spent on this command. */
+            await this._afterStopDrain();
             /* A step of an operation whose link has already been replaced: refused
                before it is counted, since the count is now the next link's and the
                catch below leaves it alone across a reset. */
@@ -22394,6 +22533,9 @@
         async getStatus() {
             if (!this._transport)
                 throw new Error('Not connected (RX missing)');
+            /* Nor claimed while a stop drains the stream's tail: the push that closes
+             * a log comes in it, and is news, not this read's answer. */
+            await this._afterStopDrain();
             const link = this._linkGeneration;
             /* Before the read is claimed below, so a push that lands during the version
              * reads is still reported as one. */

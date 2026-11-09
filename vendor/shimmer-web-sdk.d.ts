@@ -10666,6 +10666,16 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private _eventFramesPossible;
     /** Re-framing accumulator, used only while {@link _reframing}. */
     private _ctrlBuf;
+    /** Bumped once per inbound chunk, for {@link _drainStreamTail}'s quiet test. */
+    private _rxSeq;
+    /** A stop's drain of the stream tail, while one runs; commands wait for it. */
+    private _streamTailDrain;
+    /**
+     * Set only for the last parse of a drained stream tail. The link has gone
+     * quiet, so a reply that ends the buffer ends the transmission, which is as
+     * good as the next packet's preamble for telling where it stops.
+     */
+    private _streamTailQuiet;
     /**
      * How many bytes a STATUS_RESPONSE payload carries: 2 on a Shimmer3R running
      * LogAndStream v1.00.024 or later, 1 on anything else
@@ -12137,6 +12147,47 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * all.
      */
     stopStreaming(): Promise<void>;
+    /**
+     * Write a stop, `op`, and end the stream plane: at once on a framed link, and
+     * on a re-framed one ({@link _reframing}: a byte stream, or any link with a
+     * CRC on) once the stream's tail has been drained ({@link _drainStreamTail}).
+     *
+     * On a re-framed link every other command waits from before the stop is
+     * written until the plane has ended ({@link _write}). Held only from after
+     * the write, a command sent alongside the stop could go out first and have
+     * its reply land among the last packets, where it is lost.
+     *
+     * `_endStreamPlane`, not the two fields by hand. It also clears
+     * `_streamAligned`, and leaving that set is not cosmetic: `_parseBySchema` is
+     * gated on `schema`, NOT on `_streaming`, and a chunk starting with
+     * DATA_PACKET is still appended to `_rxBuf` while not streaming. So frames
+     * already in flight when the stop was sent got parsed with alignment still
+     * claimed, skipping acquisition entirely and accepting whatever offset they
+     * happened to land on. Not across a link reset, as in startStreaming.
+     *
+     * @param written told once the write has settled: with its error, if it failed
+     */
+    private _stopStreamPlane;
+    /**
+     * Keep parsing what arrives after a stop as stream data until the link has
+     * been quiet for {@link STOP_DRAIN_QUIET_MS}, then end the stream plane.
+     *
+     * Packets go on arriving for a while after the stop, and with them the stop's
+     * ACK and the status push the firmware sends when the log closes. On a
+     * re-framed link, ending the plane at once handed that tail to the control
+     * framer, part-way through a packet. Its first byte is any sample byte, and
+     * one that reads as a reply opcode with a length field swallows everything
+     * behind it: on a bench Shimmer3R the tail began 0xC1, an SD directory
+     * listing 2,840 bytes long by its own header, so the push was lost and the
+     * next command timed out. The stream parser knows where the packets end, so
+     * it takes the tail instead, as the Shimmer3 client's stop already does.
+     *
+     * Once quiet, the tail is parsed one last time with {@link _streamTailQuiet}
+     * set, so a packet or reply that ends the transmission is taken without the
+     * next packet behind it. Whatever is left is discarded. Not across a link
+     * reset: that has ended the plane already, and the bytes are the next link's.
+     */
+    private _drainStreamTail;
     /** Start streaming AND SD card logging simultaneously. */
     startStreamingAndLogging(): Promise<void>;
     private _startStreamingAndLogging;
@@ -12312,8 +12363,10 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * The width is the status's, 1 or 2 bytes ({@link statusPayloadBytesFor});
      * until the versions are read it is unknown, and nothing is taken.
      *
-     * HARDWARE-VERIFY: from the firmware source, and run against a scripted
-     * device only.
+     * Checked against bytes captured from a Shimmer3R on DEV-99 firmware over
+     * classic Bluetooth, with no CRC and a 1-byte CRC: the push that starts audio
+     * recording, between two packets, and the one that ends it, in the stop's
+     * tail. HARDWARE-VERIFY: over BLE, and with a 2-byte CRC.
      */
     private _streamStatusPushLength;
     /** How many bytes of bare replies run from `buf[at]`, each as {@link _streamReplyLength} measures it. */
@@ -12326,6 +12379,12 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _takeStreamReply;
     private _parseBySchema;
+    /** Resolve once no stop is ending the stream plane ({@link _stopStreamPlane}). */
+    private _afterStopDrain;
+    /**
+     * @param isStop the stop that holds the other commands back while it ends the
+     *   stream plane ({@link _stopStreamPlane}), which must not wait for itself
+     */
     private _write;
     /**
      * {@link _write} on the link `link`, failing at once if that link is reset
