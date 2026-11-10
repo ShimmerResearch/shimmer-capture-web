@@ -1338,8 +1338,8 @@ check(
   sd.during.sawStartSdbt && sd.sawStopSdbt,
 );
 check(
-  "only the SD stop button is live while logging",
-  !sd.during.btStop && sd.during.sdStop,
+  "while streaming and logging, both stops are live: Stop stream leaves the log, Stop stream + SD logging ends both",
+  sd.during.btStop && sd.during.sdStop,
 );
 check(
   "apply is refused while logging to the card",
@@ -3204,6 +3204,7 @@ check(
 const sdGate = await evaluate(`
   const look = () => ({
     sdStart: !document.getElementById('btnSdStart').disabled,
+    logStart: !document.getElementById('btnLogStart').disabled,
     stream: !document.getElementById('btnStreamStart').disabled,
     note: document.getElementById('sdStartNoteRow').hidden ? null
       : document.getElementById('sdStartNote').textContent,
@@ -3218,17 +3219,127 @@ const sdGate = await evaluate(`
   return { before, onDock, onUndock: look() };
 `);
 check(
-  "while the sensor says it is docked, Start stream + SD logging is held back with the reason, and plain streaming is not",
+  "while the sensor says it is docked, Start stream + SD logging and Start SD logging are held back with the reason, and plain streaming is not",
   sdGate.before.sdStart &&
+    sdGate.before.logStart &&
     sdGate.before.note === null &&
     !sdGate.onDock.sdStart &&
+    !sdGate.onDock.logStart &&
     sdGate.onDock.stream &&
     /docked/.test(sdGate.onDock.note ?? "") &&
     sdGate.onDock.title === sdGate.onDock.note &&
     sdGate.onUndock.sdStart &&
+    sdGate.onUndock.logStart &&
     sdGate.onUndock.note === null &&
     sdGate.onUndock.title === "",
   JSON.stringify(sdGate),
+);
+
+/* SD logging on its own (START_LOGGING 0x92 / STOP_LOGGING 0x93): with no
+   stream, and added to and taken from one. The page follows the sensor. */
+const LOG_LOOK = `
+  const $ = (id) => document.getElementById(id);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const look = () => ({
+    logStart: !$('btnLogStart').disabled,
+    logStop: !$('btnLogStop').disabled,
+    sdStart: !$('btnSdStart').disabled,
+    sdStop: !$('btnSdStop').disabled,
+    streamStart: !$('btnStreamStart').disabled,
+    streamStop: !$('btnStreamStop').disabled,
+    streamStopTitle: $('btnStreamStop').title,
+    note: !$('logOnlyNoteRow').hidden,
+    sensorLogs: window.mockTransport.status.logging,
+    flags: [...document.querySelectorAll('#statusFlags .flag.on')].map((e) => e.textContent),
+  });
+`;
+const logOnly = await evaluate(`${LOG_LOOK}
+  const before = look();
+  $('btnLogStart').click();
+  await wait(2000); // the start, then the read-back 1.2 s later
+  const logging = look();
+  $('btnLogStop').click();
+  await wait(600);
+  return { before, logging, stopped: look() };
+`);
+check(
+  "Start SD logging logs with no stream, read back from the sensor; Stop SD logging ends it",
+  logOnly.before.logStart &&
+    !logOnly.before.logStop &&
+    logOnly.logging.sensorLogs &&
+    logOnly.logging.logStop &&
+    !logOnly.logging.logStart &&
+    !logOnly.logging.sdStart &&
+    logOnly.logging.streamStart &&
+    logOnly.logging.note &&
+    logOnly.logging.flags.includes("SD logging") &&
+    !logOnly.stopped.sensorLogs &&
+    logOnly.stopped.logStart &&
+    !logOnly.stopped.logStop &&
+    !logOnly.stopped.note,
+  JSON.stringify(logOnly),
+);
+
+const logAndStream = await evaluate(`${LOG_LOOK}
+  $('btnStreamStart').click();
+  await wait(800);
+  const streaming = look();
+  $('btnLogStart').click();
+  await wait(800);
+  const both = look();
+  $('btnStreamStop').click();
+  await wait(1000); // the stop drains the tail first
+  const logLeft = look();
+  $('btnLogStop').click();
+  await wait(600);
+  return { streaming, both, logLeft, done: look() };
+`);
+check(
+  "a log added to a running stream; Stop stream then leaves it logging, and Stop SD logging ends it",
+  logAndStream.streaming.logStart &&
+    logAndStream.streaming.streamStop &&
+    !logAndStream.streaming.sdStop &&
+    logAndStream.both.sensorLogs &&
+    logAndStream.both.logStop &&
+    logAndStream.both.sdStop &&
+    logAndStream.both.streamStop &&
+    /logging/.test(logAndStream.both.streamStopTitle) &&
+    !logAndStream.both.note &&
+    logAndStream.logLeft.sensorLogs &&
+    logAndStream.logLeft.logStop &&
+    logAndStream.logLeft.streamStart &&
+    !logAndStream.logLeft.streamStop &&
+    logAndStream.logLeft.note &&
+    !logAndStream.done.sensorLogs &&
+    logAndStream.done.logStart &&
+    !logAndStream.done.logStop,
+  JSON.stringify(logAndStream),
+);
+
+/* Firmware that NACKs a log start it cannot carry out: the start fails with
+   the reason, and the page claims no log. Here the card fault is one the
+   sensor has not reported, so the page's own gate cannot hold the button. */
+const logRefused = await evaluate(`${LOG_LOOK}
+  window.mockTransport.status.nackRefusedLogStart = true;
+  window.mockTransport.status.setQuietly({ sdBadFile: true });
+  const lines = () => document.getElementById('log').textContent;
+  const before = lines().length;
+  $('btnLogStart').click();
+  await wait(800);
+  const after = look();
+  const said = lines().slice(before);
+  window.mockTransport.status.setQuietly({ sdBadFile: false });
+  window.mockTransport.status.nackRefusedLogStart = false;
+  return { after, said: said.slice(0, 400) };
+`);
+check(
+  "a log start the firmware refuses (NACK) fails with the reason, and the page claims no log",
+  !logRefused.after.sensorLogs &&
+    logRefused.after.logStart &&
+    !logRefused.after.logStop &&
+    !logRefused.after.flags.includes("SD logging") &&
+    /refused to start an SD log/.test(logRefused.said),
+  JSON.stringify(logRefused),
 );
 
 /* The push and the answer to GET_STATUS are the same message built by the same

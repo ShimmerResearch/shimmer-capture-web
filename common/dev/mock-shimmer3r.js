@@ -95,6 +95,8 @@ const CMD = Object.freeze({
   SET_RWC: 0x8f,
   RWC_RESPONSE: 0x90,
   GET_RWC: 0x91,
+  START_LOGGING: 0x92,
+  STOP_LOGGING: 0x93,
   VBATT_RESPONSE: 0x94,
   GET_VBATT: 0x95,
   PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE: 0xa6,
@@ -1226,6 +1228,9 @@ export function createMockShimmer3RTransport(opts = {}) {
     sdInserted: true,
     /** The firmware could not open its log file. */
     sdBadFile: false,
+    /* Refuse a log start it cannot carry out with a NACK, starting nothing,
+       instead of ACKing it as released firmware does (transport.status). */
+    nackRefusedLogStart: false,
     /** The clock has been set since the sensor last lost power. */
     rwcSet: false,
     /** The red LED, as TOGGLE_LED leaves it. */
@@ -1529,6 +1534,22 @@ export function createMockShimmer3RTransport(opts = {}) {
     },
     /** Push the status as it stands, without changing anything. */
     push: () => reply(statusResponse()),
+    get logging() {
+      return state.logging;
+    },
+    /** NACK a log start it cannot carry out, as firmware that says so does. */
+    set nackRefusedLogStart(on) {
+      state.nackRefusedLogStart = !!on;
+    },
+    /**
+     * Change the card's state without a push, as a fault the sensor finds
+     * only when a log starts: `{ sdBadFile }` or `{ sdInserted }`.
+     */
+    setQuietly(patch) {
+      for (const key of ["sdBadFile", "sdInserted"]) {
+        if (key in patch) state[key] = !!patch[key];
+      }
+    },
     /** The frame a push (or a GET_STATUS answer) carries, for comparison. */
     bytes: () => new Uint8Array(statusResponse()),
   };
@@ -1771,6 +1792,17 @@ export function createMockShimmer3RTransport(opts = {}) {
   function audioStatusBits() {
     if (!audioBuilt) return 0;
     return (audioRecording() ? 0x02 : 0) | (aud.fault ? 0x04 : 0);
+  }
+
+  /** ShimSens_checkStartLoggingConditions, as far as the mock models it. */
+  function canStartLog() {
+    return (
+      !state.logging &&
+      !state.docked &&
+      !state.usbPluggedIn &&
+      state.sdInserted &&
+      !state.sdBadFile
+    );
   }
 
   /**
@@ -3334,29 +3366,55 @@ export function createMockShimmer3RTransport(opts = {}) {
         startStreaming();
         return;
 
-      case CMD.START_SDBT:
-        state.streaming = true;
+      case CMD.START_SDBT: {
         /* The firmware starts the log only undocked, off USB, with a card in
            and no bad file (ShimSens_checkStartLoggingConditions), and ACKs
-           the command and streams either way. */
-        state.logging =
-          !state.docked &&
-          !state.usbPluggedIn &&
-          state.sdInserted &&
-          !state.sdBadFile;
+           the command and streams either way, unless it is firmware that
+           NACKs such a start, which then starts nothing. */
+        const canLog = canStartLog();
+        if (!canLog && state.nackRefusedLogStart) {
+          reply([NACK]);
+          return;
+        }
+        const wasLogging = state.logging;
+        state.streaming = true;
+        state.logging = wasLogging || canLog;
         reply([ACK]);
         startStreaming();
-        if (state.logging) audioSessionStart();
+        if (state.logging && !wasLogging) audioSessionStart();
         return;
+      }
+
+      case CMD.START_LOGGING: {
+        // START_LOGGING_COMMAND: the log alone, with or without a stream.
+        const canLog = canStartLog();
+        if (!canLog && state.nackRefusedLogStart) {
+          reply([NACK]);
+          return;
+        }
+        reply([ACK]);
+        if (canLog) {
+          state.logging = true;
+          audioSessionStart();
+        }
+        return;
+      }
+
+      case CMD.STOP_LOGGING: {
+        // STOP_LOGGING_COMMAND: the log alone; a stream goes on.
+        const wasLogging = state.logging;
+        state.logging = false;
+        reply([ACK]);
+        if (wasLogging) audioSessionStop();
+        return;
+      }
 
       case CMD.STOP_STREAMING:
+        // STOP_STREAMING_COMMAND: the stream alone; a log goes on, as on the
+        // firmware. STOP_SDBT stops both.
         state.streaming = false;
-        // Logging outlives a stream stop on real firmware only via
-        // STOP_SDBT; here a stop is a stop.
-        state.logging = false;
         stopStreaming();
         reply([ACK]);
-        audioSessionStop();
         return;
 
       case CMD.STOP_SDBT:

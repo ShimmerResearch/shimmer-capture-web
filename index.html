@@ -855,6 +855,24 @@
             >
               Stop stream
             </button>
+          </div>
+          <div class="row">
+            <button
+              id="btnLogStart"
+              type="button"
+              data-requires="connected"
+              data-cap="logStart"
+            >
+              Start SD logging
+            </button>
+            <button
+              id="btnLogStop"
+              type="button"
+              data-requires="connected"
+              data-cap="logStop"
+            >
+              Stop SD logging
+            </button>
             <button
               id="btnSdStart"
               type="button"
@@ -874,6 +892,12 @@
           </div>
           <div class="row" id="sdStartNoteRow" hidden>
             <span class="muted" id="sdStartNote"></span>
+          </div>
+          <div class="row" id="logOnlyNoteRow" hidden>
+            <span class="muted" id="logOnlyNote"
+              >The sensor is logging to its SD card. It goes on logging if this
+              page disconnects; Stop SD logging ends the log.</span
+            >
           </div>
           <div class="row">
             <label for="selWindow">Window</label>
@@ -1499,6 +1523,8 @@
       let busy = false;
       let streaming = false;
       let sdLogging = false;
+      /** True from this page's Start SD logging until the log is known to have ended. */
+      let logStartedHere = false;
       /**
        * True while the SD panel is transferring or measuring the link.
        *
@@ -1848,12 +1874,17 @@
       function regate() {
         // Capability floors the markup gates on but only the page can know.
         caps.record = !!csvColumns;
-        /* Exactly one stop button is live at a time. STOP_STREAMING (0x20)
-                 and STOP_SDBT (0x97) are different commands: the first leaves an SD
-                 recording running, so offering both would let one click end a
-                 stream and silently leave the card still being written. */
-        caps.btStop = streaming && !sdLogging;
+        /* Each stop says what it stops. STOP_STREAMING (0x20) leaves an SD
+                 log running and STOP_LOGGING (0x93) leaves a stream, and a log
+                 left running shows in the SD logging flag, in Stop SD logging and
+                 in the note under the buttons, so Stop stream is offered whenever
+                 a stream runs. Stop stream + SD logging (0x97) ends both. */
+        const linkBusy =
+          busy || sdBusy || brandBusy || calibBusy || testBusy || otaBusy;
+        caps.btStop = streaming;
         caps.sdStop = sdLogging;
+        caps.logStart = !!caps.log && !sdLogging && !linkBusy;
+        caps.logStop = !!caps.log && sdLogging && !linkBusy;
 
         /* An SD download, a name write, a calibration write and everything
                  else on this page compete for one link, so any of them in flight
@@ -1864,19 +1895,27 @@
           connected: !!client,
           streaming,
           recording: recorder.active,
-          busy: busy || sdBusy || brandBusy || calibBusy || testBusy || otaBusy,
+          busy: linkBusy,
           caps,
         });
 
-        /* The firmware ACKs Start stream + SD logging and streams even when
-                 it will not log, so the button is held back where the sensor
-                 has already said it would not, with the reason beside it. */
+        /* The firmware ACKs a log start it will not carry out (Start stream
+                 + SD logging then streams alone), so both starts are held back
+                 where the sensor has already said it would not, with the reason
+                 beside them; and while it logs, a second start has nothing to do. */
         sdStartBlock = client ? sdLogBlockedReason() : null;
-        const sdStart = $("btnSdStart");
-        if (sdStartBlock) sdStart.disabled = true;
-        sdStart.title = sdStartBlock ?? "";
+        for (const id of ["btnSdStart", "btnLogStart"]) {
+          const start = $(id);
+          if (sdStartBlock || sdLogging) start.disabled = true;
+          start.title = sdStartBlock ?? "";
+        }
+        $("btnStreamStop").title =
+          streaming && sdLogging
+            ? "Stops the stream only: the sensor goes on logging to its SD card."
+            : "";
         $("sdStartNote").textContent = sdStartBlock ?? "";
-        $("sdStartNoteRow").hidden = !sdStartBlock || streaming;
+        $("sdStartNoteRow").hidden = !sdStartBlock || sdLogging;
+        $("logOnlyNoteRow").hidden = !client || !sdLogging || streaming;
 
         /* Each panel is enabled on everything EXCEPT its own busy flag: this
                  is the floor for whether the LINK can do the thing at all, and each
@@ -2098,6 +2137,10 @@
        */
       function humanError(what, err) {
         const raw = String(err?.message ?? err ?? "unknown error");
+        /* A log start the firmware refused: the SDK's message says why the
+                 sensor logs only sometimes, which the generic NACK text below
+                 would get wrong. */
+        if (err?.name === "LogStartRefusedError") return raw;
         if (/ACK timeout/i.test(raw)) {
           return (
             `The sensor did not answer "${what}" in time. It may be out of ` +
@@ -2339,6 +2382,17 @@
         };
         paintStatus();
         audioPanel.setStatus(status);
+        /* The sensor is the authority on whether it logs: a log started from
+                 its button, by another host or before this page connected, one it
+                 would not start, and one the dock or the trial's end stopped. The
+                 SD logging controls follow it. */
+        if (
+          typeof status.sdLogging === "boolean" &&
+          status.sdLogging !== sdLogging
+        ) {
+          sdLogging = status.sdLogging;
+          if (client) regate();
+        }
         /* Docking, USB and the card decide whether a log can start. */
         if (client && sdLogBlockedReason() !== sdStartBlock) regate();
         /* The sensor is the authority on whether it is sensing: a status read
@@ -2346,7 +2400,8 @@
                  streaming, and every configuration command is NACKed until it
                  stops. Only worth saying for something the sensor stated — an
                  inferred value can teach nobody anything. */
-        if (status.sensing && !streaming) {
+        if (!status.sdLogging) logStartedHere = false;
+        if (status.sensing && !streaming && !logStartedHere) {
           log.warn(
             "the sensor reports it is sensing — it was started from its own button or by another host, and will refuse configuration commands until it stops",
           );
@@ -5013,7 +5068,8 @@
           return;
         }
         streaming = true;
-        sdLogging = withSd;
+        // A stream alone leaves a log already running as it is
+        if (withSd) sdLogging = true;
         log.log(
           withSd
             ? "streaming to this host and logging to the sensor's SD card"
@@ -5046,7 +5102,11 @@
                    "streaming" would refuse every later command for no good reason. */
         }
         streaming = false;
-        sdLogging = false;
+        // STOP_STREAMING leaves a log running (the SD logging controls show it)
+        if (withSd) {
+          sdLogging = false;
+          logStartedHere = false;
+        }
         if (client) client.onStreamFrame = null;
         // The last throttled render can be 500 ms stale, so paint the final
         // numbers rather than leaving whatever it left behind.
@@ -5065,8 +5125,74 @@
                 sdLogging: false,
                 ...(audio ? { audioRecording: false } : {}),
               }
-            : { sensing: false, streaming: false },
+            : { streaming: false, ...(sdLogging ? {} : { sensing: false }) },
         );
+        regate();
+      }
+
+      /**
+       * Start SD logging on its own (START_LOGGING_COMMAND 0x92): with no
+       * stream, or added to the one running. The log goes on after this page
+       * disconnects, until Stop SD logging, the button, the dock or the
+       * configured duration ends it.
+       *
+       * The ACK says the command ran, not that a log started: released
+       * firmware ACKs a start it will not carry out, so with no stream the
+       * status is read back to say. Firmware that refuses it (a NACK) makes
+       * the start fail with the reason, through `withDevice`.
+       */
+      async function startLog() {
+        try {
+          await withDevice("start SD logging", () => client.startLogging());
+        } catch {
+          return;
+        }
+        sdLogging = true;
+        logStartedHere = true;
+        log.log(
+          streaming
+            ? "logging to the sensor's SD card as well as streaming"
+            : "logging to the sensor's SD card — it goes on logging if this page disconnects",
+        );
+        inferStatus({ sensing: true, sdLogging: true });
+        regate();
+        /* Read back once the log has had time to open. Not while streaming:
+                 a status read then has to find its reply between packets, and the
+                 push that starts audio recording, or the next read, says anyway. */
+        if (!streaming) {
+          await new Promise((r) => setTimeout(r, 1200));
+          if (client && !streaming && typeof client.getStatus === "function") {
+            const status = await tryDevice("read the device status", () =>
+              client.getStatus(),
+            );
+            if (status) renderStatus(status);
+          }
+        }
+      }
+
+      /** Stop SD logging only (STOP_LOGGING_COMMAND 0x93); a stream goes on. */
+      async function stopLog() {
+        try {
+          await withDevice("stop SD logging", () => client.stopLogging());
+        } catch {
+          /* Logged and toasted. The flag stays as the sensor last said, so
+                   Stop SD logging is still offered. */
+          return;
+        }
+        sdLogging = false;
+        logStartedHere = false;
+        log.log(
+          streaming
+            ? "stopped logging to the sensor's SD card; the stream goes on"
+            : "stopped logging to the sensor's SD card",
+        );
+        /* Audio recording ends with the log (PlatAudio_sessionStop), as at
+                 Stop stream + SD logging. */
+        inferStatus({
+          sdLogging: false,
+          ...(streaming ? {} : { sensing: false }),
+          ...(audio ? { audioRecording: false } : {}),
+        });
         regate();
       }
 
@@ -5930,6 +6056,7 @@
       function resetAfterDisconnect() {
         streaming = false;
         sdLogging = false;
+        logStartedHere = false;
         btUpdate.onDisconnected();
         /* Back to reporting the selection, because the link that a CRC was
                  agreed on has gone and leaving "CRC 2 bytes" up would describe a
@@ -6491,6 +6618,14 @@
       $("btnSdStop").addEventListener(
         "click",
         reported(() => stopStream(true)),
+      );
+      $("btnLogStart").addEventListener(
+        "click",
+        reported(() => startLog()),
+      );
+      $("btnLogStop").addEventListener(
+        "click",
+        reported(() => stopLog()),
       );
 
       $("selWindow").addEventListener("change", (e) => {

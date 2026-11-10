@@ -59,7 +59,7 @@
  * @param {object|null} client a Shimmer3Client / Shimmer3RClient / wired client
  * @param {"ble"|"rfcomm"|"usb"|string} [mode] the link the client is on
  * @returns {{
- *   stream: boolean, sdbt: boolean, infomem: boolean, sdlog: boolean,
+ *   stream: boolean, sdbt: boolean, log: boolean, infomem: boolean, sdlog: boolean,
  *   calib: boolean, calibration: boolean, pressureCalibration: boolean,
  *   rtc: boolean, ranges: boolean,
  *   exg: boolean, sensors: boolean, battery: boolean, status: boolean,
@@ -83,6 +83,9 @@ export function describeShimmer3Caps(client, mode) {
     // file-transfer channel, it does not carry a sample stream.
     stream: has("startStreaming") && mode !== "usb",
     sdbt: has("startStreamingAndLogging") && mode !== "usb",
+    // SD logging on its own (START_LOGGING / STOP_LOGGING, 0x92 / 0x93),
+    // with or without a stream. Over the radio only, like the stream.
+    log: has("startLogging") && has("stopLogging") && mode !== "usb",
     infomem: infomemRead && infomemWrite,
     // The 0x9C SD-header rebuild. A separate capability from `infomem`
     // because an older bundle can read and write the image without being able
