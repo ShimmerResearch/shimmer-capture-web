@@ -6924,9 +6924,9 @@ check(
   `${audFault.bad.join(",")} | ${audFault.status}`,
 );
 
-/* A log started from this page always streams too, so the push that says
-   recording started arrives between two stream packets, and the SDK has to
-   take it from there. */
+/* Start stream + SD logging streams too, so the push that says recording
+   started arrives between two stream packets, and the SDK has to take it from
+   there. */
 const audStream = await evaluate(`
   window.confirm = () => true;
   const flags = () => [...document.querySelectorAll('#statusFlags .flag')].map(f => ({
@@ -6936,8 +6936,13 @@ const audStream = await evaluate(`
   for (let i = 0; i < 60 && !recording(); i++) await new Promise(r => setTimeout(r, 50));
   const during = flags();
   document.getElementById('btnSdStop').click();
-  for (let i = 0; i < 60 && recording(); i++) await new Promise(r => setTimeout(r, 50));
-  await new Promise(r => setTimeout(r, 300));
+  /* The stop's push says recording stopped. It comes in the stop's tail, so
+     before the stop returns, and the page has to keep it rather than put its
+     own guess (marked *) over it. With no link CRC the SDK takes the push only
+     once the link has been quiet for 300 ms (the stop drain), so wait for it
+     rather than a fixed time. */
+  const confirmedOff = () => flags().some(f => f.text === 'Recording audio' && !f.on);
+  for (let i = 0; i < 80 && !confirmedOff(); i++) await new Promise(r => setTimeout(r, 50));
   return { during, after: flags() };
 `);
 check(

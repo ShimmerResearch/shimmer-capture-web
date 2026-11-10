@@ -2343,6 +2343,9 @@
        */
       let statusView = null;
 
+      /** How many statuses the sensor has stated (read or pushed), for {@link inferStatus}. */
+      let statusStatements = 0;
+
       /**
        * Take a status the sensor actually stated: an answer to `getStatus`
        * (`"read"`) or one the firmware pushed unasked (`"push"`).
@@ -2373,6 +2376,7 @@
             );
           }
         }
+        statusStatements++;
         statusView = {
           status,
           source,
@@ -2433,9 +2437,22 @@
        * discarded. Measured against the mock, and the same race exists on any
        * link that can put the ACK and the response in one notification.
        *
+       * Firmware that records audio does push when a log closes, since the
+       * recording bit clears, and that push can come before the command
+       * returns: a stop resolves only once the stream's tail is drained, and
+       * the push is in the tail. So a status the sensor stated after the
+       * command went out is kept, rather than overwritten by this guess. A
+       * count, not a time: the push before the command can land in the same
+       * millisecond as the click that sends it.
+       *
        * @param {Record<string, boolean>} patch flags the command changed
+       * @param {number} [statedBefore] {@link statusStatements} when the
+       *   command went out
        */
-      function inferStatus(patch) {
+      function inferStatus(patch, statedBefore) {
+        if (statedBefore !== undefined && statusStatements !== statedBefore) {
+          return;
+        }
         /* Patched onto whatever was last known, or onto nothing at all if no
                  read has ever succeeded — `paintStatus` omits a flag that is not a
                  boolean, so the flags this page did not touch stay absent rather
@@ -5055,6 +5072,7 @@
         lastFrameX = null;
 
         client.onStreamFrame = onFrame;
+        const statedBefore = statusStatements;
         try {
           await withDevice(
             withSd ? "start streaming and SD logging" : "start streaming",
@@ -5084,11 +5102,13 @@
           withSd
             ? { sensing: true, streaming: true, sdLogging: true }
             : { sensing: true, streaming: true },
+          statedBefore,
         );
         regate();
       }
 
       async function stopStream(withSd) {
+        const statedBefore = statusStatements;
         try {
           await withDevice(
             withSd ? "stop streaming and SD logging" : "stop streaming",
@@ -5126,6 +5146,7 @@
                 ...(audio ? { audioRecording: false } : {}),
               }
             : { streaming: false, ...(sdLogging ? {} : { sensing: false }) },
+          statedBefore,
         );
         regate();
       }
@@ -5142,6 +5163,7 @@
        * the start fail with the reason, through `withDevice`.
        */
       async function startLog() {
+        const statedBefore = statusStatements;
         try {
           await withDevice("start SD logging", () => client.startLogging());
         } catch {
@@ -5154,7 +5176,7 @@
             ? "logging to the sensor's SD card as well as streaming"
             : "logging to the sensor's SD card — it goes on logging if this page disconnects",
         );
-        inferStatus({ sensing: true, sdLogging: true });
+        inferStatus({ sensing: true, sdLogging: true }, statedBefore);
         regate();
         /* Read back once the log has had time to open. Not while streaming:
                  a status read then has to find its reply between packets, and the
@@ -5172,6 +5194,7 @@
 
       /** Stop SD logging only (STOP_LOGGING_COMMAND 0x93); a stream goes on. */
       async function stopLog() {
+        const statedBefore = statusStatements;
         try {
           await withDevice("stop SD logging", () => client.stopLogging());
         } catch {
@@ -5188,11 +5211,14 @@
         );
         /* Audio recording ends with the log (PlatAudio_sessionStop), as at
                  Stop stream + SD logging. */
-        inferStatus({
-          sdLogging: false,
-          ...(streaming ? {} : { sensing: false }),
-          ...(audio ? { audioRecording: false } : {}),
-        });
+        inferStatus(
+          {
+            sdLogging: false,
+            ...(streaming ? {} : { sensing: false }),
+            ...(audio ? { audioRecording: false } : {}),
+          },
+          statedBefore,
+        );
         regate();
       }
 
