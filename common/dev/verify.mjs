@@ -398,7 +398,7 @@ check(
 );
 check(
   "form + sensor grid + hex view built",
-  ident.fields === 40 &&
+  ident.fields === 39 &&
     ident.sensorBoxes === 17 &&
     ident.checked === 3 &&
     ident.hexRows === 24,
@@ -1231,7 +1231,7 @@ check(
     un.mac === "000666668091" &&
     un.imPill === "384 bytes read" &&
     un.rate === "102.4 Hz" &&
-    un.fields === 40,
+    un.fields === 39,
   JSON.stringify(un),
 );
 
@@ -1829,7 +1829,7 @@ check(
      what the BLE cap assertions below prove — an unidentified sensor keeps the
      shorter Shimmer3 cap, which is safe on either platform. */
   brandUnknown.idHw === "GSR+ (SR48-3-0)" &&
-    brandUnknown.fields === 40 &&
+    brandUnknown.fields === 39 &&
     brandUnknown.contextHw === 8 &&
     brandUnknown.maxAttr === 8 &&
     brandUnknown.derived === "AcmeWris" &&
@@ -3562,6 +3562,7 @@ const SDK_CONSUMERS = [
   "common/bt-module-update.js",
   "common/calibration-editor.js",
   "common/device-clock.js",
+  "common/event-channel-panel.js",
   "common/factory-test-panel.js",
   "common/kinematic-block-editor.js",
   "common/rtc-drift-panel.js",
@@ -6081,6 +6082,453 @@ check(
     /v1\.4\.16\.16/.test(btFail.idBt) &&
     btFail.refresh === false,
   `${btFail.text.slice(0, 70)} | ${btFail.idBt} | Refresh disabled ${btFail.refresh}`,
+);
+
+// ===========================================================================
+// The event channel and configuration byte 232 (DEV-971), on a mock whose
+// firmware has them (`&events=1`). No release has them, so the page asks the
+// sensor with a SET_FEATURE opt-out; every other section runs a mock that
+// NACKs it, which is why their field count stays at 39.
+//
+// Press recording and the TTL input are event markers in Sensor Enables; how
+// a log starts is SD Logging's Start-up. The TCXO is not offered.
+// ===========================================================================
+console.log("\n--- event channel (byte 232, button and TTL records) ---");
+const LAYOUT = `
+  const vis = (el) => !!el && el.offsetParent !== null;
+  const fieldsIn = (id) => [...document.querySelectorAll('[data-subgroup-id="' + id + '"] .field:not(.page-owned)')]
+    .map(f => f.querySelector('label, .field-editor-label')?.textContent.trim());
+  const groups = [...document.querySelectorAll('#configForm details')]
+    .filter(d => !d.hidden).map(d => d.querySelector(':scope > summary')?.textContent.trim());
+`;
+await goto(`${BASE}?mock=1`);
+await evaluate(CONNECT);
+const evtNone = await evaluate(
+  LAYOUT +
+    `
+  document.querySelector('.tabs [data-tab="tabConfig"]').click();
+  await new Promise(r => setTimeout(r, 200));
+  return { groups, startup: fieldsIn('sdLogging.startup'), duration: fieldsIn('sdLogging.duration'),
+    tile: !!document.getElementById('eventMarkerGroup'), select: !!document.getElementById('buttonLogging'),
+    tcxo: !!document.querySelector('.field[data-field-key="tcxo"]') };
+`,
+);
+check(
+  "SD Logging's Start-up and Duration hold their fields, the TCXO is not offered, and without the event channel there are no markers",
+  !evtNone.groups.includes("Button and Event Channel") &&
+    evtNone.startup.join("|") ===
+      "Start Logging On Button Press|Single-Touch Start" &&
+    evtNone.duration.join("|") ===
+      "Estimated Experiment Length (seconds)|Maximum Experiment Length, auto-stop (minutes)" &&
+    !evtNone.tcxo &&
+    !evtNone.tile &&
+    !evtNone.select,
+  `start-up ${evtNone.startup.join(", ")} | duration ${evtNone.duration.join(", ")}`,
+);
+
+await goto(`${BASE}?mock=1&events=1`);
+check(
+  "connect to a sensor whose firmware has the event channel",
+  (await evaluate(CONNECT)) === "mock",
+);
+const evtUp = await evaluate(
+  LAYOUT +
+    `
+  for (let i = 0; i < 40 && !window.mockTransport.events.optedIn; i++)
+    await new Promise(r => setTimeout(r, 50));
+  await new Promise(r => setTimeout(r, 200));
+  const keys = [...document.querySelectorAll('.field[data-field-key]')].map(n => n.dataset.fieldKey);
+  const disabled = (k) => document.querySelector('.field[data-field-key="' + k + '"] select, .field[data-field-key="' + k + '"] input')?.disabled;
+  return {
+    fields: document.querySelectorAll('#configForm .field[data-field-key]').length,
+    has: ['buttonMode', 'logTriggers', 'ttlInput'].every(k => keys.includes(k)),
+    pageOwned: ['buttonMode', 'ttlInput'].map(k => getComputedStyle(document.querySelector('.field[data-field-key="' + k + '"]')).display),
+    tile: document.getElementById('eventMarkerGroup')?.querySelector('h3').textContent,
+    markers: [...document.querySelectorAll('#eventMarkerGroup label')].map(l => l.textContent.trim()),
+    startup: fieldsIn('sdLogging.startup'),
+    groups,
+    logging: document.getElementById('buttonLogging')?.value,
+    options: [...(document.getElementById('buttonLogging')?.options ?? [])].map(o => o.textContent),
+    triggersOff: disabled('logTriggers'),
+    buttonStartOff: disabled('buttonStart'),
+    support: document.querySelector('#eventCard .muted').textContent,
+    optedIn: window.mockTransport.events.optedIn,
+    rows: [...document.querySelectorAll('#eventTable tbody tr')].map(r => r.cells[1].textContent),
+    summary: document.getElementById('eventChannelSummary')?.textContent ?? null,
+  };
+`,
+);
+check(
+  "the form gains byte 232's three fields, and only then",
+  evtUp.has && evtUp.fields === 41,
+  `${evtUp.fields} fields`,
+);
+check(
+  "button presses and the TTL input are event markers in Sensor Enables, and how a log starts is in Start-up",
+  evtUp.tile === "Event markers" &&
+    evtUp.markers.join("|") === "Button presses|TTL input" &&
+    evtUp.pageOwned.every((d) => d === "none") &&
+    !evtUp.groups.includes("Button and Event Channel") &&
+    evtUp.startup.join("|") ===
+      "Button Starts and Stops Logging|Start Logging On Button Press|Single-Touch Start|What Else Starts Logging" &&
+    evtUp.options.length === 4 &&
+    evtUp.logging === "asBefore",
+  `${evtUp.markers.join(", ")} | start-up ${evtUp.startup.join(", ")}`,
+);
+check(
+  "as before, What Else Starts Logging is greyed out, as the sensor does not read it",
+  evtUp.triggersOff === true && evtUp.buttonStartOff === false,
+  `triggers disabled ${evtUp.triggersOff}, Start Logging On Button Press disabled ${evtUp.buttonStartOff}`,
+);
+check(
+  "the page opts in, and the inputs' state at the opt-in arrives",
+  evtUp.optedIn &&
+    /has the event channel/.test(evtUp.support) &&
+    evtUp.rows.length === 1 &&
+    evtUp.rows[0] === "Initial state",
+  JSON.stringify(evtUp.rows),
+);
+check(
+  "a 0xFF or 0 byte is summarised as Start Logging On Button Press deciding",
+  /As before leaves this to Start Logging On Button Press/.test(
+    evtUp.summary ?? "",
+  ),
+  evtUp.summary,
+);
+
+// An older host can leave single touch (byte 218 bit 7) set. LogAndStream is
+// built without it and clears it, so it must not stop the undock start. The
+// TCXO (bit 4) is set too: no build supports it, and Apply clears it below.
+const evtSingle = await evaluate(`
+  await window.mockClient.writeInfoMem(218, new Uint8Array([0x90]));
+  document.getElementById('btnRead').click();
+  const node = document.getElementById('eventChannelSummary');
+  for (let i = 0; i < 60 && !/Single-Touch/.test(node.textContent); i++)
+    await new Promise(r => setTimeout(r, 50));
+  return node.textContent;
+`);
+check(
+  "a single-touch bit left by an older host is summarised as cleared, and the undock start stands",
+  /Leaving the dock \(or unplugging USB-C\) starts logging/.test(evtSingle) &&
+    /will clear Single-Touch Start/.test(evtSingle),
+  evtSingle,
+);
+
+const evtEdit = await evaluate(`
+  const wait = () => new Promise(r => setTimeout(r, 100));
+  const select = document.getElementById('buttonLogging');
+  const choose = (s, v) => { s.value = String(v); s.dispatchEvent(new Event('change', { bubbles: true })); };
+  const disabled = (k) => document.querySelector('.field[data-field-key="' + k + '"] select, .field[data-field-key="' + k + '"] input')?.disabled;
+  document.getElementById('markerButton').click();
+  await wait();
+  const ticked = {
+    logging: select.value,
+    disabled: [...select.options].filter(o => o.disabled).map(o => o.value),
+    options: select.options.length,
+    note: document.getElementById('buttonLoggingNote').textContent,
+    moved: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+      .filter(l => /Button presses recorded/.test(l)).length,
+    triggersOff: disabled('logTriggers'),
+    buttonStartOff: disabled('buttonStart'),
+  };
+  choose(select, 'doublePress');
+  await wait();
+  choose(document.querySelector('.field[data-field-key="logTriggers"] select'), 0);
+  await wait();
+  document.getElementById('markerTtl').click();
+  await wait();
+  return {
+    ticked,
+    summary: document.getElementById('eventChannelSummary').textContent,
+    config: document.querySelector('#eventCard .field-hint').textContent,
+  };
+`);
+check(
+  "ticking Button presses moves the button off As before, and marks As before and Single press disabled rather than removing them",
+  evtEdit.ticked.logging === "none" &&
+    evtEdit.ticked.disabled.join("|") === "asBefore|singlePress" &&
+    evtEdit.ticked.options === 4 &&
+    /a single press cannot start or stop logging/.test(evtEdit.ticked.note) &&
+    evtEdit.ticked.moved === 1 &&
+    evtEdit.ticked.triggersOff === false &&
+    evtEdit.ticked.buttonStartOff === true,
+  JSON.stringify(evtEdit.ticked).slice(0, 200),
+);
+check(
+  "markers with a double press and TTL are spelled out, Start Logging On Button Press included",
+  /A double press starts and stops logging/.test(evtEdit.summary) &&
+    /Every press and release is recorded/.test(evtEdit.summary) &&
+    /Leaving the dock does not start logging/.test(evtEdit.summary) &&
+    /The TTL input is recorded/.test(evtEdit.summary) &&
+    /set Start Logging On Button Press to on/.test(evtEdit.summary) &&
+    /records button presses and the TTL input/.test(evtEdit.config),
+  evtEdit.summary,
+);
+
+const evtApply = await evaluate(`
+  window.confirm = () => true;
+  const btn = document.getElementById('btnApply');
+  btn.click();
+  for (let i = 0; i < 100 && document.getElementById('dirtyPill')?.textContent !== '0 changes'; i++)
+    await new Promise(r => setTimeout(r, 100));
+  await new Promise(r => setTimeout(r, 300));
+  const im = await window.mockClient.readInfoMemBytes();
+  return { b232: im[232], b217: im[217], b218: im[218], summary: document.getElementById('eventChannelSummary').textContent,
+    tcxoLogged: [...document.querySelectorAll('#log .log-line')].some(l => /TCXO: cleared/.test(l.textContent)) };
+`);
+check(
+  "Apply writes 0x24, holds Start Logging On Button Press on and clears single touch and the TCXO, as the firmware would",
+  evtApply.b232 === 0x24 &&
+    (evtApply.b217 & 0x20) === 0x20 &&
+    (evtApply.b218 & 0x90) === 0 &&
+    evtApply.tcxoLogged,
+  `byte 232 0x${evtApply.b232?.toString(16)}, byte 217 0x${evtApply.b217?.toString(16)}, byte 218 0x${evtApply.b218?.toString(16)}`,
+);
+
+const evtStatus = await evaluate(`
+  document.getElementById('btnEventStatus').click();
+  await new Promise(r => setTimeout(r, 600));
+  return document.querySelector('#eventCard .field-hint.mono').textContent;
+`);
+check(
+  "Read status shows the event channel's own view of the link",
+  /^Inputs on: button \+ TTL/.test(evtStatus) &&
+    /stream yes/.test(evtStatus) &&
+    /TTL armed/.test(evtStatus),
+  evtStatus,
+);
+
+const evtStream = await evaluate(`
+  document.getElementById('tabBtnStream').click();
+  document.getElementById('btnStreamStart').click();
+  await new Promise(r => setTimeout(r, 1500));
+  const ev = window.mockTransport.events;
+  ev.button(true);
+  await new Promise(r => setTimeout(r, 120));
+  ev.button(false);
+  await new Promise(r => setTimeout(r, 300));
+  ev.ttl(true);
+  await new Promise(r => setTimeout(r, 40));
+  ev.ttl(false);
+  await new Promise(r => setTimeout(r, 800));
+  const rows = [...document.querySelectorAll('#eventTable tbody tr')].map(r => r.cells[1].textContent + '#' + r.cells[2].textContent);
+  const out = {
+    rows,
+    crcFailures: window.mockClient.crcFailures,
+    loss: [...document.querySelectorAll('#stats *')].map(n => n.textContent).join('|'),
+    logs: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent).filter(l => /event: /.test(l)).length,
+  };
+  document.getElementById('btnStreamStop').click();
+  await new Promise(r => setTimeout(r, 500));
+  return out;
+`);
+check(
+  "button and TTL records arrive mid-stream, in order, and no packet is lost to them",
+  evtStream.rows.slice(0, 4).join(",") ===
+    "TTL low#4,TTL high#3,Button released#2,Button pressed#1" &&
+    evtStream.crcFailures === 0 &&
+    /LOSS\|?0\.0 %/i.test(evtStream.loss) &&
+    evtStream.logs === 4,
+  `${evtStream.rows.slice(0, 4).join(", ")} | crc failures ${evtStream.crcFailures}`,
+);
+
+/* The worked example in log-and-stream-common docs/SHIMMER3_EVENT_CHANNEL.md
+   §5: a Shimmer3R on v1.01.025, both inputs on, a 64-byte header and 17
+   records. */
+const WORKED_EVENT_FILE = [
+  "53 45 56 54 01 40 10 0A 00 20 12 37 72 35 00 00",
+  "00 00 00 00 00 00 00 00 90 5C E4 6A 03 00 01 00",
+  "01 19 00 00 01 03 00 00 00 00 00 00 00 00 00 00",
+  "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+  "01 00 00 00 A4 D0 11 37 72 35 00 00 00 01 00 00",
+  "01 00 01 00 71 DD 11 37 72 35 00 00 00 00 00 00",
+  "01 00 02 00 EC F1 11 37 72 35 00 00 00 01 00 00",
+  "01 00 03 00 48 01 12 37 72 35 00 00 00 00 00 00",
+  "02 00 04 00 00 20 12 37 72 35 00 00 FF 00 00 00",
+  "01 00 05 00 33 53 18 37 72 35 00 00 00 01 00 00",
+  "01 00 06 00 3D 6A 18 37 72 35 00 00 00 00 00 00",
+  "01 01 07 00 04 20 21 37 72 35 00 00 01 02 00 00",
+  "01 01 08 00 4C 21 21 37 72 35 00 00 01 00 00 00",
+  "01 01 09 00 10 A0 28 37 72 35 00 00 01 02 00 00",
+  "01 01 0A 00 58 A1 28 37 72 35 00 00 01 00 00 00",
+  "03 00 0B 00 00 20 4E 37 72 35 00 00 FF 00 00 00",
+  "01 00 0C 00 00 20 5D 37 72 35 00 00 00 01 00 00",
+  "01 00 0D 00 14 2E 5D 37 72 35 00 00 00 00 00 00",
+  "01 00 0E 00 66 46 5D 37 72 35 00 00 00 01 00 00",
+  "01 00 0F 00 7B 54 5D 37 72 35 00 00 00 00 00 00",
+  "03 80 10 00 AE 87 5D 37 72 35 00 00 FF 00 00 00",
+].join(" ");
+const evtFileView = await evaluate(`
+  const bytes = new Uint8Array(${JSON.stringify(WORKED_EVENT_FILE)}.split(" ").map(h => parseInt(h, 16)));
+  const ok = window.eventChannelPanel.loadFile(bytes, "NNN");
+  return {
+    ok,
+    line: [...document.querySelectorAll('#eventCard .field-hint')].map(n => n.textContent).find(t => /^NNN:/.test(t)),
+    rows: [...document.querySelectorAll('#eventTable tbody tr')].map(r => r.cells[1].textContent),
+    kv: document.querySelector('#eventCard .kv').innerText,
+    csv: !document.getElementById('btnEventCsv').disabled,
+  };
+`);
+check(
+  "an event file opens in the card: its header in words, its records in the table",
+  evtFileView.ok &&
+    /Shimmer3R, firmware 1\.01\.025/.test(evtFileView.line ?? "") &&
+    /records button \+ TTL; 17 records\./.test(evtFileView.line ?? "") &&
+    evtFileView.rows.length === 17 &&
+    evtFileView.rows[0] === "End of file" &&
+    evtFileView.rows.filter((r) => r === "TTL high").length === 2 &&
+    /Button edges\s+10/.test(evtFileView.kv) &&
+    /TTL edges\s+4/.test(evtFileView.kv) &&
+    evtFileView.csv,
+  evtFileView.line,
+);
+
+/* The SD tab, on firmware that writes events/ beside data/. The mock's card
+   has two event files for the first session, none for the second, and one
+   for a third session whose data files are gone. */
+const evtSdList = await evaluate(
+  MEMFS +
+    `
+  document.querySelector('.tabs [data-tab="tabSd"]').click();
+  await window.sdBrowser.refresh();
+  const rows = [...document.querySelectorAll('[data-sd-role="tree"] > ul > li')].map(li => ({
+    path: li.querySelector('label').textContent.trim(),
+    meta: li.querySelector(':scope > .sd-size').textContent,
+    events: [...li.querySelectorAll('[data-sd-companion-file]')].map(f => f.dataset.sdCompanionFile),
+  }));
+  return { rows, stats: window.__sdStats(),
+    cardEvents: window.mockTransport.sdCard.files.filter(f => f.path.startsWith('events/')).length };
+`,
+);
+check(
+  "the SD tab lists event files under their sessions, and one with no data files on its own row",
+  evtSdList.rows.length === 3 &&
+    /^data\/DefaultTrial_5f2c1a90\/Shimmer_\w+-000$/.test(
+      evtSdList.rows[0].path,
+    ) &&
+    /^2 file\(s\), 327\.2 KB; 2 event file\(s\), /.test(
+      evtSdList.rows[0].meta,
+    ) &&
+    evtSdList.rows[0].events.length === 2 &&
+    evtSdList.rows[0].events.every((p) => /^events\/.*-000\/00[01]$/.test(p)) &&
+    evtSdList.rows[1].events.length === 0 &&
+    !/event/.test(evtSdList.rows[1].meta) &&
+    /^events\/DefaultTrial_5f2c1a90\/Shimmer_\w+-002$/.test(
+      evtSdList.rows[2].path,
+    ) &&
+    /^no data files; 1 event file\(s\), /.test(evtSdList.rows[2].meta) &&
+    evtSdList.stats.files === "5 + 3 event file(s)" &&
+    evtSdList.cardEvents === 3,
+  evtSdList.rows.map((r) => `${r.path} [${r.meta}]`).join(" | ") +
+    ` | files ${evtSdList.stats.files}`,
+);
+
+const evtSdConsensys = await evaluate(`
+  window.sdBrowser.setLayout('consensysBackup');
+  await window.__useFs('EvConsensys');
+  const preview = window.__sdRole('preview').textContent;
+  const orphan = [...document.querySelectorAll('[data-sd-path]')].map(b => b.dataset.sdPath)
+    .find(p => p.startsWith('events/'));
+  await window.sdBrowser.download([orphan], { deleteVerified: true });
+  // The event log flushes on an animation frame.
+  await new Promise(r => requestAnimationFrame(() => setTimeout(r, 60)));
+  const said = [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+    .filter(l => /Consensys Backup layout leaves/.test(l)).join(' | ');
+  return { preview, written: window.__fs.files.size, said,
+    cardEvents: window.mockTransport.sdCard.files.filter(f => f.path.startsWith('events/')).length };
+`);
+check(
+  "a Consensys Backup download leaves the event files on the card, and says so",
+  /Event files stay on the card/.test(evtSdConsensys.preview) &&
+    evtSdConsensys.written === 0 &&
+    /Choose Mirror SD card structure to download them/.test(
+      evtSdConsensys.said,
+    ) &&
+    evtSdConsensys.cardEvents === 3,
+  `${evtSdConsensys.preview} | ${evtSdConsensys.said}`,
+);
+
+const evtSdMirror = await evaluate(`
+  const sdk = await import('/vendor/shimmer-web-sdk.esm.js');
+  window.sdBrowser.setLayout('card');
+  await window.__useFs('EvMirror');
+  const preview = window.__sdRole('preview').textContent;
+  const session = [...document.querySelectorAll('[data-sd-path]')].map(b => b.dataset.sdPath)
+    .find(p => p.endsWith('-000'));
+  await window.sdBrowser.download([session], { deleteVerified: true });
+  const got = [...window.__fs.files.entries()].map(([path, bytes]) => ({ path, size: bytes.length }));
+  const decode = (suffix) => {
+    const key = [...window.__fs.files.keys()].find(k => k.startsWith('events/') && k.endsWith(suffix));
+    if (!key) return null;
+    const f = sdk.parseEventFile(window.__fs.files.get(key));
+    return { records: f.records.length, complete: f.complete, firstSeq: f.header.firstSeq,
+      openReason: f.header.openReason, inputs: f.header.inputs };
+  };
+  return { preview, got, first: decode('-000/000'), split: decode('-000/001'),
+    card: window.mockTransport.sdCard.files.map(f => f.path),
+    dirs: window.mockTransport.sdCard.dirs };
+`);
+check(
+  "a Mirror SD card structure download takes a session's event files with it, and they decode",
+  /, and event files to EvMirror\/events\/…$/.test(evtSdMirror.preview) &&
+    evtSdMirror.got
+      .map((f) => f.path.split("/")[0])
+      .sort()
+      .join() === "data,data,events,events" &&
+    evtSdMirror.first?.records === 8 &&
+    evtSdMirror.first?.complete === true &&
+    evtSdMirror.first?.openReason === 1 &&
+    evtSdMirror.first?.inputs === 3 &&
+    evtSdMirror.split?.records === 4 &&
+    evtSdMirror.split?.firstSeq === 8 &&
+    evtSdMirror.split?.openReason === 2,
+  `${evtSdMirror.got.map((f) => `${f.path} ${f.size}B`).join(" | ")}`,
+);
+/* Only files: a session download leaves the session folder it was asked for,
+   emptied, on both sides of the card -- as it always has under data/. */
+check(
+  "deleting after a verified download clears the session's event files as well as its data files",
+  !evtSdMirror.card.some((p) => /-000\//.test(p)) &&
+    evtSdMirror.card.filter((p) => p.startsWith("events/")).length === 1 &&
+    evtSdMirror.dirs.some((d) => /^events\/.*-000$/.test(d)) ===
+      evtSdMirror.dirs.some((d) => /^data\/.*-000$/.test(d)),
+  `card now ${evtSdMirror.card.join(", ")}`,
+);
+
+// What the Download all button runs.
+const evtSdAll = await evaluate(`
+  await window.__useFs('EvAll');
+  await window.sdBrowser.download(['data'], { deleteVerified: true });
+  return { got: [...window.__fs.files.keys()],
+    card: window.mockTransport.sdCard.files.map(f => f.path),
+    dirs: window.mockTransport.sdCard.dirs };
+`);
+check(
+  "Download all takes every event file, the one with no data files included, and clears the card",
+  evtSdAll.got.filter((k) => k.startsWith("data/")).length === 3 &&
+    evtSdAll.got.filter((k) => k.startsWith("events/")).length === 1 &&
+    evtSdAll.got.some((k) => /^events\/.*-002\/000$/.test(k)) &&
+    evtSdAll.card.length === 0 &&
+    evtSdAll.dirs.join() === "data,events",
+  `${evtSdAll.got.join(" | ")} | card dirs ${evtSdAll.dirs.join(", ")}`,
+);
+
+await goto(`${BASE}?mock=1&events=1&srBoard=48-6-0`);
+await evaluate(CONNECT);
+const evtBoard = await evaluate(`
+  await new Promise(r => setTimeout(r, 300));
+  return {
+    press: document.getElementById('markerButton')?.disabled,
+    ttl: document.getElementById('markerTtl')?.disabled,
+    why: document.getElementById('markerTtlLabel')?.title,
+  };
+`);
+check(
+  "on an SR48-6-0 board both event markers are shown, disabled",
+  evtBoard.press === true &&
+    evtBoard.ttl === true &&
+    /no TTL input/.test(evtBoard.why ?? ""),
+  JSON.stringify(evtBoard),
 );
 
 // ===========================================================================

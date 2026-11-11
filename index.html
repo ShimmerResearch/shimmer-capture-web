@@ -127,6 +127,17 @@
         flex: 0 0 auto;
       }
 
+      .sensor-group > .field-hint {
+        margin-top: 6px;
+      }
+
+      /* A schema field whose control the page draws itself, elsewhere: kept in
+         the form, so it is still read, written and listed as a change, but not
+         shown twice. A class rather than `hidden`, which search toggles. */
+      .field.page-owned {
+        display: none !important;
+      }
+
       /* Sensor link on the left, device identity on the right.
 
          `minmax(0, …)` on both tracks rather than `1fr 340px`: a grid item's
@@ -923,6 +934,9 @@
           </div>
         </div>
 
+        <!-- common/event-channel-panel.js builds the button and TTL events card here. -->
+        <div id="eventPanel"></div>
+
         <div id="plots"></div>
       </section>
 
@@ -1144,6 +1158,7 @@
       } from "./common/shimmer3-config-schema.js";
       import { createStreamPlot } from "./common/plot.js";
       import { createStreamStats } from "./common/stream-stats.js";
+      import { createEventChannelPanel } from "./common/event-channel-panel.js";
       import { createSdBrowser } from "./common/sd-browser.js";
       import { createBrandEditor } from "./common/brand-editor.js";
       import { createCalibrationEditor } from "./common/calibration-editor.js";
@@ -1564,6 +1579,18 @@
       let srBoard = null;
 
       /**
+       * Whether the firmware has the event channel, and with it configuration
+       * byte 232 (DEV-971), as the sensor answered at connect. No release has
+       * it, and the builds that do report the release before them, so the page
+       * asks rather than reading the version. Over USB the dock protocol cannot
+       * ask, so it stays false there and the form leaves the byte out.
+       */
+      let eventChannel = false;
+      /** The last stream frame's raw device timestamp and its x on the plot, to place event markers. */
+      let lastFrameTs = null;
+      let lastFrameX = null;
+
+      /**
        * What to put on the Device row.
        *
        * The sensor's own configured name comes first. It is the name the
@@ -1801,6 +1828,20 @@
             !otaBusy,
         );
         paintSdGating();
+
+        /* The status command answers with a reply the stream parser does not
+                 take mid-stream, so it is offered only while idle. */
+        evtPanel.setEnabled(
+          !!client &&
+            eventChannel &&
+            !streaming &&
+            !busy &&
+            !sdBusy &&
+            !brandBusy &&
+            !calibBusy &&
+            !testBusy &&
+            !otaBusy,
+        );
 
         brand.setEnabled(
           !!client &&
@@ -2619,7 +2660,143 @@
             ),
           );
         }
+        /* Byte 232's two recorded inputs, as enables beside the sensors
+                 (DEV-971). They are events, not samples: time-stamped records
+                 beside the data file, in events/, and sent to this page while
+                 it is connected. Only on firmware with the event channel. */
+        if (layout?.idxButtonLogMode !== undefined) {
+          grid.appendChild(
+            el(
+              "div",
+              { class: "sensor-group", id: "eventMarkerGroup" },
+              el("h3", {}, "Event markers"),
+              el(
+                "label",
+                { id: "markerButtonLabel" },
+                el("input", {
+                  type: "checkbox",
+                  id: "markerButton",
+                  onchange: onMarkerToggle,
+                }),
+                "Button presses",
+              ),
+              el(
+                "label",
+                { id: "markerTtlLabel" },
+                el("input", {
+                  type: "checkbox",
+                  id: "markerTtl",
+                  onchange: onMarkerToggle,
+                }),
+                "TTL input",
+              ),
+              el("div", {
+                class: "field-hint muted",
+                text:
+                  "Time-stamped events recorded beside the data file (events/ on the card), " +
+                  "and sent to this page while it is connected. Not sampled: they add no " +
+                  "columns and do not change the sampling rate.",
+              }),
+            ),
+          );
+        }
         return grid;
+      }
+
+      /**
+       * An event-marker box moved: byte 232's press recording or TTL input.
+       *
+       * Recording presses takes a button that does not start and stop logging
+       * on a single press, so a marker can never stop a recording. Ticking it
+       * moves Button Starts and Stops Logging to the nearest choice that can
+       * go with it (`withPressRecording`), and says so; unticking it keeps the
+       * button's part in logging (`withoutPressRecording`).
+       */
+      function onMarkerToggle(event) {
+        const at = layout?.idxButtonLogMode;
+        if (at === undefined || !form) return;
+        const image = form.getImage();
+        let byte = sdk.correctButtonLogMode(image[at]);
+        if (event.target.id === "markerTtl") {
+          byte = event.target.checked
+            ? byte | sdk.BUTTON_LOG_MODE.TTL_INPUT
+            : byte & ~sdk.BUTTON_LOG_MODE.TTL_INPUT & 0xff;
+        } else {
+          const before = sdk.splitButtonMode(byte).logging;
+          byte = event.target.checked
+            ? sdk.withPressRecording(byte, fieldValue("buttonStart") === 1)
+            : sdk.withoutPressRecording(byte);
+          const after = sdk.splitButtonMode(byte).logging;
+          if (after !== before) {
+            log.log(
+              `Button presses recorded: Button Starts and Stops Logging moves from ` +
+                `"${buttonLoggingLabel(before)}" to "${buttonLoggingLabel(after)}", ` +
+                `so a marker press can never stop a recording`,
+            );
+          }
+        }
+        image[at] = byte;
+        form.refresh();
+        afterImageEdit();
+      }
+
+      /** Button Starts and Stops Logging moved. Options that cannot go with press recording are disabled, so cannot be chosen. */
+      function onButtonLoggingChange(event) {
+        const at = layout?.idxButtonLogMode;
+        if (at === undefined || !form) return;
+        const image = form.getImage();
+        const settings = sdk.decodeButtonLogMode(image[at]);
+        const mode = sdk.joinButtonMode({
+          recordsPresses: sdk.splitButtonMode(image[at]).recordsPresses,
+          logging: event.target.value,
+        });
+        if (mode !== null) {
+          image[at] = sdk.encodeButtonLogMode({
+            ...settings,
+            buttonMode: mode,
+          });
+          form.refresh();
+        }
+        afterImageEdit();
+      }
+
+      function buttonLoggingLabel(value) {
+        return (
+          sdk.BUTTON_LOGGING_OPTIONS.find(([v]) => v === value)?.[1] ?? value
+        );
+      }
+
+      /**
+       * Button Starts and Stops Logging: the half of byte 232's button mode
+       * that is not press recording, which is an event-marker enable. Drawn
+       * by the page because one 3-bit field holds both; the schema's Button
+       * Mode field stays in the form, hidden, so it is still listed as a
+       * change and written.
+       */
+      function buildButtonLoggingField() {
+        return el(
+          "div",
+          { class: "field", id: "buttonLoggingField" },
+          el(
+            "label",
+            { for: "buttonLogging" },
+            "Button Starts and Stops Logging",
+          ),
+          el(
+            "select",
+            { id: "buttonLogging", onchange: onButtonLoggingChange },
+            sdk.BUTTON_LOGGING_OPTIONS.map(([value, label]) =>
+              el("option", { value }, label),
+            ),
+          ),
+          el("div", {
+            class: "field-hint",
+            text:
+              "Byte 232 bits 0-2, with Sensor Enables → Event markers → Button presses. " +
+              "Not As before, it also sets Start Logging On Button Press to its nearest equivalent.",
+          }),
+          el("div", { class: "field-hint muted", id: "buttonLoggingNote" }),
+        );
       }
 
       /**
@@ -2934,7 +3111,7 @@
         form?.destroy();
         context = ctx;
         layout = sdk.resolveInfoMemLayout(ctx);
-        fields = sdk.infoMemFieldsFor(generation);
+        fields = sdk.infoMemFieldsFor(generation, layout);
         log.log(
           `configuration schema: ${fields.length} fields for ${generation}`,
         );
@@ -3010,6 +3187,28 @@
           samplingBody.insertBefore(buildRateHelper(), samplingBody.firstChild);
         }
 
+        /* Byte 232 (DEV-971). Press recording and the TTL input are event
+                 markers in Sensor Enables; how a log starts is SD Logging's
+                 Start-up, which opens with what the sensor will actually do,
+                 worked out by the firmware's own rules, then the button's part
+                 in logging. The schema's Button Mode and TTL fields stay in the
+                 form, hidden, because the page draws their controls. */
+        const startup = host.querySelector(
+          '[data-subgroup-id="sdLogging.startup"] .grid',
+        );
+        if (startup && layout?.idxButtonLogMode !== undefined) {
+          for (const key of ["buttonMode", "ttlInput"]) {
+            host
+              .querySelector(`.field[data-field-key="${key}"]`)
+              ?.classList.add("page-owned");
+          }
+          startup.insertBefore(buildButtonLoggingField(), startup.firstChild);
+          startup.parentNode.insertBefore(
+            el("div", { class: "field-hint", id: "eventChannelSummary" }),
+            startup,
+          );
+        }
+
         /* The two ExG register banks are opaque 10-byte runs, and the ExG
                  preset above is what installs a known-good one. They stay editable
                  for anyone who really does have a register bank to paste, but they
@@ -3030,12 +3229,176 @@
 
       /** Called after anything changes the working image. */
       function afterImageEdit() {
+        syncEventChannel();
         syncSensorGrid();
         syncRateReadout();
         syncRateCoverage();
         syncSensorRules();
         renderHex();
         regate();
+      }
+
+      /**
+       * Configuration byte 232 (DEV-971), in words: what the button does, what
+       * starts logging and which inputs the event channel records, as the
+       * firmware will read the image now in the form. Also tells the events
+       * card what is being recorded.
+       */
+      function syncEventChannel() {
+        const node = $("eventChannelSummary");
+        const at = layout?.idxButtonLogMode;
+        const image = form?.getImage();
+        if (at === undefined || !image) {
+          if (node) node.textContent = "";
+          evtPanel.setConfig(null);
+          return;
+        }
+        const ube = fieldValue("buttonStart") === 1;
+        // Single touch is left out: LogAndStream is built without it, and clears it
+        const d = sdk.describeButtonLogMode(image[at], ube);
+        evtPanel.setConfig(image[at]);
+        syncButtonControls(image[at]);
+        if (!node) return;
+        const said = [];
+        if (d.buttonDisabled)
+          said.push("The button does nothing, and its LED stays dark.");
+        else if (d.pressTogglesLogging)
+          said.push(
+            d.doublePress
+              ? "A double press starts and stops logging."
+              : "A press starts and stops logging.",
+          );
+        else said.push("A press does not start or stop logging.");
+        if (d.recordsPresses) said.push("Every press and release is recorded.");
+        said.push(
+          d.loggingDisabled
+            ? "SD logging is off: nothing can start it."
+            : d.undockStartsLogging
+              ? "Leaving the dock (or unplugging USB-C) starts logging."
+              : "Leaving the dock does not start logging.",
+        );
+        if (d.ttlInput) said.push("The TTL input is recorded.");
+        if (d.buttonMode === 0) {
+          said.push(
+            "As before leaves this to Start Logging On Button Press, and What Else Starts Logging is not read.",
+          );
+        } else if (d.userButtonEnable !== ube) {
+          said.push(
+            `The sensor will set Start Logging On Button Press to ${d.userButtonEnable ? "on" : "off"}, the nearest equivalent for firmware and hosts that know only that setting.`,
+          );
+        }
+        if (fieldValue("singleTouch") === 1) {
+          said.push(
+            "The sensor will clear Single-Touch Start, which its firmware does not act on.",
+          );
+        }
+        if (d.corrected !== image[at] && image[at] !== 0xff) {
+          said.push(
+            `As stored (0x${image[at].toString(16).padStart(2, "0")}) the sensor reads it as 0x${d.corrected.toString(16).padStart(2, "0")}; that is what Apply writes.`,
+          );
+        }
+        node.textContent = said.join(" ");
+      }
+
+      /**
+       * The event-marker boxes, Button Starts and Stops Logging, and which of
+       * byte 217's and 232's other fields the sensor reads, from the byte.
+       *
+       * An option that cannot go with press recording stays in the list,
+       * disabled, so the choice is still there to see. A board without the
+       * button's edges or the TTL input (SR48-6-0) has those boxes disabled.
+       */
+      function syncButtonControls(raw) {
+        const parts = sdk.splitButtonMode(raw);
+        const board = sdk.eventChannelBoardSupport(
+          context?.hardwareVersion ?? 10,
+          srBoard,
+        );
+        const press = $("markerButton");
+        const ttl = $("markerTtl");
+        if (press) {
+          press.checked = parts.recordsPresses;
+          press.disabled = !board.recordsButtonEdges;
+          $("markerButtonLabel").title = board.recordsButtonEdges
+            ? "Every press and release, time-stamped. A single press then cannot start or stop logging, so a marker can never stop a recording."
+            : "This board's button is used for dock detection, so its presses cannot be recorded (SR48-6-0).";
+        }
+        if (ttl) {
+          ttl.checked = sdk.isTtlInputEnabled(raw);
+          ttl.disabled = !board.ttlInputSupported;
+          $("markerTtlLabel").title = board.ttlInputSupported
+            ? "Each edge of the TTL input, time-stamped: P1.5 on Shimmer3, PE9 on Shimmer3R, at board logic level."
+            : "This board has no TTL input (SR48-6-0).";
+        }
+        const select = $("buttonLogging");
+        if (select) {
+          select.value = parts.logging;
+          for (const option of select.options) {
+            option.disabled =
+              parts.recordsPresses && !sdk.canRecordPressesWith(option.value);
+          }
+          $("buttonLoggingNote").textContent = parts.recordsPresses
+            ? "With Button presses recorded, a single press cannot start or stop logging, so a marker can never stop a recording; and As before has no setting that records. Untick Button presses to choose them."
+            : "";
+        }
+        const asBefore = parts.logging === sdk.BUTTON_LOGGING.AS_BEFORE;
+        form.setFieldSupport(
+          "logTriggers",
+          !asBefore,
+          "Not read while Button Starts and Stops Logging is As before: Start Logging On Button Press decides.",
+        );
+        form.setFieldSupport(
+          "buttonStart",
+          asBefore,
+          "Button Starts and Stops Logging decides. The sensor sets this to the nearest equivalent, for firmware and hosts that know only this setting.",
+        );
+      }
+
+      /**
+       * Make the checks the firmware makes on byte 232 when it takes a
+       * configuration, so what Apply writes is what it reads back: the byte
+       * corrected, Start Logging On Button Press held to it, single touch
+       * cleared, and no press recording or TTL input on a board without them.
+       */
+      function conformEventChannel() {
+        if (!form || layout?.idxButtonLogMode === undefined) return;
+        const changed = sdk.applyButtonLogModeRules(
+          form.getImage(),
+          layout,
+          sdk.eventChannelBoardSupport(context?.hardwareVersion ?? 10, srBoard),
+        );
+        if (changed.length) {
+          form.refresh();
+          log.log(
+            `byte 232: set ${changed.map((i) => `byte ${i}`).join(", ")} as the sensor will`,
+          );
+          afterImageEdit();
+        }
+      }
+
+      /**
+       * One record from the sensor's event channel: into the events card, and
+       * onto the plot while it is streaming.
+       *
+       * The record's time is the RTC the packets are timed by, and its low 24
+       * bits line up with a packet's timestamp, so it is placed by its distance
+       * from the last frame's - which keeps it right on either time axis.
+       */
+      function onEventRecord(rec) {
+        evtPanel.push(rec);
+        if (rec.type === sdk.EVENT_RECORD_TYPE.INITIAL_STATE) return;
+        const what = sdk.describeEventRecord(rec);
+        log.log(`event: ${what} (seq ${rec.seq})`);
+        if (!streaming || lastFrameTs === null || lastFrameX === null) return;
+        let delta = (Number(rec.ticks & 0xffffffn) - lastFrameTs) & 0xffffff;
+        if (delta >= 0x800000) delta -= 0x1000000;
+        const kind =
+          rec.channel === sdk.EVENT_CHANNEL.BUTTON
+            ? "button"
+            : rec.channel === sdk.EVENT_CHANNEL.TTL
+              ? "ttl"
+              : "other";
+        plot.pushEvent(lastFrameX + delta / 32768, what, kind);
       }
 
       /**
@@ -3462,6 +3825,20 @@
       }
 
       /**
+       * Clear the TCXO bit, as the firmware does when it takes a configuration
+       * (no LogAndStream build supports one), so what Apply writes is what the
+       * sensor reads back. The form does not offer the setting.
+       */
+      function conformTcxo() {
+        if (!form || !layout || typeof sdk.applyTcxoRule !== "function") return;
+        if (sdk.applyTcxoRule(form.getImage(), layout).length) {
+          form.refresh();
+          log.log("TCXO: cleared, as the sensor will; no firmware supports it");
+          afterImageEdit();
+        }
+      }
+
+      /**
        * Apply the plan `buildApplyPlan` produced, in its order.
        *
        * The order is the firmware's, not a preference: the stored image first,
@@ -3472,6 +3849,8 @@
        * what was written.
        */
       async function applyConfiguration() {
+        conformEventChannel();
+        conformTcxo();
         const plan = currentPlan();
         if (plan.blocked) {
           showToast(plan.blocked, "warn");
@@ -3678,6 +4057,16 @@
 
       const plot = createStreamPlot($("plots"), { windowSec: 10, maxFps: 30 });
       const stats = createStreamStats($("stats"), { windowMillis: 2000 });
+      /* The sensor's button and TTL records (DEV-971): live from a firmware
+               that has the event channel, or from an event file opened from disk. */
+      const evtPanel = createEventChannelPanel($("eventPanel"), {
+        onReadStatus: () =>
+          tryDevice("read the event channel status", () =>
+            client.getEventChannelStatus(),
+          ),
+        downloadBlob,
+        log: (msg) => log.log(msg),
+      });
       const recorder = sdk.createCsvRecorder({
         fileNameFn: () => recordFileName(),
         download: downloadBlob,
@@ -3714,6 +4103,10 @@
                  because `deviceMac` is filled in during the connect handshake,
                  after this panel is mounted. */
         macId: () => deviceMac,
+        /* Firmware with the event channel writes event files, in events/
+                 beside data/. A getter, because the connect handshake is what
+                 finds out. */
+        companionFiles: () => eventChannel,
         onBusyChange: (transferring) => {
           sdBusy = transferring;
           regate();
@@ -4332,6 +4725,8 @@
         stats.reset(streamRateHz, streamFrameBytes);
         csvColumns = null;
         schemaFromFrame = false;
+        lastFrameTs = null;
+        lastFrameX = null;
 
         client.onStreamFrame = onFrame;
         try {
@@ -4497,6 +4892,11 @@
             ? deviceMs / 1000
             : hostMs / 1000;
         plot.push(oc, xSec, { unix: haveUnix });
+        const rawTs = oc.get?.("TIMESTAMP", "raw")?.value;
+        if (Number.isFinite(rawTs)) {
+          lastFrameTs = rawTs;
+          lastFrameX = xSec;
+        }
         stats.onFrame(oc, performance.now());
         if (recorder.active && recorder.push(hostMs, oc)) recordedRows++;
       }
@@ -4977,6 +5377,25 @@
           client.readInfoMemBytes(),
         );
 
+        /* The event channel and configuration byte 232 (DEV-971). Asked of
+                 the sensor, because no version says it: a SET_FEATURE opt-out that
+                 only firmware with the event channel ACKs, and which changes
+                 nothing. It brings byte 232 into the form, through the context. */
+        eventChannel = false;
+        if (caps.eventChannel) {
+          eventChannel =
+            (await tryDevice(
+              "ask whether the firmware has the event channel",
+              () => client.supportsEventChannel(),
+            )) === true;
+          log.log(
+            eventChannel
+              ? "event channel: this firmware has it, so the configuration includes byte 232"
+              : "event channel: not in this firmware",
+          );
+        }
+        evtPanel.setSupport(eventChannel ? "yes" : "no");
+
         const ctx = {
           hardwareVersion: hw?.hardwareVersion ?? 10,
           firmwareId: fw?.fwId ?? 3,
@@ -4985,6 +5404,7 @@
             minor: fw?.minor ?? 0,
             internal: fw?.patch ?? 0,
           },
+          eventChannel,
         };
         generation = sdk.inferShimmer3Generation(
           ctx,
@@ -5000,6 +5420,23 @@
             "err",
             "The configuration image could not be read, so the form below shows a blank image. Press “Read from device” to try again.",
           );
+        }
+
+        /* Take the records live for this connection. The firmware clears the
+                 opt-in on every connect and disconnect, so this is asked afresh each
+                 time; it enables no input, byte 232 does that. */
+        if (eventChannel) {
+          evtPanel.resetLink();
+          client.onEventRecord = onEventRecord;
+          const on = await tryDevice("turn the event stream on", () =>
+            client.setEventStream(true),
+          );
+          if (on !== true) {
+            client.onEventRecord = null;
+            log.warn(
+              "event channel: the sensor did not take the opt-in, so no records will arrive live",
+            );
+          }
         }
 
         /* And the calibration, for the same reason the configuration image is
@@ -5116,6 +5553,10 @@
         });
         $("hostClock").textContent = formatClock(Date.now());
 
+        /* The dock protocol has no SET_FEATURE, so there is no asking whether
+                 the firmware has byte 232: the form leaves it out over USB. */
+        eventChannel = false;
+        evtPanel.setSupport("usb");
         const ctx = {
           hardwareVersion: id?.hardwareVersion ?? 10,
           firmwareId: version?.firmwareIdentifier ?? 3,
@@ -5231,6 +5672,10 @@
         /* A status pushed by a link the page has already let go would paint a
                  departed sensor's flags into a panel that is about to say "–". */
         if (client) client.onDeviceStatus = null;
+        if (client) client.onEventRecord = null;
+        eventChannel = false;
+        evtPanel.setSupport("none");
+        evtPanel.resetLink();
         client = null;
         mode = null;
         caps = {};
@@ -5433,6 +5878,7 @@
                 : btVersion,
             pressure,
             sensors,
+            eventChannel: params.get("events") === "1",
             debug: params.get("debug") === "1",
           });
           // Hooks for driving the page from the console while developing:
@@ -5451,6 +5897,7 @@
           window.calibrationEditor = cal;
           window.factoryTestPanel = selfTest;
           window.rtcDriftPanel = drift;
+          window.eventChannelPanel = evtPanel;
           /* Also the client itself, so a link's feature set can be taken
                    apart from the console: shadowing a method on it is how the
                    "this link cannot do X" paths get exercised without owning the
