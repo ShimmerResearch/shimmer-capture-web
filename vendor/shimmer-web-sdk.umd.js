@@ -13,7 +13,7 @@
      * from it by the Bump step in cut-release.yml — the release bumps this file
      * as well as package.json, so a published bundle reports its own version.
      */
-    const SDK_VERSION = '0.5.12';
+    const SDK_VERSION = '0.5.13';
 
     /**
      * Container for a single decoded sensor frame.
@@ -5260,11 +5260,13 @@
         0x13: { name: 'INT_ADC_2', fmt: 'u16', endian: 'le', sizeBytes: 2 },
         0x1a: { name: 'TEMPERATURE', fmt: 'u24', endian: 'le', sizeBytes: 3 },
         0x1b: { name: 'PRESSURE', fmt: 'u24', endian: 'le', sizeBytes: 3 },
+        // The sound level (DEV-1413): 0.01 dB(A), 0x8000 for no level.
+        0x38: { name: 'SOUND_LEVEL', fmt: 'i16', endian: 'le', sizeBytes: 2 },
     });
     /**
      * Per-generation channel table, layered over {@link CHANNEL_FORMATS}.
      *
-     * Five kinds of entry live here, and only the first is cosmetic:
+     * Six kinds of entry live here, and only the first is cosmetic:
      *
      * 1. **The ADC block, `0x0D`-`0x13`.** The IDs are reused with different
      *    meanings on the two platforms — `shimmer_sensing.h:107-122` defines
@@ -5310,6 +5312,11 @@
      *    Shimmer3R's 12-bit ADXL371 value. A Shimmer3 sends its 9-axis chip's own
      *    accelerometer there as a plain big-endian `i16`, so this layer overrides
      *    the shared entry (DEV-1338).
+     * 6. **`0x38` SOUND_LEVEL, Shimmer3R only** (DEV-1413): the microphone's
+     *    A-weighted level over its last 128 ms block, a signed 16-bit
+     *    little-endian count of 0.01 dB(A), 0x8000 for no level
+     *    (`devices/audio/soundLevel.ts`). A Shimmer3 has no microphone, so, like
+     *    the bridge amplifier the other way round, it resolves to nothing there.
      *
      * Names follow the SD-log channel tables in `devices/sdlog/channels.ts` so the
      * streamed and logged copies of the same signal carry the same label. The one
@@ -7178,6 +7185,11 @@
         MAG: 'local_flux',
         /** Microtesla. What the Verisense decoders emit for their magnetometer. */
         MICRO_TESLA: 'uT',
+        /**
+         * A-weighted sound pressure level, in decibels: the Shimmer3R sound-level
+         * channel's unit, and nominal (`devices/audio/soundLevel.ts`).
+         */
+        DECIBELS_A: 'dB(A)',
     });
 
     /**
@@ -8202,6 +8214,58 @@
     }
 
     /**
+     * The Shimmer3R sound-level channel (DEV-1413): channel id 0x38, two bytes,
+     * a signed 16-bit little-endian count of 0.01 dB(A).
+     *
+     * **What it measures.** The A-weighted sound level, LAeq, over the most recent
+     * completed 128 ms block from the microphone, in dB(A) SPL. The firmware adds
+     * the microphone's datasheet sensitivity (the board carries an MP23DB01HP or an
+     * IM68D121, and each has its own), and nothing more: no unit has been checked
+     * against a calibrated sound level meter. So the level is **nominal**, and a
+     * host should say so wherever it shows one.
+     *
+     * **No level.** `0x8000` (-32768) says there is no level to report: while
+     * capture settles, for about the first 256 ms; when it is stopped; or when it
+     * failed. {@link soundLevelDbA} turns it into `NaN`, never -327.68 dB.
+     *
+     * **When.** A value describes the block that ended 0-128 ms before the
+     * packet's timestamp, plus the main loop's latency, which can add up to about
+     * 0.2 s more while an SD card is slow. Nothing here corrects for it.
+     *
+     * **Where.** The firmware places the channel just before the ADS7028 block
+     * (GSR, the ADCs and battery), so battery stays last. Hosts take the order from
+     * the channel list, the inquiry response or the SD header, as for any channel.
+     * It is sampled while streaming, logging, or both, whenever configuration
+     * byte 233 bit 4 is set ({@link soundLevelEnabled}). A Shimmer3 never sends it.
+     *
+     * HARDWARE-VERIFY: written from the firmware specification. Decoding has since
+     * been checked against a unit's bytes: two streams (122,482 packets) and an SD
+     * data file (30,719 records) captured from a Shimmer3R on the channel's
+     * firmware build, replayed here, give the level the firmware's own test rig
+     * decoded on every one, no level included. Turning the channel on over a live
+     * link, and the readback check in mode.ts, have not run against a unit.
+     */
+    /** The channel id in the inquiry response and the SD header's channel list. */
+    const SOUND_LEVEL_CHANNEL_ID = 0x38;
+    /** The name the stream and SD decoders give the channel. */
+    const SOUND_LEVEL_NAME = 'SOUND_LEVEL';
+    /** The raw value that means no level: 0x8000 as a signed 16-bit count. */
+    const SOUND_LEVEL_NO_LEVEL = -32768;
+    /** Counts per dB(A). */
+    const SOUND_LEVEL_COUNTS_PER_DB = 100;
+    /** The calibrated value's unit: nominal dB(A) SPL. */
+    const SOUND_LEVEL_UNIT = CHANNEL_UNITS.DECIBELS_A;
+    /**
+     * A raw sound-level count in nominal dB(A) SPL, or `NaN` for the no-level value
+     * (and for anything that is not a 16-bit count).
+     */
+    function soundLevelDbA(raw) {
+        if (!Number.isInteger(raw) || raw <= SOUND_LEVEL_NO_LEVEL || raw > 32767)
+            return NaN;
+        return raw / SOUND_LEVEL_COUNTS_PER_DB;
+    }
+
+    /**
      * GSR: one raw ADC word → skin resistance, conductance, and the range that
      * produced them.
      *
@@ -8855,6 +8919,15 @@
         Exg2_Status: {
             unit: CHANNEL_UNITS.NO_UNITS,
             calibrate: (raw) => raw,
+        },
+        /*
+         * The Shimmer3R sound level (DEV-1413): 0.01 dB(A) counts, nominal. The
+         * no-level value, 0x8000, calibrates to NaN rather than -327.68 dB, and the
+         * field is still added, so a frame keeps its width while capture settles.
+         */
+        SOUND_LEVEL: {
+            unit: SOUND_LEVEL_UNIT,
+            calibrate: (raw) => soundLevelDbA(raw),
         },
     });
     // ---------------------------------------------------------------------------
@@ -15483,11 +15556,13 @@
 
     /**
      * Configuration byte 233 (`NV_AUDIO_MODE`) on a Shimmer3R: whether it records
-     * from its microphone while it logs to SD, and what it keeps (DEV-99).
+     * from its microphone while it logs to SD, and what it keeps (DEV-99), and
+     * whether it samples the sound level into the data (DEV-1413).
      *
      *    bits 0-1  mode          {@link AUDIO_MODE}
      *    bits 2-3  gain preset   0, the calibrated default; 1-3 reserved
-     *    bits 4-6  unused, cleared
+     *    bit 4     sound level   the 0x38 channel, in the stream and the data file
+     *    bits 5-6  unused, cleared
      *    bit 7     must be 0
      *
      * Anything the firmware cannot act on reads as 0, off: bit 7 set (erased
@@ -15495,6 +15570,12 @@
      * mode it does not build. So a host that writes a mode and reads the byte back
      * learns whether the unit records it. Shimmer3 has no microphone, and its
      * firmware holds the byte at 0.
+     *
+     * **The sound level is independent of the mode.** Bits 0-1 govern only what
+     * goes to the SD card beside the data file; bit 4 adds a channel to the data
+     * itself, streamed and logged, with any mode or none. Firmware without the
+     * channel clears bit 4 when it corrects the byte, so the readback says whether
+     * a unit has it ({@link soundLevelSupportedByReadback}).
      *
      * A port of log-and-stream-common `Configuration/shimmer_audio_mode.c`, kept
      * rule for rule. `docs/SHIMMER3_CONFIGURATION_INFOMEM.md` §8.5 has the table
@@ -15514,6 +15595,8 @@
         MODE_MASK: 0x03,
         GAIN_SHIFT: 2,
         GAIN_MASK: 0x0c,
+        /** Bit 4: sample the sound level into the data, channel 0x38 (DEV-1413). */
+        SOUND_LEVEL: 0x10,
         INVALID: 0x80,
     });
     /** Byte 233 bits 0-1: what is recorded while logging. */
@@ -15546,8 +15629,9 @@
     ]);
     /**
      * The byte the firmware acts on, and writes back after a configuration write:
-     * `raw` with bits 4-6 cleared when it is valid and its mode is built, and 0
-     * otherwise (`ShimAudioMode_correct`).
+     * `raw` with bits 5-6 cleared when it is valid and its mode is built, and 0
+     * otherwise (`ShimAudioMode_correct`). Bit 4, the sound level, is kept; firmware
+     * from before the sound-level channel clears it as well.
      */
     function correctAudioMode(raw) {
         const byte = raw & 0xff;
@@ -15558,7 +15642,7 @@
             !(AUDIO_MODES_BUILT & (1 << mode))) {
             return 0;
         }
-        return byte & (AUDIO_MODE_BYTE.MODE_MASK | AUDIO_MODE_BYTE.GAIN_MASK);
+        return (byte & (AUDIO_MODE_BYTE.MODE_MASK | AUDIO_MODE_BYTE.GAIN_MASK | AUDIO_MODE_BYTE.SOUND_LEVEL));
     }
     /** The mode the firmware acts on, {@link AUDIO_MODE}. */
     function audioModeOf(raw) {
@@ -15579,32 +15663,87 @@
         return mode === AUDIO_MODE.FINGERPRINT_RAW || mode === AUDIO_MODE.RAW;
     }
     /**
-     * The mode that keeps exactly `parts`. Every combination is a mode, so a host
-     * can offer byte 233 as two enables, as Shimmer Capture's Microphone tile does.
+     * Whether the unit samples the sound level into its data, channel 0x38
+     * (DEV-1413): bit 4 of the byte as the firmware corrects it. Streamed and
+     * logged alike, whatever the mode.
+     */
+    function soundLevelEnabled(raw) {
+        return (correctAudioMode(raw) & AUDIO_MODE_BYTE.SOUND_LEVEL) !== 0;
+    }
+    /**
+     * What a readback says about the sound-level channel, after a host wrote
+     * byte 233 with bit 4 set: true when the bit came back (the firmware has the
+     * channel), false when the firmware cleared it (it does not). `null` when the
+     * byte written did not set the bit, which asks nothing.
+     *
+     * The firmware corrects the byte when it takes a configuration, so compare
+     * with what the device reads back (`readInfoMemConfig`), not with the image
+     * that was written. Only firmware that has byte 233 corrects it: firmware
+     * from before audio recording stores it as written, so there the bit reads
+     * back set with no channel behind it. Ask only where `supportsAudio()` said
+     * yes, which is where the layout has the byte (`InfoMemContext.audio`).
+     */
+    function soundLevelSupportedByReadback(written, readBack) {
+        if (!soundLevelEnabled(written))
+            return null;
+        return soundLevelEnabled(readBack);
+    }
+    /**
+     * The byte that turns on exactly `parts`, at the default gain. Every
+     * combination of the fingerprint and raw audio is a mode, so a host can offer
+     * byte 233 as enables, as Shimmer Capture's Microphone tile does; `soundLevel`
+     * sets bit 4 as well.
      */
     function joinAudioMode(parts) {
+        let mode;
         if (parts.fingerprint)
-            return parts.raw ? AUDIO_MODE.FINGERPRINT_RAW : AUDIO_MODE.FINGERPRINT;
-        return parts.raw ? AUDIO_MODE.RAW : AUDIO_MODE.OFF;
+            mode = parts.raw ? AUDIO_MODE.FINGERPRINT_RAW : AUDIO_MODE.FINGERPRINT;
+        else
+            mode = parts.raw ? AUDIO_MODE.RAW : AUDIO_MODE.OFF;
+        return parts.soundLevel ? mode | AUDIO_MODE_BYTE.SOUND_LEVEL : mode;
+    }
+    /**
+     * Byte 233 split into {@link AudioModeParts}, as the firmware reads it: the
+     * inverse of {@link joinAudioMode} on every corrected byte.
+     */
+    function splitAudioMode(raw) {
+        return {
+            fingerprint: recordsAudioFingerprint(raw),
+            raw: recordsRawAudio(raw),
+            soundLevel: soundLevelEnabled(raw),
+        };
     }
     /**
      * Whether setting this mode records speech, so a host must ask the user to
-     * confirm first: modes 2 and 3, which keep raw audio. Takes a mode (0-3), not
-     * the whole byte.
+     * confirm first: modes 2 and 3, which keep raw audio. Takes a mode (0-3); a
+     * whole byte is read by its bits 0-1, so the sound-level bit never hides a
+     * mode that records speech.
      */
     function audioModeRecordsSpeech(mode) {
-        return mode === AUDIO_MODE.FINGERPRINT_RAW || mode === AUDIO_MODE.RAW;
+        const m = mode & AUDIO_MODE_BYTE.MODE_MASK;
+        return m === AUDIO_MODE.FINGERPRINT_RAW || m === AUDIO_MODE.RAW;
     }
     /**
      * The byte for a mode at the default gain, corrected the way the firmware
      * will correct it, so what a host writes is what it reads back from firmware
-     * that builds the mode. A mode outside 0-3 gives 0.
+     * that builds the mode. A mode outside 0-3 gives 0. The sound level is off;
+     * {@link withSoundLevel} turns it on.
      */
     function encodeAudioMode(mode) {
         const m = Math.trunc(mode);
         if (!(m >= 0 && m <= AUDIO_MODE_BYTE.MODE_MASK))
             return 0;
         return correctAudioMode(m);
+    }
+    /**
+     * The byte with the sound level (bit 4) turned on or off and everything else
+     * as the firmware reads it: corrected first, so a byte the firmware reads as
+     * off stays off apart from bit 4. Firmware without the channel reads bit 4
+     * back clear ({@link soundLevelSupportedByReadback}).
+     */
+    function withSoundLevel(raw, on) {
+        const byte = correctAudioMode(raw) & ~AUDIO_MODE_BYTE.SOUND_LEVEL;
+        return on ? byte | AUDIO_MODE_BYTE.SOUND_LEVEL : byte;
     }
     /** A short name for a mode: `Off`, `Fingerprint`, `Fingerprint + raw`, `Raw`. */
     function describeAudioMode(mode) {
@@ -16757,11 +16896,13 @@
         // present only where the firmware has the byte, which the layout decides
         // (`idxAudioMode`). Bit 7 set - erased memory, or older firmware - or a
         // reserved gain preset makes the whole byte read as 0, off. In Sensor
-        // Enables, with what is recorded, where the microphone is looked for: it is
-        // never sampled into the stream or the data file, but recorded beside it
-        // while logging, as the event markers are. The four modes are every
-        // combination of the fingerprint and raw audio, so a host can offer them as
-        // two enables (`joinAudioMode`).
+        // Enables, with what is recorded, where the microphone is looked for: the
+        // audio is never sampled into the stream or the data file, but recorded
+        // beside it while logging, as the event markers are. The four modes are
+        // every combination of the fingerprint and raw audio, so a host can offer
+        // them as two enables (`joinAudioMode`). Bit 4 (DEV-1413) is a third: the
+        // sound level, which IS sampled into the stream and the data file, as
+        // channel 0x38, whatever the mode.
         {
             key: 'audioMode',
             label: 'Audio Recording',
@@ -16775,6 +16916,23 @@
             width: 2,
             zeroWhenAnySet: AUDIO_MODE_BYTE.INVALID | AUDIO_MODE_BYTE.GAIN_MASK,
             options: AUDIO_MODE_OPTIONS,
+            group: 'sensors',
+            appliesTo: S3R_ONLY,
+            configKey: 'audioMode',
+        },
+        {
+            key: 'soundLevel',
+            label: 'Sound Level',
+            desc: 'Byte 233 bit 4: the A-weighted sound level over the last 128 ms of microphone audio, ' +
+                'as channel 0x38 in the stream and the data file, in 0.01 dB(A). Nominal: from the ' +
+                "microphone's datasheet sensitivity, not checked against a calibrated meter. Independent " +
+                'of Audio Recording. Firmware without the channel reads back Off.',
+            kind: 'bit',
+            layoutKey: 'idxAudioMode',
+            shift: 4,
+            width: 1,
+            zeroWhenAnySet: AUDIO_MODE_BYTE.INVALID | AUDIO_MODE_BYTE.GAIN_MASK,
+            options: ON_OFF,
             group: 'sensors',
             appliesTo: S3R_ONLY,
             configKey: 'audioMode',
@@ -25094,6 +25252,16 @@
         0x26: uncal('Exg2_CH2_16Bit', 'i16r'),
         0x27: uncal('BRIDGE_AMP_HIGH', 'u12'),
         0x28: uncal('BRIDGE_AMP_LOW', 'u12'),
+        // The sound level (DEV-1413), emitted calibrated: nominal dB(A), NaN for
+        // the no-level value 0x8000. Without this entry the catch-all would read
+        // it as u12 and turn a negative count into a large positive one.
+        [SOUND_LEVEL_CHANNEL_ID]: {
+            name: SOUND_LEVEL_NAME,
+            unit: SOUND_LEVEL_UNIT,
+            calibrated: true,
+            dataType: 'i16',
+            sizeBytes: 2,
+        },
     });
     /**
      * Build the Shimmer3R (384-byte header) channel list from the dynamic
@@ -30338,11 +30506,17 @@
             for (let c = 0; c < channels.length; c++) {
                 const spec = channels[c];
                 const raw = decodeSdLogValue(bytes, p, spec.dataType);
-                // GSR is calibrated inline (amplifier equation). Inertial channels are
-                // marked calibrated by the plan but keep their raw value here and are
+                // GSR is calibrated inline (amplifier equation), and so is the sound
+                // level (0.01 dB(A), NaN for no level). Inertial channels are marked
+                // calibrated by the plan but keep their raw value here and are
                 // calibrated together (per triple) by applyCalibPlan below, and the
                 // BMP581 pair likewise by applyBmp581.
-                values[c] = spec.name === 'GSR' && spec.calibrated ? calibrateGsr(raw, header.gsrRange) : raw;
+                if (spec.calibrated && spec.name === 'GSR')
+                    values[c] = calibrateGsr(raw, header.gsrRange);
+                else if (spec.calibrated && spec.name === SOUND_LEVEL_NAME)
+                    values[c] = soundLevelDbA(raw);
+                else
+                    values[c] = raw;
                 p += spec.sizeBytes;
             }
             if (calibPlan.entries.length) {
@@ -39239,6 +39413,11 @@
     exports.SMARTDOCK_CONNECTION_TYPE = SMARTDOCK_CONNECTION_TYPE;
     exports.SMARTDOCK_DEFAULTS = SMARTDOCK_DEFAULTS;
     exports.SMARTDOCK_LINE_TERMINATOR = SMARTDOCK_LINE_TERMINATOR;
+    exports.SOUND_LEVEL_CHANNEL_ID = SOUND_LEVEL_CHANNEL_ID;
+    exports.SOUND_LEVEL_COUNTS_PER_DB = SOUND_LEVEL_COUNTS_PER_DB;
+    exports.SOUND_LEVEL_NAME = SOUND_LEVEL_NAME;
+    exports.SOUND_LEVEL_NO_LEVEL = SOUND_LEVEL_NO_LEVEL;
+    exports.SOUND_LEVEL_UNIT = SOUND_LEVEL_UNIT;
     exports.SR_BOARD = SR_BOARD;
     exports.STREAM_MODE = STREAM_MODE;
     exports.SdLogFormatError = SdLogFormatError;
@@ -39674,6 +39853,10 @@
     exports.shimmerUartCrcCheck = shimmerUartCrcCheck;
     exports.shouldOverrideCalibration = shouldOverrideCalibration;
     exports.slipEncode = slipEncode;
+    exports.soundLevelDbA = soundLevelDbA;
+    exports.soundLevelEnabled = soundLevelEnabled;
+    exports.soundLevelSupportedByReadback = soundLevelSupportedByReadback;
+    exports.splitAudioMode = splitAudioMode;
     exports.splitButtonMode = splitButtonMode;
     exports.statusPayloadBytesFor = statusPayloadBytesFor;
     exports.summariseExgBanks = summariseExgBanks;
@@ -39699,6 +39882,7 @@
     exports.whenIf820OtaDeviceIdle = whenIf820OtaDeviceIdle;
     exports.wiredPacketLength = wiredPacketLength;
     exports.withPressRecording = withPressRecording;
+    exports.withSoundLevel = withSoundLevel;
     exports.withoutPressRecording = withoutPressRecording;
     exports.writeInfoMemFieldValue = writeInfoMemFieldValue;
     exports.writeVerisenseOperationalFieldValue = writeVerisenseOperationalFieldValue;

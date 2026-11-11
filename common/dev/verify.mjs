@@ -6755,14 +6755,15 @@ const audUp = await evaluate(
     inSensors: !!document.querySelector('[data-group-body="sensors"] #microphoneGroup'),
     audioGroup: [...document.querySelectorAll('#configForm details > summary')].some(s => s.textContent.trim() === 'Audio Recording'),
     fieldShown: getComputedStyle(document.querySelector('.field[data-field-key="audioMode"]')).display !== 'none',
+    levelFieldShown: getComputedStyle(document.querySelector('.field[data-field-key="soundLevel"]')).display !== 'none',
   };
 `,
 );
 check(
-  "the form gains byte 233's Audio Recording field, and the audio card shows",
+  "the form gains byte 233's Audio Recording and Sound Level fields, and the audio card shows",
   audUp.probes === 1 &&
     audUp.field &&
-    audUp.fields === 40 &&
+    audUp.fields === 41 &&
     !audUp.hidden &&
     /records audio while it logs to SD/.test(audUp.support),
   `${audUp.fields} fields | ${audUp.support}`,
@@ -6774,13 +6775,14 @@ check(
   `${audUp.flags} | ${audUp.summary}`,
 );
 check(
-  "byte 233 is a Microphone tile in Sensor Enables, its two boxes the four modes, with no group of its own",
+  "byte 233 is a Microphone tile in Sensor Enables, two boxes for the four modes and one for the sound level, with no group of its own",
   audUp.tile === "Microphone" &&
     audUp.inSensors &&
     audUp.boxes.join("|") ===
-      "Audio fingerprint (no sound stored)|Raw audio (records speech)" &&
+      "Audio fingerprint (no sound stored)|Raw audio (records speech)|Sound level (nominal dB(A), no sound stored)" &&
     !audUp.audioGroup &&
-    !audUp.fieldShown,
+    !audUp.fieldShown &&
+    !audUp.levelFieldShown,
   `${audUp.tile} | ${audUp.boxes.join(", ")} | group ${audUp.audioGroup}`,
 );
 
@@ -7063,6 +7065,190 @@ check(
   !audSdMirror.card.some((p) => p.startsWith("audio/")) &&
     !audSdMirror.card.some((p) => /-000\//.test(p)),
   `card now ${audSdMirror.card.join(", ")}`,
+);
+
+// ---- The sound level (DEV-1413): byte 233 bit 4, the Microphone tile's third
+// box, and channel 0x38 in the stream and the CSV. First on firmware with the
+// channel, then on firmware without it, which clears the bit when it takes the
+// configuration: the image Apply reads back is how the page finds out.
+const APPLY_AND_READ_233 = `
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return true; };
+  document.getElementById('btnApply').click();
+  for (let i = 0; i < 100 && document.getElementById('dirtyPill')?.textContent !== '0 changes'; i++)
+    await new Promise(r => setTimeout(r, 100));
+  await new Promise(r => setTimeout(r, 300));
+  const im = await window.mockClient.readInfoMemBytes();
+  const logLines = [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
+`;
+
+/* LN accel, GSR and the battery: the ADS7028's channels are there for the
+   sound level to go in front of, as the firmware puts it. */
+await goto(`${BASE}?mock=1&audio=1&soundlevel=1&sensors=0x2084`);
+check(
+  "connect to a sensor whose firmware has the sound-level channel",
+  (await evaluate(CONNECT)) === "mock",
+);
+const slSet = await evaluate(
+  `
+  await new Promise(r => setTimeout(r, 200));
+  const box = document.getElementById('micSoundLevel');
+  const before = box.checked;
+  box.click();
+  await new Promise(r => setTimeout(r, 100));
+  const pending = document.getElementById('audioSummary').textContent;
+  const modes = [document.getElementById('micFingerprint').checked, document.getElementById('micRaw').checked];
+` +
+    APPLY_AND_READ_233 +
+    `
+  return { before, pending, modes, asked: window.__asked.length,
+    speech: window.__asked.filter(m => /stores raw audio/.test(m)).length,
+    b233: im[233], checked: document.getElementById('micSoundLevel').checked,
+    summary: document.getElementById('audioSummary').textContent,
+    kept: logLines.filter(l => /sound level: the firmware kept byte 233 bit 4/.test(l)).length };
+`,
+);
+check(
+  "the Sound level box sets byte 233 bit 4 alone, without the speech prompt, and the read-back keeps it",
+  slSet.before === false &&
+    slSet.modes.join() === "false,false" &&
+    /sound level, in nominal dB\(A\)/.test(slSet.pending) &&
+    slSet.b233 === 0x10 &&
+    slSet.asked === 1 &&
+    slSet.speech === 0 &&
+    slSet.checked &&
+    slSet.kept === 1 &&
+    !/no sound-level channel/.test(slSet.summary),
+  `byte 233 0x${slSet.b233?.toString(16)} | ${slSet.asked} prompt(s) | ${slSet.summary}`,
+);
+
+const slStream = await evaluate(`
+  const client = window.mockClient;
+  const seen = [];
+  let handler = client.onStreamFrame;
+  Object.defineProperty(client, 'onStreamFrame', {
+    configurable: true,
+    get() { return handler; },
+    set(f) {
+      handler = f && ((oc) => {
+        const raw = oc.get('SOUND_LEVEL', 'raw');
+        const cal = oc.get('SOUND_LEVEL', 'cal');
+        const order = oc.fields.filter(f => f.kind === 'raw').map(f => f.name);
+        seen.push({ raw: raw?.value ?? null, cal: cal ? (Number.isNaN(cal.value) ? 'NaN' : cal.value) : null,
+          unit: cal?.unit ?? null, last: order.at(-1),
+          beforeGsr: order.indexOf('SOUND_LEVEL') === order.indexOf('GSR') - 1 });
+        f(oc);
+      });
+    },
+  });
+  document.querySelector('.tabs [data-tab="tabStream"]').click();
+  document.getElementById('btnStreamStart').click();
+  for (let i = 0; i < 80 && document.getElementById('btnRecStart').disabled; i++)
+    await new Promise(r => setTimeout(r, 25));
+  document.getElementById('btnRecStart').click();
+  await new Promise(r => setTimeout(r, 1500));
+  document.getElementById('btnRecStop').click();
+  await new Promise(r => setTimeout(r, 500));
+  const charts = [...document.querySelectorAll('.plot-panel canvas')].map(c => {
+    const ch = Chart.getChart(c);
+    return { title: ch.options.plugins.title.text, traces: ch.data.datasets.map(d => d.label),
+      axis: ch.options.scales.y.title?.display ? ch.options.scales.y.title.text : '' };
+  });
+  document.getElementById('btnStreamStop').click();
+  await new Promise(r => setTimeout(r, 800));
+  Object.defineProperty(client, 'onStreamFrame', { configurable: true, writable: true, enumerable: true, value: handler });
+  let csv = null;
+  if (window.__blobs.length) {
+    const txt = await window.__blobs[window.__blobs.length - 1].text();
+    const lines = txt.split(/\\r?\\n/).filter(Boolean);
+    const head = lines[0].split(',');
+    const at = head.indexOf('SOUND_LEVEL_CAL');
+    csv = { rawAt: head.indexOf('SOUND_LEVEL_RAW'), at, unit: lines[1].split(',')[at],
+      values: lines.slice(2).map(l => l.split(',')[at]), cols: head.length,
+      widths: [...new Set(lines.map(l => l.split(',').length))] };
+  }
+  return { seen, charts, csv };
+`);
+const slNone = slStream.seen.filter((f) => f.raw === -32768);
+const slLevels = slStream.seen.filter((f) => f.raw !== -32768);
+check(
+  "the stream carries SOUND_LEVEL: no level (0x8000) for its first 256 ms reads NaN, never -327.68 dB",
+  slStream.seen.length > 30 &&
+    slNone.length >= 10 &&
+    slStream.seen.slice(0, slNone.length).every((f) => f.raw === -32768) &&
+    slNone.every((f) => f.cal === "NaN" && f.unit === "dB(A)"),
+  `${slStream.seen.length} frames, ${slNone.length} with no level: ${JSON.stringify(slStream.seen[0])}`,
+);
+check(
+  "after that, a level in nominal dB(A), and the battery is still the last channel",
+  slLevels.length > 20 &&
+    slLevels.every(
+      (f) =>
+        typeof f.cal === "number" &&
+        Math.abs(f.cal - f.raw / 100) < 1e-9 &&
+        f.cal >= 47 &&
+        f.cal <= 63,
+    ) &&
+    slStream.seen.every((f) => f.last === "BATTERY" && f.beforeGsr),
+  JSON.stringify(slLevels.slice(0, 2)),
+);
+const slChart = slStream.charts.find((c) => c.title === "Sound level");
+check(
+  "the sound level is plotted in a panel of its own, its axis in dB(A)",
+  slChart?.traces.length === 1 &&
+    /^SOUND_LEVEL\b/.test(slChart.traces[0]) &&
+    slChart.axis === "dB(A)" &&
+    !slStream.charts.some(
+      (c) => c !== slChart && c.traces.some((t) => /^SOUND_LEVEL\b/.test(t)),
+    ),
+  JSON.stringify(slChart ?? slStream.charts.map((c) => c.title)),
+);
+check(
+  "the CSV has the SOUND_LEVEL columns, in dB(A), every row as wide as the header",
+  slStream.csv &&
+    slStream.csv.rawAt > 0 &&
+    slStream.csv.at > 0 &&
+    slStream.csv.unit === "dB(A)" &&
+    slStream.csv.values.length > 20 &&
+    slStream.csv.values.every(
+      (v) => v === "NaN" || (Number(v) >= 47 && Number(v) <= 63),
+    ) &&
+    slStream.csv.widths.length === 1,
+  slStream.csv
+    ? `${slStream.csv.values.length} rows, unit ${slStream.csv.unit}, first ${slStream.csv.values.slice(0, 3).join(" ")}`
+    : "no CSV",
+);
+
+await goto(`${BASE}?mock=1&audio=1`);
+check(
+  "connect to a sensor whose firmware records audio but has no sound-level channel",
+  (await evaluate(CONNECT)) === "mock",
+);
+const slAbsent = await evaluate(
+  `
+  await new Promise(r => setTimeout(r, 200));
+  document.getElementById('micFingerprint').click();
+  document.getElementById('micSoundLevel').click();
+  await new Promise(r => setTimeout(r, 100));
+` +
+    APPLY_AND_READ_233 +
+    `
+  return { b233: im[233], checked: document.getElementById('micSoundLevel').checked,
+    fingerprint: document.getElementById('micFingerprint').checked,
+    summary: document.getElementById('audioSummary').textContent,
+    cleared: logLines.filter(l => /sound level: the firmware cleared byte 233 bit 4/.test(l)).length };
+`,
+);
+check(
+  "firmware without the channel clears bit 4, keeps the mode, and the tile says it has no sound-level channel",
+  slAbsent.b233 === 0x01 &&
+    slAbsent.fingerprint &&
+    !slAbsent.checked &&
+    slAbsent.cleared === 1 &&
+    /cleared Sound level when it took the configuration: it has no sound-level channel/.test(
+      slAbsent.summary,
+    ),
+  `byte 233 0x${slAbsent.b233?.toString(16)} | ${slAbsent.summary}`,
 );
 
 // ===========================================================================

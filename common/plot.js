@@ -64,6 +64,9 @@ export const PLOT_GROUPS = Object.freeze([
   { id: "TEMPERATURE", label: "Temperature" },
   { id: "ADC", label: "ADC (expansion connector)" },
   { id: "BRIDGE_AMP", label: "Bridge amplifier" },
+  /* A Shimmer3R's sound level (DEV-1413), in nominal dB(A): a unit no other
+     channel shares, so a panel of its own rather than OTHER's axis. */
+  { id: "SOUND_LEVEL", label: "Sound level" },
   { id: "OTHER", label: "Other channels" },
 ]);
 
@@ -140,6 +143,7 @@ export function groupForField(name) {
   if (n === "TEMPERATURE") return "TEMPERATURE";
   if (/^(EXT|INT)_(EXP_)?ADC/.test(n)) return "ADC";
   if (n.startsWith("BRIDGE_AMP")) return "BRIDGE_AMP";
+  if (n === "SOUND_LEVEL") return "SOUND_LEVEL";
   // The ExG status byte is a register readback, not a signal, so it is not an
   // ExG trace — it falls through to OTHER with the rest of the odds and ends.
   if (

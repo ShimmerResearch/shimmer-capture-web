@@ -1581,6 +1581,14 @@
        * is the reference both the hex view and the apply plan need.
        */
       let deviceImage = null;
+      /**
+       * Byte 233 as last written with the sound level on (DEV-1413), until the
+       * image is read back; then whether the firmware kept it, which is how a
+       * host learns whether it has the channel (`soundLevelSupportedByReadback`).
+       * null until a write has asked.
+       */
+      let soundLevelAsked = null;
+      let soundLevelSupport = null;
       /** Sensor bitmap in `deviceImage`. */
       let baselineSensors = 0;
       /** ExG preset the user picked since the last read. */
@@ -2824,10 +2832,12 @@
             ),
           );
         }
-        /* Byte 233 (DEV-99): what the microphone keeps, as two enables. The
+        /* Byte 233 (DEV-99): what the microphone keeps, as enables. The
                  four modes are every combination of the fingerprint and raw
-                 audio (`joinAudioMode`). Recorded only while logging to SD, into
-                 audio/, never sampled into the stream or the data file. Only on
+                 audio (`joinAudioMode`), recorded only while logging to SD, into
+                 audio/, never sampled into the stream or the data file. The
+                 third box is bit 4, the sound level (DEV-1413): a channel IN
+                 the stream and the data file, whatever the mode. Only on
                  Shimmer3R firmware that records audio. */
         if (layout?.idxAudioMode !== undefined) {
           grid.appendChild(
@@ -2840,7 +2850,10 @@
                   "Configuration byte 233. The fingerprint keeps landmark hashes in an .AFP " +
                   "file, which store no sound. Raw audio keeps the 16 kHz audio in a .WAV " +
                   "file, which records speech: Apply asks you to confirm, and everyone near " +
-                  "the sensor needs to know it is recording.",
+                  "the sensor needs to know it is recording. Sound level adds the " +
+                  "A-weighted level of each 128 ms of audio to the data, streamed and " +
+                  "logged, in nominal dB(A): from the microphone's datasheet, not checked " +
+                  "against a calibrated meter. It stores no sound.",
               },
               el("h3", {}, "Microphone"),
               el(
@@ -2863,11 +2876,22 @@
                 }),
                 "Raw audio (records speech)",
               ),
+              el(
+                "label",
+                {},
+                el("input", {
+                  type: "checkbox",
+                  id: "micSoundLevel",
+                  onchange: onSoundLevelToggle,
+                }),
+                "Sound level (nominal dB(A), no sound stored)",
+              ),
               el("div", {
                 class: "field-hint muted",
                 text:
-                  "Recorded only while logging to SD, into audio/ beside each data file. " +
-                  "Not streamed, and not in the data file.",
+                  "The fingerprint and raw audio are recorded only while logging to SD, " +
+                  "into audio/ beside each data file: not streamed, and not in the data " +
+                  "file. The sound level is a channel in the data, streamed and logged.",
               }),
               el("div", { class: "field-hint", id: "audioSummary" }),
             ),
@@ -2930,6 +2954,24 @@
           raw: $("micRaw").checked,
         });
         sdk.writeInfoMemFieldValue(form.getImage(), field, layout, mode);
+        form.refresh();
+        afterImageEdit();
+      }
+
+      /**
+       * The Sound level box moved: byte 233's bit 4 (DEV-1413), through the
+       * schema's Sound Level field, which stays in the form, hidden. The mode
+       * is left as it is: the two are independent.
+       */
+      function onSoundLevelToggle() {
+        const field = fields.find((f) => f.key === "soundLevel");
+        if (!field || !form || !layout) return;
+        sdk.writeInfoMemFieldValue(
+          form.getImage(),
+          field,
+          layout,
+          $("micSoundLevel").checked ? 1 : 0,
+        );
         form.refresh();
         afterImageEdit();
       }
@@ -3444,9 +3486,11 @@
                  says what the chosen mode keeps and that raw audio records speech.
                  The schema's Audio Recording field stays in the form, hidden,
                  because the page draws its control. */
-        host
-          .querySelector('.field[data-field-key="audioMode"]')
-          ?.classList.add("page-owned");
+        for (const key of ["audioMode", "soundLevel"]) {
+          host
+            .querySelector(`.field[data-field-key="${key}"]`)
+            ?.classList.add("page-owned");
+        }
 
         /* The two ExG register banks are opaque 10-byte runs, and the ExG
                  preset above is what installs a known-good one. They stay editable
@@ -3557,9 +3601,11 @@
         audioPanel.setConfig(image[at]);
         const fingerprint = $("micFingerprint");
         const raw = $("micRaw");
+        const level = $("micSoundLevel");
         if (fingerprint)
           fingerprint.checked = sdk.recordsAudioFingerprint(image[at]);
         if (raw) raw.checked = sdk.recordsRawAudio(image[at]);
+        if (level) level.checked = sdk.soundLevelEnabled(image[at]);
         if (!node) return;
         const mode = sdk.audioModeOf(image[at]);
         const said = [];
@@ -3578,6 +3624,16 @@
         if (sdk.audioModeRecordsSpeech(mode)) {
           said.push(
             "Raw audio records speech: Apply asks you to confirm, and everyone near the sensor needs to know it is recording.",
+          );
+        }
+        if (sdk.soundLevelEnabled(image[at])) {
+          said.push(
+            "The stream and the data file carry the sound level, in nominal dB(A) over each 128 ms of audio; a gap means no level yet.",
+          );
+        }
+        if (soundLevelSupport === false) {
+          said.push(
+            "This sensor's firmware cleared Sound level when it took the configuration: it has no sound-level channel.",
           );
         }
         const fixed = sdk.correctAudioMode(image[at]);
@@ -3939,12 +3995,43 @@
       /** Last coverage warning logged, so an edit does not repeat it every time. */
       let lastRateCoverageWarning = "";
 
+      /** Before an image write: remember byte 233 if it asks for the sound level. */
+      function askSoundLevel(image) {
+        const at = layout?.idxAudioMode;
+        soundLevelAsked =
+          at !== undefined && sdk.soundLevelEnabled(image[at])
+            ? image[at]
+            : null;
+      }
+
+      /**
+       * After a write, the image read back answers whether the firmware has
+       * the sound-level channel: firmware without it clears bit 4.
+       */
+      function noteSoundLevelReadback(image) {
+        const at = layout?.idxAudioMode;
+        if (soundLevelAsked === null || at === undefined) return;
+        const answer = sdk.soundLevelSupportedByReadback(
+          soundLevelAsked,
+          image[at],
+        );
+        soundLevelAsked = null;
+        if (answer === null) return;
+        soundLevelSupport = answer;
+        if (answer) log.log("sound level: the firmware kept byte 233 bit 4");
+        else
+          log.warn(
+            "sound level: the firmware cleared byte 233 bit 4, so it has no sound-level channel",
+          );
+      }
+
       /**
        * Take an image the sensor just gave us as the new reference: the form's
        * working document, its baseline, and the page's own `deviceImage`.
        */
       function adoptDeviceImage(bytes) {
         deviceImage = new Uint8Array(bytes);
+        noteSoundLevelReadback(deviceImage);
         /* The Device row's preferred source, and it arrives here rather than
                  in either connect path because this is the one place both of them
                  funnel the image through.
@@ -4237,6 +4324,7 @@
           switch (step.step) {
             case "writeInfoMemBytes":
             case "writeInfoMem":
+              askSoundLevel(form.getImage());
               await withDevice("write the configuration image", () =>
                 client.writeInfoMemBytes(form.getImage()),
               );
@@ -5830,8 +5918,12 @@
         /* Audio recording and configuration byte 233 (DEV-99). Asked of the
                  sensor too: the SDK sends nothing to firmware older than the builds
                  that have it, and asks the rest with GET_AUDIO_STATUS, which older
-                 firmware drops unanswered - a second's wait, once per connection. */
+                 firmware drops unanswered - a second's wait, once per connection.
+                 Whether it has the sound-level channel (DEV-1413) no command says:
+                 the first write that asks for it, read back, does. */
         audio = false;
+        soundLevelAsked = null;
+        soundLevelSupport = null;
         if (caps.audio) {
           audio =
             (await tryDevice("ask whether the firmware records audio", () =>
@@ -6343,6 +6435,7 @@
             sensors,
             eventChannel: params.get("events") === "1",
             audio: params.get("audio") === "1",
+            soundLevel: params.get("soundlevel") === "1",
             debug: params.get("debug") === "1",
           });
           // Hooks for driving the page from the console while developing:
@@ -6565,6 +6658,7 @@
           return;
         }
         const written = new Uint8Array(form.getImage());
+        askSoundLevel(written);
         try {
           await withDevice("write the configuration image", () =>
             client.writeInfoMemBytes(written),
