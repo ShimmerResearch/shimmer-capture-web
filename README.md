@@ -372,7 +372,7 @@ before.
 
 ## Streaming, plotting and recording
 
-Start a stream on its own, or a stream and an SD recording together. The plot
+Start a stream on its own, an SD log on its own, or both together. The plot
 draws one panel per sensor group from the channels the sensor is actually
 sending, in raw or calibrated units, over a 5, 10 or 30 second window, and can
 be paused or cleared without interrupting the stream. **Clear plots** drops
@@ -383,6 +383,31 @@ disagree about when something happened. Alongside it a statistics strip
 reads the achieved rate, the configured rate, packet loss — measured against
 gaps in the _device_ clock, not host arrival times, so host Bluetooth buffering
 cannot invent losses — throughput, frame count and elapsed time.
+
+### SD logging, with or without a stream
+
+On a Shimmer3R over Bluetooth, the stream and the sensor's SD log have
+controls of their own:
+
+- **Start stream** and **Stop stream** run the stream alone. Stop stream
+  leaves a log running, and its tooltip says so while one is.
+- **Start SD logging** and **Stop SD logging** run the log alone, with no
+  stream or added to the one running. A log started this way goes on after the
+  page disconnects, until Stop SD logging, the sensor's button, the dock or the
+  configured duration ends it, and the page says so while it runs without a
+  stream.
+- **Start stream + SD logging** and **Stop stream + SD logging** do both at
+  once.
+
+The SD logging controls follow the sensor's own status, so a log started from
+its button, by another host or before the page connected shows, and can be
+stopped. The firmware will not start a log while the sensor is docked or on USB
+power, without a card, with an SD file error, or with logging turned off in its
+configuration. Both log starts are disabled while the sensor's last status or
+configuration says so, with the reason under them. Released firmware still
+acknowledges such a start and does nothing, so after a log-only start the page
+reads the status back. Firmware that refuses the start says so, and the page
+shows why.
 
 ### Every channel, in its own units
 
@@ -506,6 +531,52 @@ Where it does, three things change:
 Over USB the dock protocol cannot ask, so the group and the live records are
 Bluetooth-only; an event file opens from any link.
 
+### Audio recording
+
+A Shimmer3R whose firmware records audio can record from its microphone while
+it logs to SD, into `audio/` beside each data file: `<NNN>.WAV`, the raw 16 kHz
+audio, and `<NNN>.AFP`, its fingerprint (landmark hashes, which store no
+sound). No firmware release has it yet, and the builds that do report the
+release they were cut from, v1.01.025. So the page sends nothing to older
+firmware, and asks the rest when it connects with the audio status command,
+which firmware without audio leaves unanswered: a second's wait on such a
+sensor, once per connection.
+
+Where it does, four things change:
+
+- **Configure → Sensor Enables** gains a **Microphone** tile, configuration
+  byte 233: **Audio fingerprint** (landmark hashes, no sound stored) and **Raw
+  audio** (records speech). Every combination of the two is one of the
+  firmware's four modes. The tile says what the chosen combination keeps, and
+  that it is recorded only while logging to SD, into `audio/`, never into the
+  stream or the data file. Raw audio records speech, so **Apply asks for that
+  on its own** before the usual prompt, and writes nothing if you decline. It
+  does not ask again for the mode the sensor already has.
+- **General** gains an **Audio recording** card: what the configuration
+  records, whether the sensor is recording now, and **Read audio status**, the
+  recorder's own account: its state, the session's first fault, seconds
+  recorded, silence written after an overrun, write errors and fingerprint
+  chunks. The card is hidden for any other sensor.
+- The **Device** flags gain **Recording audio** and **Audio fault**. The sensor
+  pushes its status whenever either changes, so they follow a recording without
+  polling. **Stop stream + SD logging** turns Recording audio off itself, marked
+  as the page's own belief, in case the sensor's push is lost. A fault stays
+  shown until the next session starts.
+- A recording needs a log, and the sensor won't start one while it is docked or
+  on USB power, without a card, with an SD file error, or with logging turned
+  off in its configuration. It still accepts **Start stream + SD logging** then
+  and only streams, so the log starts are disabled while the sensor's last
+  status or configuration says so, with the reason under them (see
+  [SD logging, with or without a stream](#sd-logging-with-or-without-a-stream)).
+  **Stop SD logging** turns Recording audio off as Stop stream + SD logging
+  does.
+- **SD card** lists the audio files with the data files, each under its
+  session, and a **Mirror SD card structure** download takes them with it (see
+  [The SD card](#the-sd-card)).
+
+Over USB the dock protocol cannot ask, so the group and the card are
+Bluetooth-only.
+
 ## The event log
 
 A drawer docked to the bottom of the viewport carries every command, reply and
@@ -573,6 +644,10 @@ structure** download takes a session's event files with it, into
 `<destination>/events/…`, and deletes them after it when asked. The **Consensys
 Backup** layout leaves them on the card and says so, because Consensys'
 importer would read an `events/` folder anywhere in that tree as data.
+
+Firmware that records audio (see [Audio recording](#audio-recording)) writes
+an `audio/` folder beside `data/` in the same way, with a `.WAV` and an `.AFP`
+per data file, and the tab treats it exactly as it treats `events/`.
 
 This needs a Bluetooth link and **firmware v1.01.011 or later**. Earlier
 firmware either has no SD file-transfer commands at all or, on v1.01.009 and
@@ -713,7 +788,11 @@ While the mock is connected, `mockTransport.writes` in the console is every
 command the page has sent, and `mockTransport.emitDisconnect()` simulates a
 dropped link. `mockTransport.factoryTest` reports how many self-tests have run,
 whether one is still printing and exactly what text it printed;
-`mockTransport.rtc` exposes the sensor's own running clock. The panels
+`mockTransport.rtc` exposes the sensor's own running clock.
+`mockTransport.status` docks and undocks it (`setDocked`) and says whether it
+logs (`logging`). Setting `nackRefusedLogStart` makes it refuse a log start it
+cannot carry out, as firmware that says so does, and `setQuietly({ sdBadFile })`
+changes the card without telling the page. The panels
 themselves are `factoryTestPanel` and `rtcDriftPanel`, beside `sdBrowser`,
 `brandEditor` and `calibrationEditor`.
 

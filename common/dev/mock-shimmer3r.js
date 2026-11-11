@@ -95,6 +95,8 @@ const CMD = Object.freeze({
   SET_RWC: 0x8f,
   RWC_RESPONSE: 0x90,
   GET_RWC: 0x91,
+  START_LOGGING: 0x92,
+  STOP_LOGGING: 0x93,
   VBATT_RESPONSE: 0x94,
   GET_VBATT: 0x95,
   PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE: 0xa6,
@@ -108,6 +110,8 @@ const CMD = Object.freeze({
   GET_EVENT_CHANNEL_STATUS: 0xb9,
   EVENT_CHANNEL_STATUS_RESPONSE: 0xba,
   EVENT_RECORD_RESPONSE: 0xbb,
+  GET_AUDIO_STATUS: 0xbc,
+  AUDIO_STATUS_RESPONSE: 0xbd,
 });
 
 /**
@@ -804,6 +808,192 @@ function eventFileBytes(opened, firstSeq, openReason, edges) {
   return out;
 }
 
+/**
+ * The audio files firmware that records audio writes beside those data files
+ * (DEV-99), in mode 2, the fingerprint and raw audio:
+ * `audio/<experiment>/<session>/<NNN>.WAV` and `<NNN>.AFP`, partners of the
+ * data file at `data/<experiment>/<session>/<NNN>`.
+ *
+ * The first session has both for each of its two data files; `001` followed
+ * a file split. The second session has none: it logged with audio off.
+ *
+ * Real files, laid out as log-and-stream-common Audio/shimmer_audio_file.c
+ * writes them, so a downloaded one decodes: the WAV holds half a second of a
+ * 1 kHz tone, which any player opens, and the fingerprint two chunks of a
+ * few landmarks each.
+ *
+ * @param {string} shimmerName
+ * @param {string} mac
+ * @returns {{path: string, size: number, bytes: Uint8Array, fdate: number,
+ *   ftime: number}[]}
+ */
+function buildSyntheticAudioFiles(shimmerName, mac) {
+  const trial = "audio/DefaultTrial_5f2c1a90";
+  const base = new Date(2026, 7, 14, 10, 23, 44);
+  const out = [];
+  for (const [n, openReason, dt] of [
+    [0, 0, 0],
+    [1, 1, 3600],
+  ]) {
+    const opened = new Date(base.getTime() + dt * 1000);
+    const dataTicks = BigInt(Math.round(opened.getTime() / 1000)) * 32768n;
+    const info = {
+      mode: 2,
+      openReason,
+      fileNumber: n,
+      dataTicks,
+      mac,
+      firstTicks: dataTicks + 15729n, // the first sample 0.48 s after the data file's
+    };
+    const [fdate, ftime] = fatStamp(opened);
+    const name = String(n).padStart(3, "0");
+    const wav = audioWavBytes(info, 8000);
+    const afp = audioFingerprintBytes(info);
+    out.push(
+      {
+        path: `${trial}/${shimmerName}-000/${name}.WAV`,
+        size: wav.length,
+        bytes: wav,
+        fdate,
+        ftime,
+      },
+      {
+        path: `${trial}/${shimmerName}-000/${name}.AFP`,
+        size: afp.length,
+        bytes: afp,
+        fdate,
+        ftime,
+      },
+    );
+  }
+  return out;
+}
+
+/** Bytes 44-131 of both audio headers: the identity, then the closing summary they share. */
+function audioIdentity(out, view, info) {
+  out.set([0x53, 0x41, 0x55, 0x44, 1, 10, info.mode, info.openReason], 44); // "SAUD", v1, Shimmer3R
+  view.setUint16(52, info.fileNumber, true);
+  view.setBigUint64(56, info.dataTicks, true);
+  view.setUint32(64, 0x5f2c1a90, true); // config time, as the trial folder's name
+  view.setUint16(68, 3, true); // LogAndStream
+  view.setUint16(70, 1, true);
+  out[72] = 1;
+  out[73] = 25; // v1.01.025
+  for (let i = 0; i < 6; i++)
+    out[74 + i] = parseInt(info.mac.slice(i * 2, i * 2 + 2), 16) || 0;
+  view.setBigUint64(80, info.firstTicks, true);
+  view.setUint32(88, 24, true); // decimation
+  view.setInt32(92, 6, true); // gain code, the MP23DB01HP's
+  out[96] = 1; // closed normally
+  view.setUint32(120, 270, true); // ADF errors, the start-up saturation
+  view.setUint32(124, 268, true);
+}
+
+/** A closed WAV of `samples` samples of a 1 kHz tone (Audio/shimmer_audio_file.c). */
+function audioWavBytes(info, samples) {
+  const out = new Uint8Array(512 + samples * 2);
+  const view = new DataView(out.buffer);
+  const ascii = (at, text) =>
+    out.set(
+      [...text].map((c) => c.charCodeAt(0)),
+      at,
+    );
+  ascii(0, "RIFF");
+  view.setUint32(4, out.length - 8, true);
+  ascii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, 16000, true);
+  view.setUint32(28, 32000, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  ascii(36, "shim");
+  view.setUint32(40, 460, true);
+  audioIdentity(out, view, info);
+  view.setUint32(100, samples, true);
+  // The last sample's Shimmer clock: (samples - 1) / 16000 s on
+  view.setBigUint64(
+    104,
+    info.firstTicks + BigInt(Math.round(((samples - 1) * 32768) / 16000)),
+    true,
+  );
+  ascii(504, "data");
+  view.setUint32(508, samples * 2, true);
+  for (let i = 0; i < samples; i++)
+    view.setInt16(
+      512 + i * 2,
+      Math.round(3000 * Math.sin((2 * Math.PI * 1000 * i) / 16000)),
+      true,
+    );
+  return out;
+}
+
+/** A closed fingerprint file of two chunks (Audio/shimmer_audio_file.c). */
+function audioFingerprintBytes(info) {
+  const chunks = [
+    // [chunk number, landmarks as [t1, f1, f2, dt]]
+    [
+      info.fileNumber * 900,
+      [
+        [12, 64, 70, 5],
+        [40, 64, 58, 9],
+        [300, 120, 121, 3],
+      ],
+    ],
+    [
+      info.fileNumber * 900 + 1,
+      [
+        [3, 31, 40, 2],
+        [250, 90, 100, 30],
+      ],
+    ],
+  ];
+  const records = chunks.reduce((n, [, l]) => n + l.length, 0);
+  const out = new Uint8Array(512 + chunks.length * 16 + records * 4);
+  const view = new DataView(out.buffer);
+  out.set([0x53, 0x41, 0x46, 0x50], 0); // "SAFP"
+  view.setUint16(4, 1, true);
+  view.setUint16(6, 512, true);
+  view.setUint16(8, 16000, true);
+  view.setUint16(10, 256, true);
+  view.setUint16(12, 16, true);
+  view.setUint16(14, 4, true);
+  view.setUint32(16, 80000, true);
+  view.setUint32(20, 64000, true);
+  audioIdentity(out, view, info);
+  view.setUint32(100, chunks.length, true);
+  view.setBigUint64(104, info.firstTicks + 131072n, true); // the last chunk, 4 s on
+  view.setUint32(112, records, true);
+  let at = 512;
+  chunks.forEach(([k, landmarks], i) => {
+    view.setUint16(at, 0x4843, true); // "CH"
+    view.setUint16(at + 2, landmarks.length, true);
+    view.setUint32(at + 4, k, true);
+    view.setBigUint64(at + 8, info.firstTicks + BigInt(i) * 131072n, true);
+    at += 16;
+    for (const [t1, f1, f2, dt] of landmarks) {
+      view.setUint32(
+        at,
+        (t1 | (dt << 9) | (((f2 - f1) & 63) << 15) | ((f1 & 127) << 21)) >>> 0,
+        true,
+      );
+      at += 4;
+    }
+  });
+  return out;
+}
+
+/**
+ * Configuration byte 233 as firmware that records audio corrects it
+ * (`ShimAudioMode_correct`): bit 7 set or a reserved gain preset reads as off,
+ * and bits 4-6 are cleared.
+ */
+function correctAudioMode(raw) {
+  if (raw & 0x80 || raw & 0x0c) return 0;
+  return raw & 0x0f;
+}
+
 /** Pack a Date into the FAT date/time pair the card stores. */
 function fatStamp(d) {
   const fdate =
@@ -902,6 +1092,13 @@ export function mockEnabledFromUrl() {
  * @param {number} [opts.sdKBps=120] throughput of streamed SD file blocks
  * @param {number} [opts.linkKBps=180] throughput reported by the firmware
  *   data-rate test (SET_DATA_RATE_TEST)
+ * @param {boolean} [opts.eventChannel=false] firmware with the event channel
+ *   and configuration byte 232 (DEV-971)
+ * @param {boolean} [opts.audio=false] firmware that records audio (DEV-99):
+ *   byte 233 corrected on write, GET_AUDIO_STATUS answered, status byte 1's
+ *   audio bits, and audio/ files on the card. Reports v1.01.025 unless
+ *   `firmware` says otherwise, as those builds do. `transport.audio` starts
+ *   and stops logging and raises faults.
  * @param {boolean} [opts.debug=false] console.log every command
  * @returns {LoopbackTransport} pass it to `new Shimmer3RClient({ transport })`.
  *   `transport.emitDisconnect()` simulates a dropped link;
@@ -922,7 +1119,14 @@ export function createMockShimmer3RTransport(opts = {}) {
   const dribbleBytes = Math.max(1, opts.dribbleBytes ?? DEFAULT_DRIBBLE_BYTES);
   const debug = !!opts.debug;
   const mac = (opts.mac ?? "000666668091").replace(/[^0-9a-fA-F]/g, "");
-  const fw = { major: 1, minor: 1, patch: 12, ...(opts.firmware ?? {}) };
+  /* A build that records audio reports the release it was cut from,
+     v1.01.025, and the SDK asks only from there on. */
+  const fw = {
+    major: 1,
+    minor: 1,
+    patch: opts.audio ? 25 : 12,
+    ...(opts.firmware ?? {}),
+  };
   /* `undefined` means "not asked for" and gets the Shimmer3R default; `null`
      means "this sensor will not say", which NACKs GET_DEVICE_VERSION. Anything
      non-finite is neither -- it used to reach `hardwareVersion & 0xff` and
@@ -939,6 +1143,25 @@ export function createMockShimmer3RTransport(opts = {}) {
   const eventChannel = !!opts.eventChannel;
   /** The connection's event stream: opted in, the link's next sequence number, each input's level. */
   const evt = { optedIn: false, seq: 0, button: false, ttl: false };
+  /* Firmware that records audio, with configuration byte 233 and the audio
+     status command (DEV-99). Off by default, as on every release so far:
+     GET_AUDIO_STATUS then goes unanswered, as an unknown command does on real
+     firmware, and byte 233 is stored as written, uncorrected. */
+  const audioBuilt = !!opts.audio;
+  /**
+   * The recorder: the session it is in, if any, and that session's first
+   * fault. `fatal` faults stop the recording and leave logging running.
+   */
+  const aud = {
+    sessionStartMs: null,
+    sessionEndMs: null,
+    fault: 0,
+    fatal: false,
+    silence: 0,
+    skipped: 0,
+    /** Lose the push that says recording stopped, as a link can. */
+    dropStopPush: false,
+  };
 
   /* Which pressure part this mock claims to carry. Defaults to the one the
      platform really would: a Shimmer3R has a BMP390 or BMP581, a Shimmer3 a
@@ -1005,6 +1228,9 @@ export function createMockShimmer3RTransport(opts = {}) {
     sdInserted: true,
     /** The firmware could not open its log file. */
     sdBadFile: false,
+    /* Refuse a log start it cannot carry out with a NACK, starting nothing,
+       instead of ACKing it as released firmware does (transport.status). */
+    nackRefusedLogStart: false,
     /** The clock has been set since the sensor last lost power. */
     rwcSet: false,
     /** The red LED, as TOGGLE_LED leaves it. */
@@ -1308,6 +1534,22 @@ export function createMockShimmer3RTransport(opts = {}) {
     },
     /** Push the status as it stands, without changing anything. */
     push: () => reply(statusResponse()),
+    get logging() {
+      return state.logging;
+    },
+    /** NACK a log start it cannot carry out, as firmware that says so does. */
+    set nackRefusedLogStart(on) {
+      state.nackRefusedLogStart = !!on;
+    },
+    /**
+     * Change the card's state without a push, as a fault the sensor finds
+     * only when a log starts: `{ sdBadFile }` or `{ sdInserted }`.
+     */
+    setQuietly(patch) {
+      for (const key of ["sdBadFile", "sdInserted"]) {
+        if (key in patch) state[key] = !!patch[key];
+      }
+    },
     /** The frame a push (or a GET_STATUS answer) carries, for comparison. */
     bytes: () => new Uint8Array(statusResponse()),
   };
@@ -1528,9 +1770,134 @@ export function createMockShimmer3RTransport(opts = {}) {
       CMD.INSTREAM_CMD_RESPONSE,
       CMD.STATUS_RESPONSE,
       status0,
-      state.usbPluggedIn ? 1 : 0,
+      (state.usbPluggedIn ? 1 : 0) | audioStatusBits(),
     ];
   }
+
+  // -------------------------------------------------------------------------
+  // Audio recording (DEV-99)
+  // -------------------------------------------------------------------------
+
+  /** Byte 233's mode, as the firmware acts on it. */
+  const audioMode = () =>
+    audioBuilt ? correctAudioMode(infoMem[233]) & 0x03 : 0;
+  /** Whether the recorder is capturing: logging, a mode set, no fault that stopped it. */
+  const audioRecording = () =>
+    audioBuilt &&
+    aud.sessionStartMs !== null &&
+    aud.sessionEndMs === null &&
+    !aud.fatal;
+
+  /** Status byte 1 bits 1 and 2 (`ShimAudio_statusBits`). */
+  function audioStatusBits() {
+    if (!audioBuilt) return 0;
+    return (audioRecording() ? 0x02 : 0) | (aud.fault ? 0x04 : 0);
+  }
+
+  /** ShimSens_checkStartLoggingConditions, as far as the mock models it. */
+  function canStartLog() {
+    return (
+      !state.logging &&
+      !state.docked &&
+      !state.usbPluggedIn &&
+      state.sdInserted &&
+      !state.sdBadFile
+    );
+  }
+
+  /**
+   * Logging has started, by any route. The recorder comes up and the status
+   * is pushed when the recording bit sets, which the firmware does even for a
+   * start a Bluetooth command caused: the bit changes a moment after the ACK.
+   */
+  function audioSessionStart() {
+    if (!audioBuilt) return;
+    const before = audioStatusBits();
+    aud.sessionStartMs = audioMode() ? Date.now() : null;
+    aud.sessionEndMs = null;
+    aud.fault = 0;
+    aud.fatal = false;
+    aud.silence = 0;
+    aud.skipped = 0;
+    if (audioStatusBits() !== before)
+      setTimeout(() => reply(statusResponse()), 300);
+  }
+
+  /** Logging has stopped: the files close, and the recording bit clears. */
+  function audioSessionStop() {
+    if (!audioBuilt || aud.sessionStartMs === null) return;
+    const before = audioStatusBits();
+    if (aud.sessionEndMs === null) aud.sessionEndMs = Date.now();
+    if (audioStatusBits() !== before && !aud.dropStopPush)
+      reply(statusResponse());
+  }
+
+  /** `[0xBD][32 bytes]` (`PlatAudio_buildStatus`). */
+  function audioStatusResponse() {
+    const out = new Uint8Array(33);
+    const view = new DataView(out.buffer);
+    out[0] = CMD.AUDIO_STATUS_RESPONSE;
+    out[1] = 1;
+    out[2] = audioMode();
+    const started = aud.sessionStartMs !== null;
+    out[3] = !started ? 0 : aud.fatal ? 4 : aud.sessionEndMs !== null ? 3 : 2;
+    out[4] = aud.fault;
+    const seconds = started
+      ? Math.floor(
+          ((aud.sessionEndMs ?? Date.now()) - aud.sessionStartMs) / 1000,
+        )
+      : 0;
+    view.setUint32(5, seconds, true);
+    view.setUint32(9, aud.silence, true);
+    view.setUint32(17, started ? 270 : 0, true); // ADF errors: the start-up saturation
+    view.setUint32(21, started ? 268 : 0, true);
+    const fp = out[2] === 1 || out[2] === 2;
+    view.setUint32(
+      25,
+      fp && seconds >= 5 ? Math.floor((seconds - 1) / 4) : 0,
+      true,
+    );
+    view.setUint32(29, aud.skipped, true);
+    return out;
+  }
+
+  /* Drive the recorder from a test or the console. */
+  transport.audio = {
+    get supported() {
+      return audioBuilt;
+    },
+    get recording() {
+      return audioRecording();
+    },
+    get mode() {
+      return audioMode();
+    },
+    /** Lose the push that says recording stopped, as a link can, or stop losing it. */
+    set dropStopPush(on) {
+      aud.dropStopPush = !!on;
+    },
+    /** Start or stop SD logging as the user button would, and push the status. */
+    setLogging(on) {
+      state.logging = !!on;
+      reply(statusResponse());
+      if (on) audioSessionStart();
+      else audioSessionStop();
+    },
+    /**
+     * A fault, as the firmware raises it: 4 (overrun) and 5 (fingerprint
+     * behind) degrade the recording, any other stops it. The session keeps
+     * its first fault. The status is pushed when the fault bit sets.
+     */
+    fault(code) {
+      if (!audioRecording()) return;
+      const before = audioStatusBits();
+      if (!aud.fault) aud.fault = code;
+      if (code === 4) aud.silence += 65536;
+      else if (code === 5) aud.skipped += 3;
+      else aud.fatal = true;
+      if (audioStatusBits() !== before) reply(statusResponse());
+    },
+  };
 
   // -------------------------------------------------------------------------
   // Stream schema and synthetic data
@@ -1695,6 +2062,7 @@ export function createMockShimmer3RTransport(opts = {}) {
   let sdFiles = [
     ...buildSyntheticCard(shimmerName),
     ...(eventChannel ? buildSyntheticEventFiles(shimmerName) : []),
+    ...(audioBuilt ? buildSyntheticAudioFiles(shimmerName, mac) : []),
   ];
   let sdDirs = derivedDirs(sdFiles);
 
@@ -1972,7 +2340,8 @@ export function createMockShimmer3RTransport(opts = {}) {
    * `[0xCB][status]`
    *
    * The firmware only permits paths strictly under `data/`, or `events/` on
-   * firmware with the event channel, and refuses a directory that still holds
+   * firmware with the event channel, or `audio/` on firmware that records
+   * audio, and refuses a directory that still holds
    * something — which is what makes the SDK's "delete the emptied folders
    * afterwards, deepest first" pass necessary.
    */
@@ -1984,7 +2353,8 @@ export function createMockShimmer3RTransport(opts = {}) {
     }
     if (
       !path.startsWith("data/") &&
-      !(eventChannel && path.startsWith("events/"))
+      !(eventChannel && path.startsWith("events/")) &&
+      !(audioBuilt && path.startsWith("audio/"))
     ) {
       out[1] = SD_STATUS.BAD_ARGS;
       return out;
@@ -2679,6 +3049,11 @@ export function createMockShimmer3RTransport(opts = {}) {
         const addr = (cmd[2] ?? 0) | ((cmd[3] ?? 0) << 8);
         const off = pageOffset(addr);
         infoMem.set(cmd.subarray(4, 4 + len), off);
+        /* Firmware that records audio corrects byte 233 when it takes a
+           configuration (`ShimConfig_checkAndCorrectConfig`), so a read-back
+           shows what it will record. Older firmware stores it as written. */
+        if (audioBuilt && off <= 233 && off + len > 233)
+          infoMem[233] = correctAudioMode(infoMem[233]);
         // Keep the live state in step with what was just written, so an
         // inquiry after a config write reports the new rate and sensors —
         // which is exactly what the firmware does on undock.
@@ -2880,6 +3255,15 @@ export function createMockShimmer3RTransport(opts = {}) {
         return;
       }
 
+      case CMD.GET_AUDIO_STATUS:
+        /* Firmware without audio has no command 0xBC: it drops the byte and
+           sends nothing, which is how the SDK tells (`supportsAudio`). Silence
+           here rather than the NACK below, because a NACK would teach a page
+           an answer real firmware never gives. */
+        if (!audioBuilt) return;
+        reply(concat([ACK], audioStatusResponse()));
+        return;
+
       case CMD.GET_EVENT_CHANNEL_STATUS: {
         if (!eventChannel) break;
         // [ACK][0xBA][inputs][flags][state][seq u16][dropped u16][link lost u16]
@@ -2982,18 +3366,53 @@ export function createMockShimmer3RTransport(opts = {}) {
         startStreaming();
         return;
 
-      case CMD.START_SDBT:
+      case CMD.START_SDBT: {
+        /* The firmware starts the log only undocked, off USB, with a card in
+           and no bad file (ShimSens_checkStartLoggingConditions), and ACKs
+           the command and streams either way, unless it is firmware that
+           NACKs such a start, which then starts nothing. */
+        const canLog = canStartLog();
+        if (!canLog && state.nackRefusedLogStart) {
+          reply([NACK]);
+          return;
+        }
+        const wasLogging = state.logging;
         state.streaming = true;
-        state.logging = true;
+        state.logging = wasLogging || canLog;
         reply([ACK]);
         startStreaming();
+        if (state.logging && !wasLogging) audioSessionStart();
         return;
+      }
+
+      case CMD.START_LOGGING: {
+        // START_LOGGING_COMMAND: the log alone, with or without a stream.
+        const canLog = canStartLog();
+        if (!canLog && state.nackRefusedLogStart) {
+          reply([NACK]);
+          return;
+        }
+        reply([ACK]);
+        if (canLog) {
+          state.logging = true;
+          audioSessionStart();
+        }
+        return;
+      }
+
+      case CMD.STOP_LOGGING: {
+        // STOP_LOGGING_COMMAND: the log alone; a stream goes on.
+        const wasLogging = state.logging;
+        state.logging = false;
+        reply([ACK]);
+        if (wasLogging) audioSessionStop();
+        return;
+      }
 
       case CMD.STOP_STREAMING:
+        // STOP_STREAMING_COMMAND: the stream alone; a log goes on, as on the
+        // firmware. STOP_SDBT stops both.
         state.streaming = false;
-        // Logging outlives a stream stop on real firmware only via
-        // STOP_SDBT; here a stop is a stop.
-        state.logging = false;
         stopStreaming();
         reply([ACK]);
         return;
@@ -3003,6 +3422,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         state.logging = false;
         stopStreaming();
         reply([ACK]);
+        audioSessionStop();
         return;
 
       case CMD.TOGGLE_LED:

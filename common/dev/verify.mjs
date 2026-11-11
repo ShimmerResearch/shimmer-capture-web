@@ -1338,8 +1338,8 @@ check(
   sd.during.sawStartSdbt && sd.sawStopSdbt,
 );
 check(
-  "only the SD stop button is live while logging",
-  !sd.during.btStop && sd.during.sdStop,
+  "while streaming and logging, both stops are live: Stop stream leaves the log, Stop stream + SD logging ends both",
+  sd.during.btStop && sd.during.sdStop,
 );
 check(
   "apply is refused while logging to the card",
@@ -3198,6 +3198,150 @@ check(
   `${docked.before.badge} → ${docked.onDock.badge} → ${docked.onUndock.badge}`,
 );
 
+/* The firmware does not log while docked, yet ACKs Start stream + SD logging
+   and streams, so the page holds that button back, and says why, for as long
+   as the sensor says it is docked. Plain streaming stays available. */
+const sdGate = await evaluate(`
+  const look = () => ({
+    sdStart: !document.getElementById('btnSdStart').disabled,
+    logStart: !document.getElementById('btnLogStart').disabled,
+    stream: !document.getElementById('btnStreamStart').disabled,
+    note: document.getElementById('sdStartNoteRow').hidden ? null
+      : document.getElementById('sdStartNote').textContent,
+    title: document.getElementById('btnSdStart').title,
+  });
+  const before = look();
+  window.mockTransport.status.setDocked(true);
+  await new Promise(r => setTimeout(r, 400));
+  const onDock = look();
+  window.mockTransport.status.setDocked(false);
+  await new Promise(r => setTimeout(r, 400));
+  return { before, onDock, onUndock: look() };
+`);
+check(
+  "while the sensor says it is docked, Start stream + SD logging and Start SD logging are held back with the reason, and plain streaming is not",
+  sdGate.before.sdStart &&
+    sdGate.before.logStart &&
+    sdGate.before.note === null &&
+    !sdGate.onDock.sdStart &&
+    !sdGate.onDock.logStart &&
+    sdGate.onDock.stream &&
+    /docked/.test(sdGate.onDock.note ?? "") &&
+    sdGate.onDock.title === sdGate.onDock.note &&
+    sdGate.onUndock.sdStart &&
+    sdGate.onUndock.logStart &&
+    sdGate.onUndock.note === null &&
+    sdGate.onUndock.title === "",
+  JSON.stringify(sdGate),
+);
+
+/* SD logging on its own (START_LOGGING 0x92 / STOP_LOGGING 0x93): with no
+   stream, and added to and taken from one. The page follows the sensor. */
+const LOG_LOOK = `
+  const $ = (id) => document.getElementById(id);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const look = () => ({
+    logStart: !$('btnLogStart').disabled,
+    logStop: !$('btnLogStop').disabled,
+    sdStart: !$('btnSdStart').disabled,
+    sdStop: !$('btnSdStop').disabled,
+    streamStart: !$('btnStreamStart').disabled,
+    streamStop: !$('btnStreamStop').disabled,
+    streamStopTitle: $('btnStreamStop').title,
+    note: !$('logOnlyNoteRow').hidden,
+    sensorLogs: window.mockTransport.status.logging,
+    flags: [...document.querySelectorAll('#statusFlags .flag.on')].map((e) => e.textContent),
+  });
+`;
+const logOnly = await evaluate(`${LOG_LOOK}
+  const before = look();
+  $('btnLogStart').click();
+  await wait(2000); // the start, then the read-back 1.2 s later
+  const logging = look();
+  $('btnLogStop').click();
+  await wait(600);
+  return { before, logging, stopped: look() };
+`);
+check(
+  "Start SD logging logs with no stream, read back from the sensor; Stop SD logging ends it",
+  logOnly.before.logStart &&
+    !logOnly.before.logStop &&
+    logOnly.logging.sensorLogs &&
+    logOnly.logging.logStop &&
+    !logOnly.logging.logStart &&
+    !logOnly.logging.sdStart &&
+    logOnly.logging.streamStart &&
+    logOnly.logging.note &&
+    logOnly.logging.flags.includes("SD logging") &&
+    !logOnly.stopped.sensorLogs &&
+    logOnly.stopped.logStart &&
+    !logOnly.stopped.logStop &&
+    !logOnly.stopped.note,
+  JSON.stringify(logOnly),
+);
+
+const logAndStream = await evaluate(`${LOG_LOOK}
+  $('btnStreamStart').click();
+  await wait(800);
+  const streaming = look();
+  $('btnLogStart').click();
+  await wait(800);
+  const both = look();
+  $('btnStreamStop').click();
+  await wait(1000); // the stop drains the tail first
+  const logLeft = look();
+  $('btnLogStop').click();
+  await wait(600);
+  return { streaming, both, logLeft, done: look() };
+`);
+check(
+  "a log added to a running stream; Stop stream then leaves it logging, and Stop SD logging ends it",
+  logAndStream.streaming.logStart &&
+    logAndStream.streaming.streamStop &&
+    !logAndStream.streaming.sdStop &&
+    logAndStream.both.sensorLogs &&
+    logAndStream.both.logStop &&
+    logAndStream.both.sdStop &&
+    logAndStream.both.streamStop &&
+    /logging/.test(logAndStream.both.streamStopTitle) &&
+    !logAndStream.both.note &&
+    logAndStream.logLeft.sensorLogs &&
+    logAndStream.logLeft.logStop &&
+    logAndStream.logLeft.streamStart &&
+    !logAndStream.logLeft.streamStop &&
+    logAndStream.logLeft.note &&
+    !logAndStream.done.sensorLogs &&
+    logAndStream.done.logStart &&
+    !logAndStream.done.logStop,
+  JSON.stringify(logAndStream),
+);
+
+/* Firmware that NACKs a log start it cannot carry out: the start fails with
+   the reason, and the page claims no log. Here the card fault is one the
+   sensor has not reported, so the page's own gate cannot hold the button. */
+const logRefused = await evaluate(`${LOG_LOOK}
+  window.mockTransport.status.nackRefusedLogStart = true;
+  window.mockTransport.status.setQuietly({ sdBadFile: true });
+  const lines = () => document.getElementById('log').textContent;
+  const before = lines().length;
+  $('btnLogStart').click();
+  await wait(800);
+  const after = look();
+  const said = lines().slice(before);
+  window.mockTransport.status.setQuietly({ sdBadFile: false });
+  window.mockTransport.status.nackRefusedLogStart = false;
+  return { after, said: said.slice(0, 400) };
+`);
+check(
+  "a log start the firmware refuses (NACK) fails with the reason, and the page claims no log",
+  !logRefused.after.sensorLogs &&
+    logRefused.after.logStart &&
+    !logRefused.after.logStop &&
+    !logRefused.after.flags.includes("SD logging") &&
+    /refused to start an SD log/.test(logRefused.said),
+  JSON.stringify(logRefused),
+);
+
 /* The push and the answer to GET_STATUS are the same message built by the same
    function — this is the assertion that they stayed that way. */
 check(
@@ -3558,6 +3702,7 @@ console.log("\n--- one SDK copy, reached one way ---");
    starts importing the SDK -- and when something stops. */
 const SDK_CONSUMERS = [
   "index.html",
+  "common/audio-panel.js",
   "common/brand-editor.js",
   "common/bt-module-update.js",
   "common/calibration-editor.js",
@@ -4504,7 +4649,9 @@ const generalIdle = await evaluate(`
     first: btn.dataset.tab,
     label: btn.textContent.trim(),
     selected: document.querySelector('.tabs [aria-selected="true"]').dataset.tab,
-    cards: [...document.querySelectorAll('#tabGeneral .card-title')]
+    /* The cards shown: the audio card joins them only for a sensor whose
+       firmware records audio (DEV-99), which this mock's does not. */
+    cards: [...document.querySelectorAll('#tabGeneral .card:not([hidden]) .card-title')]
       .map(t => t.textContent.trim()),
     /* Every control on it is a device command, so every one is gated on a
        link. A button that is live with nothing connected would fail on its
@@ -6529,6 +6676,393 @@ check(
     evtBoard.ttl === true &&
     /no TTL input/.test(evtBoard.why ?? ""),
   JSON.stringify(evtBoard),
+);
+
+// ===========================================================================
+// Shimmer3R audio recording and configuration byte 233 (DEV-99), on a mock
+// whose firmware records audio (`&audio=1`, which reports v1.01.025 as those
+// builds do). No release has it, so the SDK rules older firmware out by version
+// and asks the rest with GET_AUDIO_STATUS (0xBC), which older firmware drops.
+// ===========================================================================
+console.log("\n--- audio recording (byte 233, audio status, audio/ files) ---");
+const AUDIO_OPS = `
+  const audioProbes = () => (window.mockTransport?.writes ?? [])
+    .filter(w => (w.bytes ?? w.data)[0] === 0xbc).length;
+`;
+
+await goto(`${BASE}?mock=1`);
+await evaluate(CONNECT);
+const audOld = await evaluate(
+  AUDIO_OPS +
+    `
+  return {
+    probes: audioProbes(),
+    hidden: document.getElementById('audioCard').hidden,
+    field: !!document.querySelector('.field[data-field-key="audioMode"]'),
+  };
+`,
+);
+check(
+  "firmware older than the builds with audio is not asked, and shows no audio",
+  audOld.probes === 0 && audOld.hidden && !audOld.field,
+  JSON.stringify(audOld),
+);
+
+await goto(`${BASE}?mock=1&fw=1.01.025`);
+await evaluate(CONNECT);
+const audSilent = await evaluate(
+  AUDIO_OPS +
+    `
+  return {
+    probes: audioProbes(),
+    hidden: document.getElementById('audioCard').hidden,
+    fields: document.querySelectorAll('#configForm .field').length,
+    flags: document.getElementById('statusFlags').textContent,
+    said: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+      .filter(l => /audio: /.test(l)).join(' | '),
+  };
+`,
+);
+check(
+  "a v1.01.025 build without audio is asked once, its silence read as no, and the form is unchanged",
+  audSilent.probes === 1 &&
+    audSilent.hidden &&
+    audSilent.fields === 39 &&
+    !/audio/i.test(audSilent.flags) &&
+    /audio: not in this firmware/.test(audSilent.said),
+  JSON.stringify(audSilent),
+);
+
+await goto(`${BASE}?mock=1&audio=1`);
+check(
+  "connect to a sensor whose firmware records audio",
+  (await evaluate(CONNECT)) === "mock",
+);
+const audUp = await evaluate(
+  AUDIO_OPS +
+    `
+  await new Promise(r => setTimeout(r, 200));
+  return {
+    probes: audioProbes(),
+    fields: document.querySelectorAll('#configForm .field').length,
+    field: !!document.querySelector('.field[data-field-key="audioMode"]'),
+    hidden: document.getElementById('audioCard').hidden,
+    support: document.querySelector('#audioCard .muted').textContent,
+    flags: document.getElementById('statusFlags').textContent,
+    summary: document.getElementById('audioSummary')?.textContent ?? null,
+    tile: document.querySelector('#microphoneGroup h3')?.textContent ?? null,
+    boxes: [...document.querySelectorAll('#microphoneGroup label')].map(l => l.textContent.trim()),
+    inSensors: !!document.querySelector('[data-group-body="sensors"] #microphoneGroup'),
+    audioGroup: [...document.querySelectorAll('#configForm details > summary')].some(s => s.textContent.trim() === 'Audio Recording'),
+    fieldShown: getComputedStyle(document.querySelector('.field[data-field-key="audioMode"]')).display !== 'none',
+  };
+`,
+);
+check(
+  "the form gains byte 233's Audio Recording field, and the audio card shows",
+  audUp.probes === 1 &&
+    audUp.field &&
+    audUp.fields === 40 &&
+    !audUp.hidden &&
+    /records audio while it logs to SD/.test(audUp.support),
+  `${audUp.fields} fields | ${audUp.support}`,
+);
+check(
+  "the status flags include the recorder's, and the summary says it records nothing",
+  /Recording audio/.test(audUp.flags) &&
+    audUp.summary === "The sensor records no audio.",
+  `${audUp.flags} | ${audUp.summary}`,
+);
+check(
+  "byte 233 is a Microphone tile in Sensor Enables, its two boxes the four modes, with no group of its own",
+  audUp.tile === "Microphone" &&
+    audUp.inSensors &&
+    audUp.boxes.join("|") ===
+      "Audio fingerprint (no sound stored)|Raw audio (records speech)" &&
+    !audUp.audioGroup &&
+    !audUp.fieldShown,
+  `${audUp.tile} | ${audUp.boxes.join(", ")} | group ${audUp.audioGroup}`,
+);
+
+/* Byte 233 through the Microphone tile: mode 1 is the fingerprint, 2 both,
+   3 raw audio, 0 neither. */
+const SET_AUDIO = (v) => `
+  {
+    const want = { micFingerprint: ${v} === 1 || ${v} === 2, micRaw: ${v} === 2 || ${v} === 3 };
+    for (const [id, on] of Object.entries(want)) {
+      const box = document.getElementById(id);
+      if (box.checked !== on) box.click();
+    }
+  }
+  await new Promise(r => setTimeout(r, 100));
+`;
+const APPLY_AUDIO = `
+  document.getElementById('btnApply').click();
+  for (let i = 0; i < 100 && document.getElementById('dirtyPill')?.textContent !== '0 changes'; i++)
+    await new Promise(r => setTimeout(r, 100));
+  await new Promise(r => setTimeout(r, 300));
+`;
+
+const audDecline = await evaluate(
+  SET_AUDIO(3) +
+    `
+  const summary = document.getElementById('audioSummary').textContent;
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return !/stores raw audio, which records speech/.test(m); };
+  document.getElementById('btnApply').click();
+  await new Promise(r => setTimeout(r, 600));
+  const im = await window.mockClient.readInfoMemBytes();
+  return { summary, asked: window.__asked, b233: im[233],
+    said: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+      .filter(l => /raw audio recording was not confirmed/.test(l)).length };
+`,
+);
+check(
+  "raw audio is spelled out as recording speech, and declining it writes nothing",
+  /raw 16 kHz audio \(\.WAV\)/.test(audDecline.summary) &&
+    /records speech: Apply asks you to confirm/.test(audDecline.summary) &&
+    audDecline.asked.length === 1 &&
+    /stores raw audio, which records speech/.test(audDecline.asked[0]) &&
+    audDecline.b233 === 0 &&
+    audDecline.said === 1,
+  `${audDecline.asked.length} prompt(s) | byte 233 0x${audDecline.b233?.toString(16)}`,
+);
+
+const audAccept = await evaluate(
+  `
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return true; };
+` +
+    APPLY_AUDIO +
+    `
+  const im = await window.mockClient.readInfoMemBytes();
+  return { asked: window.__asked.map(m => m.split('\\n')[0]), b233: im[233] };
+`,
+);
+check(
+  "confirming it writes mode 3, after its own prompt and then the usual one",
+  audAccept.b233 === 3 &&
+    audAccept.asked.length === 2 &&
+    /stores raw audio, which records speech/.test(audAccept.asked[0]) &&
+    /Write this configuration to the sensor\?/.test(audAccept.asked[1]),
+  `${audAccept.asked.join(" / ")} | byte 233 0x${audAccept.b233?.toString(16)}`,
+);
+
+const audFingerprint = await evaluate(
+  SET_AUDIO(1) +
+    `
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return true; };
+` +
+    APPLY_AUDIO +
+    `
+  const im = await window.mockClient.readInfoMemBytes();
+  return { asked: window.__asked.length, speech: window.__asked.filter(m => /stores raw audio/.test(m)).length,
+    b233: im[233], summary: document.getElementById('audioSummary').textContent,
+    config: document.getElementById('audioConfigLine').textContent,
+    boxes: [document.getElementById('micFingerprint').checked, document.getElementById('micRaw').checked] };
+`,
+);
+check(
+  "the fingerprint alone stores no sound, so it is written without the speech prompt",
+  audFingerprint.b233 === 1 &&
+    audFingerprint.asked === 1 &&
+    audFingerprint.speech === 0 &&
+    /fingerprint \(\.AFP: landmark hashes, no sound\)/.test(
+      audFingerprint.summary,
+    ) &&
+    /records the audio fingerprint only/.test(audFingerprint.config) &&
+    audFingerprint.boxes.join() === "true,false",
+  `byte 233 0x${audFingerprint.b233?.toString(16)} | ${audFingerprint.asked} prompt(s), ${audFingerprint.speech} about speech | ${audFingerprint.summary}`,
+);
+
+const audRecording = await evaluate(`
+  window.mockTransport.audio.setLogging(true);
+  for (let i = 0; i < 40 && !/Recording now/.test(document.getElementById('audioStateLine').textContent); i++)
+    await new Promise(r => setTimeout(r, 50));
+  await new Promise(r => setTimeout(r, 1100));
+  document.getElementById('btnAudioStatus').click();
+  await new Promise(r => setTimeout(r, 600));
+  const on = [...document.querySelectorAll('#statusFlags .flag.on')].map(f => f.textContent);
+  return { on, state: document.getElementById('audioStateLine').textContent,
+    status: document.getElementById('audioStatusLine').textContent };
+`);
+check(
+  "the sensor's push turns Recording audio on, and Read audio status gives the recorder's own view",
+  audRecording.on.includes("Recording audio") &&
+    audRecording.state === "Recording now." &&
+    /^Mode 1 \(Fingerprint\) · Recording · fault: None · [1-9]\d* s recorded/.test(
+      audRecording.status,
+    ),
+  `${audRecording.state} | ${audRecording.status}`,
+);
+
+const audFault = await evaluate(`
+  window.mockTransport.audio.fault(3);
+  for (let i = 0; i < 40 && !document.querySelector('#statusFlags .flag.bad'); i++)
+    await new Promise(r => setTimeout(r, 50));
+  document.getElementById('btnAudioStatus').click();
+  await new Promise(r => setTimeout(r, 600));
+  const out = {
+    bad: [...document.querySelectorAll('#statusFlags .flag.bad')].map(f => f.textContent),
+    on: [...document.querySelectorAll('#statusFlags .flag.on')].map(f => f.textContent),
+    state: document.getElementById('audioStateLine').textContent,
+    status: document.getElementById('audioStatusLine').textContent,
+  };
+  window.mockTransport.audio.setLogging(false);
+  await new Promise(r => setTimeout(r, 300));
+  return out;
+`);
+check(
+  "a write fault is pushed: Audio fault shows as bad, recording stops, and the status names the fault",
+  audFault.bad.includes("Audio fault") &&
+    !audFault.on.includes("Recording audio") &&
+    /Not recording\. This session's audio failed/.test(audFault.state) &&
+    /Stopped by a fault · fault: A write to the card failed/.test(
+      audFault.status,
+    ),
+  `${audFault.bad.join(",")} | ${audFault.status}`,
+);
+
+/* Start stream + SD logging streams too, so the push that says recording
+   started arrives between two stream packets, and the SDK has to take it from
+   there. */
+const audStream = await evaluate(`
+  window.confirm = () => true;
+  const flags = () => [...document.querySelectorAll('#statusFlags .flag')].map(f => ({
+    text: f.textContent, on: f.classList.contains('on'), inferred: f.classList.contains('inferred') }));
+  const recording = () => flags().some(f => f.text === 'Recording audio' && f.on);
+  document.getElementById('btnSdStart').click();
+  for (let i = 0; i < 60 && !recording(); i++) await new Promise(r => setTimeout(r, 50));
+  const during = flags();
+  document.getElementById('btnSdStop').click();
+  /* The stop's push says recording stopped. It comes in the stop's tail, so
+     before the stop returns, and the page has to keep it rather than put its
+     own guess (marked *) over it. With no link CRC the SDK takes the push only
+     once the link has been quiet for 300 ms (the stop drain), so wait for it
+     rather than a fixed time. */
+  const confirmedOff = () => flags().some(f => f.text === 'Recording audio' && !f.on);
+  for (let i = 0; i < 80 && !confirmedOff(); i++) await new Promise(r => setTimeout(r, 50));
+  return { during, after: flags() };
+`);
+check(
+  "during Start stream + SD logging, the push mid-stream turns Recording audio on and replaces the inferred flags",
+  audStream.during.some((f) => f.text === "Recording audio" && f.on) &&
+    audStream.during.every((f) => !f.inferred),
+  audStream.during
+    .map((f) => `${f.text}${f.on ? "+" : ""}${f.inferred ? "*" : ""}`)
+    .join(","),
+);
+check(
+  "stopping it turns Recording audio off again",
+  audStream.after.some((f) => f.text === "Recording audio" && !f.on),
+  audStream.after.map((f) => `${f.text}${f.on ? "+" : ""}`).join(","),
+);
+
+/* The push that says recording stopped can be lost on the way, so the stop
+   turns the flag off itself, as it does SD logging. */
+const audStopNoPush = await evaluate(`
+  window.confirm = () => true;
+  const flags = () => [...document.querySelectorAll('#statusFlags .flag')].map(f => ({
+    text: f.textContent, on: f.classList.contains('on'), inferred: f.classList.contains('inferred') }));
+  const recording = () => flags().some(f => f.text === 'Recording audio' && f.on);
+  // The last stop drains the stream's tail before the page is idle again.
+  const sdStart = document.getElementById('btnSdStart');
+  for (let i = 0; i < 60 && sdStart.disabled; i++) await new Promise(r => setTimeout(r, 50));
+  sdStart.click();
+  for (let i = 0; i < 60 && !recording(); i++) await new Promise(r => setTimeout(r, 50));
+  const during = recording();
+  window.mockTransport.audio.dropStopPush = true;
+  document.getElementById('btnSdStop').click();
+  await new Promise(r => setTimeout(r, 1000));
+  window.mockTransport.audio.dropStopPush = false;
+  return { during, after: flags() };
+`);
+check(
+  "with the stop's push lost, the stop still turns Recording audio off, as the page's own belief",
+  audStopNoPush.during &&
+    audStopNoPush.after.some(
+      (f) => /^Recording audio\b/.test(f.text) && !f.on && f.inferred,
+    ),
+  `recording ${audStopNoPush.during} → ` +
+    audStopNoPush.after
+      .map((f) => `${f.text}${f.on ? "+" : ""}${f.inferred ? "*" : ""}`)
+      .join(","),
+);
+
+/* The SD tab, on firmware that writes audio/ beside data/. The mock's card has
+   a WAV and a fingerprint for each of the first session's two data files. */
+const audSdList = await evaluate(
+  MEMFS +
+    `
+  document.querySelector('.tabs [data-tab="tabSd"]').click();
+  await window.sdBrowser.refresh();
+  const rows = [...document.querySelectorAll('[data-sd-role="tree"] > ul > li')].map(li => ({
+    path: li.querySelector('label').textContent.trim(),
+    meta: li.querySelector(':scope > .sd-size').textContent,
+    audio: [...li.querySelectorAll('[data-sd-companion-file]')].map(f => f.dataset.sdCompanionFile),
+  }));
+  return { rows, stats: window.__sdStats() };
+`,
+);
+check(
+  "the SD tab lists each session's audio files under it",
+  audSdList.rows.length === 2 &&
+    /; 4 audio file\(s\), /.test(audSdList.rows[0].meta) &&
+    audSdList.rows[0].audio.length === 4 &&
+    audSdList.rows[0].audio.every((p) =>
+      /^audio\/DefaultTrial_5f2c1a90\/Shimmer_\w+-000\/00[01]\.(WAV|AFP)$/.test(
+        p,
+      ),
+    ) &&
+    audSdList.rows[1].audio.length === 0 &&
+    audSdList.stats.files === "5 + 4 audio file(s)",
+  audSdList.rows.map((r) => `${r.path} [${r.meta}]`).join(" | ") +
+    ` | files ${audSdList.stats.files}`,
+);
+
+const audSdMirror = await evaluate(`
+  const sdk = await import('/vendor/shimmer-web-sdk.esm.js');
+  window.sdBrowser.setLayout('card');
+  await window.__useFs('AudMirror');
+  const preview = window.__sdRole('preview').textContent;
+  const session = [...document.querySelectorAll('[data-sd-path]')].map(b => b.dataset.sdPath)
+    .find(p => p.endsWith('-000'));
+  await window.sdBrowser.download([session], { deleteVerified: true });
+  const keys = [...window.__fs.files.keys()];
+  const file = (suffix) => window.__fs.files.get(keys.find(k => k.startsWith('audio/') && k.endsWith(suffix)));
+  const wav = sdk.parseAudioWavHeader(file('-000/001.WAV'));
+  const afp = sdk.parseAudioFingerprintFile(file('-000/000.AFP'));
+  const dataTs = (path) => sdk.sdDataPathForCompanion(path);
+  return { preview, keys,
+    wav: { mode: wav.mode, closed: wav.closed, samples: wav.samples, fileNumber: wav.fileNumber,
+      openReason: wav.openReason, fw: wav.firmwareVersion.internal },
+    afp: { chunks: afp.chunks.length, records: afp.chunks.reduce((n, c) => n + c.records.length, 0),
+      truncated: afp.lastChunkTruncated, first: afp.chunks[0]?.records[0]?.t1 },
+    paired: keys.filter(k => k.startsWith('audio/')).map(dataTs).every(p => keys.includes(p)),
+    card: window.mockTransport.sdCard.files.map(f => f.path) };
+`);
+check(
+  "a Mirror SD card structure download takes a session's audio files with it, and they decode",
+  /, and audio files to AudMirror\/audio\/…$/.test(audSdMirror.preview) &&
+    audSdMirror.keys.filter((k) => k.startsWith("audio/")).length === 4 &&
+    audSdMirror.wav.mode === 2 &&
+    audSdMirror.wav.closed === true &&
+    audSdMirror.wav.samples === 8000 &&
+    audSdMirror.wav.fileNumber === 1 &&
+    audSdMirror.wav.openReason === 1 &&
+    audSdMirror.afp.chunks === 2 &&
+    audSdMirror.afp.records === 5 &&
+    audSdMirror.afp.truncated === false &&
+    audSdMirror.afp.first === 12 &&
+    audSdMirror.paired,
+  `${audSdMirror.keys.join(" | ")}`,
+);
+check(
+  "deleting after a verified download clears the session's audio files too",
+  !audSdMirror.card.some((p) => p.startsWith("audio/")) &&
+    !audSdMirror.card.some((p) => /-000\//.test(p)),
+  `card now ${audSdMirror.card.join(", ")}`,
 );
 
 // ===========================================================================
