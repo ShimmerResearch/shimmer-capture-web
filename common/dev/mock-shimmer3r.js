@@ -241,6 +241,8 @@ const CHANNEL_WIDTH = Object.freeze({
   0x19: { bytes: 2, be: false },
   0x27: { bytes: 2, be: false, unsigned: true },
   0x28: { bytes: 2, be: false, unsigned: true },
+  // The sound level (DEV-1413): 0.01 dB(A), signed, 0x8000 for no level.
+  0x38: { bytes: 2, be: false },
 });
 
 /**
@@ -282,7 +284,16 @@ const PLAUSIBLE_SAMPLES = Object.freeze({
   0x1c: { centre: 2000, amplitude: 300 }, // GSR, inside range 0's window
   0x27: { centre: 2048, amplitude: 300 }, // bridge amp
   0x28: { centre: 2048, amplitude: 300 },
+  0x38: { centre: 5500, amplitude: 800 }, // sound level, 55 dB(A) ± 8
 });
+
+/** The sound level's channel (DEV-1413), and its no-level value, 0x8000. */
+const SOUND_LEVEL_ID = 0x38;
+const SOUND_LEVEL_NONE = -32768;
+/** The ADS7028's channels on a Shimmer3R: GSR, the ADCs and the battery. */
+const ADS7028_IDS = Object.freeze([
+  0x1c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x03,
+]);
 
 /**
  * The pressure pair, whose raw registers mean different things on the two
@@ -987,11 +998,12 @@ function audioFingerprintBytes(info) {
 /**
  * Configuration byte 233 as firmware that records audio corrects it
  * (`ShimAudioMode_correct`): bit 7 set or a reserved gain preset reads as off,
- * and bits 4-6 are cleared.
+ * and bits 5-6 are cleared. Bit 4, the sound level (DEV-1413), is kept by
+ * firmware with the channel and cleared by firmware without it.
  */
-function correctAudioMode(raw) {
+function correctAudioMode(raw, soundLevel = false) {
   if (raw & 0x80 || raw & 0x0c) return 0;
-  return raw & 0x0f;
+  return raw & (soundLevel ? 0x1f : 0x0f);
 }
 
 /** Pack a Date into the FAT date/time pair the card stores. */
@@ -1099,6 +1111,11 @@ export function mockEnabledFromUrl() {
  *   audio bits, and audio/ files on the card. Reports v1.01.025 unless
  *   `firmware` says otherwise, as those builds do. `transport.audio` starts
  *   and stops logging and raises faults.
+ * @param {boolean} [opts.soundLevel=false] with `audio`, firmware with the
+ *   sound-level channel (DEV-1413): byte 233's bit 4 survives the correction,
+ *   and while it is set the stream carries channel 0x38 just before the
+ *   ADS7028's channels, no level (0x8000) for its first 256 ms. Without it,
+ *   the correction clears bit 4, as firmware before the channel does.
  * @param {boolean} [opts.debug=false] console.log every command
  * @returns {LoopbackTransport} pass it to `new Shimmer3RClient({ transport })`.
  *   `transport.emitDisconnect()` simulates a dropped link;
@@ -1148,6 +1165,9 @@ export function createMockShimmer3RTransport(opts = {}) {
      GET_AUDIO_STATUS then goes unanswered, as an unknown command does on real
      firmware, and byte 233 is stored as written, uncorrected. */
   const audioBuilt = !!opts.audio;
+  /* Firmware with the sound-level channel (DEV-1413), which is built on top of
+     audio recording. */
+  const soundLevelBuilt = audioBuilt && !!opts.soundLevel;
   /**
    * The recorder: the session it is in, if any, and that session's first
    * fault. `fatal` faults stop the recording and leave logging running.
@@ -1780,7 +1800,10 @@ export function createMockShimmer3RTransport(opts = {}) {
 
   /** Byte 233's mode, as the firmware acts on it. */
   const audioMode = () =>
-    audioBuilt ? correctAudioMode(infoMem[233]) & 0x03 : 0;
+    audioBuilt ? correctAudioMode(infoMem[233], soundLevelBuilt) & 0x03 : 0;
+  /** Whether the stream and the data carry the sound level (byte 233 bit 4). */
+  const soundLevelOn = () =>
+    soundLevelBuilt && (correctAudioMode(infoMem[233], true) & 0x10) !== 0;
   /** Whether the recorder is capturing: logging, a mode set, no fault that stopped it. */
   const audioRecording = () =>
     audioBuilt &&
@@ -1910,6 +1933,12 @@ export function createMockShimmer3RTransport(opts = {}) {
       if (!(state.sensors & group.bit)) continue;
       for (const id of group.ids) if (!ids.includes(id)) ids.push(id);
     }
+    /* The sound level (DEV-1413) has no sensor bit: byte 233's bit 4 adds it,
+       just before the ADS7028's channels, so the battery stays last. */
+    if (soundLevelOn()) {
+      const at = ids.findIndex((id) => ADS7028_IDS.includes(id));
+      ids.splice(at < 0 ? ids.length : at, 0, SOUND_LEVEL_ID);
+    }
     return ids;
   }
 
@@ -1941,6 +1970,10 @@ export function createMockShimmer3RTransport(opts = {}) {
    * broken one at a glance, and to make an axis mix-up obvious.
    */
   function sampleFor(id, n) {
+    /* No level while capture settles, as the firmware sends for about the
+       first 256 ms. */
+    if (id === SOUND_LEVEL_ID && n < Math.ceil(state.rateHz * 0.256))
+      return SOUND_LEVEL_NONE;
     const width = channelWidthFor(id, hardwareVersion);
     const t = n / state.rateHz;
     const phase = ((id * 37) % 360) * (Math.PI / 180);
@@ -3053,7 +3086,7 @@ export function createMockShimmer3RTransport(opts = {}) {
            configuration (`ShimConfig_checkAndCorrectConfig`), so a read-back
            shows what it will record. Older firmware stores it as written. */
         if (audioBuilt && off <= 233 && off + len > 233)
-          infoMem[233] = correctAudioMode(infoMem[233]);
+          infoMem[233] = correctAudioMode(infoMem[233], soundLevelBuilt);
         // Keep the live state in step with what was just written, so an
         // inquiry after a config write reports the new rate and sensors —
         // which is exactly what the firmware does on undock.

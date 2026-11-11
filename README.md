@@ -552,6 +552,20 @@ Where it does, four things change:
   stream or the data file. Raw audio records speech, so **Apply asks for that
   on its own** before the usual prompt, and writes nothing if you decline. It
   does not ask again for the mode the sensor already has.
+
+  A third box, **Sound level** (byte 233 bit 4), is a channel in the data
+  instead: the A-weighted level of the most recent 128 ms of audio, streamed
+  and logged, plotted, and a `SOUND_LEVEL` column in the CSV, with any
+  combination of the other two or none. It is **nominal** dB(A): the firmware
+  adds the microphone's datasheet sensitivity, and no unit has been checked
+  against a calibrated sound level meter. The sensor sends no level for its
+  first quarter-second or so, while capture settles, and the page shows that
+  as a gap (`NaN` in the CSV), never as -327.68 dB. A value describes the 128
+  ms that ended up to 128 ms before its sample's timestamp, later still (up to
+  about 0.2 s) while an SD card is slow. No command says whether a sensor has
+  the channel; firmware without it clears the bit when it takes the
+  configuration, so the image Apply reads back answers, and the tile says so.
+
 - **General** gains an **Audio recording** card: what the configuration
   records, whether the sensor is recording now, and **Read audio status**, the
   recorder's own account: its state, the session's first fault, seconds
@@ -781,6 +795,8 @@ one is a useful thing to be able to see.
 | `&sensors=`        | Preload the enabled-sensor bitmap, `0x0422E6` or decimal — how a calibrated multi-channel stream, or an image that already breaks a sensor rule, is reachable from a URL.                                                          |
 | `&pressure=`       | Which pressure part the mock claims: `390`, `581`, `180`, or `nack` / `silent` for the two ways real firmware fails to serve the coefficients.                                                                                     |
 | `&events=1`        | Firmware with the event channel: byte 232 in the form, and button and TTL records to a host that opts in. `mockTransport.events.button(true/false)` and `.ttl(true/false)` produce them from the console.                          |
+| `&audio=1`         | Firmware that records audio: byte 233 in the form, the audio status command, audio files on the card. `mockTransport.audio` starts and stops logging and raises faults.                                                            |
+| `&soundlevel=1`    | With `&audio=1`, firmware with the sound-level channel: byte 233 bit 4 survives a write, and while it is set the stream carries channel 0x38, no level for 256 ms. Without it the sensor clears the bit, as older firmware does.   |
 | `&rtcWrapIn=<s>`   | Put the sensor's clock this many seconds short of the point where the 24-bit stream counter rolls over, so a short stream crosses a wrap. It moves the clock, not the counter, because on a Shimmer3R the two are the same number. |
 | `&debug=1`         | Log every command and reply to the browser console.                                                                                                                                                                                |
 
