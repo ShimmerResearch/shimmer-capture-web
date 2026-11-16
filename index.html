@@ -589,6 +589,21 @@
             <!-- Not hidden before connecting: it shows what the selection
                  WILL ask for, then what the sensor actually accepted. -->
             <span class="pill" id="crcPill">CRC 2 bytes</span>
+            <span class="link-sep" aria-hidden="true"></span>
+            <!-- DEV-1483. On this row, with its explanation in the tooltip,
+                 because a row of its own and a hint under it made this card
+                 the tallest thing above the tab strip and pushed the strip past
+                 its budget on Linux fonts (verify.mjs, TAB_STRIP_BUDGET_PX).
+                 On by default; turning it off is remembered per browser.
+                 Disconnect is never reconnected, so walking away from the
+                 sensor on purpose means pressing Disconnect first. -->
+            <label
+              for="chkAutoReconnect"
+              title="If the sensor goes out of range or is switched off, keep trying to reconnect to the same sensor, over BLE or Classic Bluetooth, without asking you to pick it again, and restart a stream that was running. Samples sent while the link was down are lost. A CSV recording is closed when the link drops; start a new one once it is back. Not across a page reload."
+            >
+              <input type="checkbox" id="chkAutoReconnect" checked />
+              Reconnect automatically
+            </label>
           </div>
           <div class="field-hint">
             Has the sensor append a checksum to every packet, so a corrupted
@@ -597,23 +612,6 @@
             way to tell a bad link from a bad decode; one byte lets roughly 1 in
             256 bad frames through. Firmware that does not support it falls back
             to off on its own. Applied when you connect.
-          </div>
-          <!-- DEV-1483. On by default; turning it off is remembered per
-               browser. Disconnect is never reconnected, so walking away from
-               the sensor on purpose means pressing Disconnect first. -->
-          <div class="row">
-            <label for="chkAutoReconnect">
-              <input type="checkbox" id="chkAutoReconnect" checked />
-              Reconnect automatically if the Bluetooth link drops
-            </label>
-          </div>
-          <div class="field-hint">
-            If the sensor goes out of range or is switched off, this page keeps
-            trying to reconnect to the same sensor, over BLE or Classic
-            Bluetooth, without asking you to pick it again, and restarts a
-            stream that was running. Samples sent while the link was down are
-            lost. A CSV recording is closed when the link drops; start a new one
-            once it is back. Not across a page reload.
           </div>
           <div class="banner info" id="reconnectBanner" hidden>
             <span id="reconnectText"></span>
