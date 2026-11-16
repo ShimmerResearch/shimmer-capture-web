@@ -127,6 +127,21 @@ Checked against the mock (below); a real sensor walked out of range has not
 been run yet. On a Shimmer3 with an RN4678 at v1.23, a Classic reconnect while
 it logs can leave it ignoring Bluetooth until it is power-cycled (DEV-1384).
 
+### The strip at the top
+
+Scroll the connect buttons and the Device card out of view and a slim strip
+slides in at the top of the window, as in the Verisense console (DEV-1485). It
+repeats what they say:
+
+- the link, in the same colour as the pill under the buttons;
+- the sensor's name and battery;
+- what it is doing for this page: streaming, SD logging, recording;
+- while an automatic reconnect runs, its line, with the next try's countdown.
+
+On a phone it keeps the link, the name and a reconnect, and drops the rest.
+It is for looking at only, and screen readers skip it, since it repeats the
+fields above.
+
 ## General
 
 The first tab, as in the Verisense device console, and for the same reason: the
