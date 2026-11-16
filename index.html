@@ -512,12 +512,12 @@
             256 bad frames through. Firmware that does not support it falls back
             to off on its own. Applied when you connect.
           </div>
-          <!-- DEV-1483. Off by default: a page that reconnects on its own
-               surprises someone who walked away from the sensor on purpose.
-               Remembered per browser. -->
+          <!-- DEV-1483. On by default; turning it off is remembered per
+               browser. Disconnect is never reconnected, so walking away from
+               the sensor on purpose means pressing Disconnect first. -->
           <div class="row">
             <label for="chkAutoReconnect">
-              <input type="checkbox" id="chkAutoReconnect" />
+              <input type="checkbox" id="chkAutoReconnect" checked />
               Reconnect automatically if the Bluetooth link drops
             </label>
           </div>
@@ -6879,12 +6879,13 @@
       $("btnBt").addEventListener("click", userConnect("rfcomm"));
       $("btnUsb").addEventListener("click", userConnect("usb"));
 
-      /* The automatic reconnect's setting, remembered in this browser only. */
+      /* The automatic reconnect's setting: on unless turned off in this
+               browser. */
       try {
         $("chkAutoReconnect").checked =
-          localStorage.getItem(AUTO_RECONNECT_KEY) === "on";
+          localStorage.getItem(AUTO_RECONNECT_KEY) !== "off";
       } catch {
-        /* storage blocked: the setting starts off */
+        /* storage blocked: the setting starts on, as the markup has it */
       }
       $("chkAutoReconnect").addEventListener("change", (e) => {
         try {

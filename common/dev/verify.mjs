@@ -184,9 +184,10 @@ await goto(`${BASE}?mock=1`);
    the pass starts from the state a first visit is in. */
 await evaluate(
   `try { localStorage.removeItem('shimmerCaptureLogDrawer'); } catch {}
-   /* Likewise the automatic reconnect: left on, every dropped-link check
-      below would reconnect instead of ending the session. */
-   try { localStorage.removeItem('shimmerCaptureAutoReconnect'); } catch {}
+   /* The automatic reconnect is on by default; off, every dropped-link check
+      below sees the session end as it did before it existed. Its own section
+      near the end turns it back on. */
+   try { localStorage.setItem('shimmerCaptureAutoReconnect', 'off'); } catch {}
    return 1;`,
 );
 await goto(`${BASE}?mock=1`);
@@ -7279,12 +7280,17 @@ const AR = `
   const toasts = () => [...document.querySelectorAll('.toast')].map(t => t.textContent);
 `;
 
+/* A first visit: nothing stored, so the setting is at its default. */
+await evaluate(
+  `try { localStorage.removeItem('shimmerCaptureAutoReconnect'); } catch {} return 1;`,
+);
+await goto(`${BASE}?mock=1`);
 const arIdle = await evaluate(`${AR}
   return { checked: $('chkAutoReconnect').checked, bannerHidden: $('reconnectBanner').hidden };
 `);
 check(
-  "the automatic reconnect is off by default, with no banner",
-  !arIdle.checked && arIdle.bannerHidden,
+  "the automatic reconnect is on by default, with no banner",
+  arIdle.checked && arIdle.bannerHidden,
   JSON.stringify(arIdle),
 );
 

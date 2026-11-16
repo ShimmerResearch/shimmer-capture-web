@@ -98,8 +98,8 @@ so if you pick the wrong one.
 ### Reconnecting automatically
 
 **Reconnect automatically if the Bluetooth link drops**, under the connect
-buttons, is off by default and remembered in this browser (DEV-1483). With it
-on, a BLE or Classic Bluetooth link that the sensor drops (out of range,
+buttons, is on by default; turning it off is remembered in this browser
+(DEV-1483). With it on, a BLE or Classic Bluetooth link that the sensor drops (out of range,
 switched off) is reconnected without the device or port picker, and a stream
 that was running starts again:
 
