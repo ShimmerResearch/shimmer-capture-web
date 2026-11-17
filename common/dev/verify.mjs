@@ -183,7 +183,12 @@ await goto(`${BASE}?mock=1`);
    left it open makes the plot-width check below measure the wrong thing, so
    the pass starts from the state a first visit is in. */
 await evaluate(
-  `try { localStorage.removeItem('shimmerCaptureLogDrawer'); } catch {} return 1;`,
+  `try { localStorage.removeItem('shimmerCaptureLogDrawer'); } catch {}
+   /* The automatic reconnect is on by default; off, every dropped-link check
+      below sees the session end as it did before it existed. Its own section
+      near the end turns it back on. */
+   try { localStorage.setItem('shimmerCaptureAutoReconnect', 'off'); } catch {}
+   return 1;`,
 );
 await goto(`${BASE}?mock=1`);
 check(
@@ -7249,6 +7254,251 @@ check(
       slAbsent.summary,
     ),
   `byte 233 0x${slAbsent.b233?.toString(16)} | ${slAbsent.summary}`,
+);
+
+// ===========================================================================
+// Automatic reconnect (DEV-1483). The mock reconnects through the same code a
+// BLE or Classic link does, short of the transport: a drop the page did not
+// ask for, the tries, the stream put back, Cancel, and the setting off.
+// `mockRefuseConnects` makes the next connects fail, as a sensor still out of
+// range does.
+// ===========================================================================
+console.log("\n--- automatic reconnect (DEV-1483) ---");
+await goto(`${BASE}?mock=1`);
+const AR = `
+  const $ = (id) => document.getElementById(id);
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const until = async (cond, ms) => {
+    for (let t = 0; t < ms; t += 100) { if (cond()) return true; await sleep(100); }
+    return cond();
+  };
+  const connected = () => $('connPill').textContent !== 'disconnected' && !!$('rateHelper');
+  const starts = () => (window.mockTransport?.writes ?? [])
+    .filter(w => (w.bytes ?? w.data)[0] === 0x07).length;
+  const logHas = (re) => [...document.querySelectorAll('#log .log-line')]
+    .some(l => re.test(l.textContent));
+  const toasts = () => [...document.querySelectorAll('.toast')].map(t => t.textContent);
+`;
+
+/* A first visit: nothing stored, so the setting is at its default. */
+await evaluate(
+  `try { localStorage.removeItem('shimmerCaptureAutoReconnect'); } catch {} return 1;`,
+);
+await goto(`${BASE}?mock=1`);
+const arIdle = await evaluate(`${AR}
+  return { checked: $('chkAutoReconnect').checked, bannerHidden: $('reconnectBanner').hidden };
+`);
+check(
+  "the automatic reconnect is on by default, with no banner",
+  arIdle.checked && arIdle.bannerHidden,
+  JSON.stringify(arIdle),
+);
+
+const arResume = await evaluate(`${AR}
+  const chk = $('chkAutoReconnect');
+  chk.checked = true; chk.dispatchEvent(new Event('change'));
+  $('btnMock').click();
+  await until(connected, 8000);
+  await sleep(400);
+  $('btnStreamStart').click();
+  await until(() => !$('btnStreamStop').disabled, 4000);
+  await sleep(800);
+  const first = window.mockTransport;
+  first.emitDisconnect(new Error('walked out of range (mock)'));
+  await sleep(300);
+  const during = {
+    bannerShown: !$('reconnectBanner').hidden,
+    text: $('reconnectText').textContent,
+    bleLocked: $('btnBle').disabled,
+    disconnectLocked: $('btnDisconnect').disabled,
+    pill: $('connPill').textContent,
+  };
+  await until(() => window.mockTransport !== first && starts() > 0
+    && !$('btnStreamStop').disabled, 15000);
+  await sleep(300);
+  return {
+    during,
+    stored: localStorage.getItem('shimmerCaptureAutoReconnect'),
+    newLink: window.mockTransport !== first,
+    starts: starts(),
+    streaming: !$('btnStreamStop').disabled,
+    bannerHidden: $('reconnectBanner').hidden,
+    pill: $('connPill').textContent,
+    logged: logHas(/reconnected after 1 try/),
+    restarting: logHas(/restarting the stream$/),
+    toasts: toasts(),
+  };
+`);
+check(
+  "a drop mid-stream shows the reconnect banner and holds the connect buttons",
+  arResume.during.bannerShown &&
+    /Reconnecting over the mock sensor/.test(arResume.during.text) &&
+    arResume.during.bleLocked &&
+    arResume.during.disconnectLocked &&
+    arResume.during.pill === "disconnected",
+  JSON.stringify(arResume.during),
+);
+check(
+  "it reconnects with no click and starts the stream again",
+  arResume.newLink &&
+    arResume.starts === 1 &&
+    arResume.streaming &&
+    arResume.bannerHidden &&
+    arResume.pill !== "disconnected" &&
+    arResume.logged &&
+    arResume.restarting &&
+    arResume.toasts.some((t) => /Reconnected and streaming again/.test(t)),
+  JSON.stringify({ ...arResume, during: undefined }),
+);
+check(
+  "the setting is remembered in this browser",
+  arResume.stored === "on",
+  String(arResume.stored),
+);
+
+const arRetry = await evaluate(`${AR}
+  const first = window.mockTransport;
+  window.mockRefuseConnects = 1;
+  first.emitDisconnect(new Error('walked out of range (mock)'));
+  await until(() => /trying again in 2 s/.test($('reconnectText').textContent), 4000);
+  const waiting = $('reconnectText').textContent;
+  await until(() => window.mockTransport !== first && starts() > 0
+    && !$('btnStreamStop').disabled, 15000);
+  return {
+    waiting,
+    refusedLeft: window.mockRefuseConnects,
+    newLink: window.mockTransport !== first,
+    streaming: !$('btnStreamStop').disabled,
+    logged: logHas(/reconnected after 2 tries/),
+  };
+`);
+check(
+  "a refused try is retried after the next wait, and the stream comes back",
+  /Try 1 failed; trying again in 2 s/.test(arRetry.waiting) &&
+    arRetry.refusedLeft === 0 &&
+    arRetry.newLink &&
+    arRetry.streaming &&
+    arRetry.logged,
+  JSON.stringify(arRetry),
+);
+
+const arCancel = await evaluate(`${AR}
+  const first = window.mockTransport;
+  window.mockRefuseConnects = 99;
+  first.emitDisconnect(new Error('switched off (mock)'));
+  await until(() => window.mockRefuseConnects === 98, 4000);
+  await sleep(200);
+  $('btnReconnectCancel').click();
+  await sleep(300);
+  const right = {
+    bannerHidden: $('reconnectBanner').hidden,
+    pill: $('connPill').textContent,
+    bleFree: !$('btnBle').disabled || !navigator.bluetooth,
+    disconnectOff: $('btnDisconnect').disabled,
+    logged: logHas(/automatic reconnect cancelled/),
+  };
+  await sleep(5000);
+  const later = { refusedLeft: window.mockRefuseConnects, sameLink: window.mockTransport === first };
+  window.mockRefuseConnects = 0;
+  return { right, later };
+`);
+check(
+  "Cancel stops the reconnect at once and leaves the page disconnected",
+  arCancel.right.bannerHidden &&
+    arCancel.right.pill === "disconnected" &&
+    arCancel.right.bleFree &&
+    arCancel.right.disconnectOff &&
+    arCancel.right.logged,
+  JSON.stringify(arCancel.right),
+);
+check(
+  "and no try follows it",
+  arCancel.later.refusedLeft === 98 && arCancel.later.sameLink,
+  JSON.stringify(arCancel.later),
+);
+
+const arUserDisconnect = await evaluate(`${AR}
+  $('btnMock').click();
+  await until(connected, 8000);
+  await sleep(400);
+  const link = window.mockTransport;
+  $('btnDisconnect').click();
+  await sleep(2500);
+  return {
+    bannerHidden: $('reconnectBanner').hidden,
+    pill: $('connPill').textContent,
+    sameLink: window.mockTransport === link,
+  };
+`);
+check(
+  "the user's own Disconnect is never reconnected",
+  arUserDisconnect.bannerHidden &&
+    arUserDisconnect.pill === "disconnected" &&
+    arUserDisconnect.sameLink,
+  JSON.stringify(arUserDisconnect),
+);
+
+const arOff = await evaluate(`${AR}
+  const chk = $('chkAutoReconnect');
+  chk.checked = false; chk.dispatchEvent(new Event('change'));
+  $('btnMock').click();
+  await until(connected, 8000);
+  await sleep(400);
+  const link = window.mockTransport;
+  link.emitDisconnect(new Error('walked out of range (mock)'));
+  await sleep(2500);
+  const out = {
+    bannerHidden: $('reconnectBanner').hidden,
+    pill: $('connPill').textContent,
+    sameLink: window.mockTransport === link,
+    toast: toasts().some(t => /The sensor disconnected/.test(t)),
+    stored: localStorage.getItem('shimmerCaptureAutoReconnect'),
+  };
+  try { localStorage.removeItem('shimmerCaptureAutoReconnect'); } catch {}
+  return out;
+`);
+check(
+  "with the setting off, a drop ends the session as before",
+  arOff.bannerHidden &&
+    arOff.pill === "disconnected" &&
+    arOff.sameLink &&
+    arOff.toast &&
+    arOff.stored === "off",
+  JSON.stringify(arOff),
+);
+
+/* Classic Bluetooth is the unframed link; the mock stands in for the port,
+   so this proves the drop on that link is reconnected too, not that a real
+   port reopens (that needs a sensor). */
+await goto(`${BASE}?mock=1&framed=0`);
+const arClassic = await evaluate(`${AR}
+  const chk = $('chkAutoReconnect');
+  chk.checked = true; chk.dispatchEvent(new Event('change'));
+  $('btnMock').click();
+  await until(connected, 8000);
+  await sleep(400);
+  $('btnStreamStart').click();
+  await until(() => !$('btnStreamStop').disabled, 4000);
+  await sleep(500);
+  const first = window.mockTransport;
+  first.emitDisconnect(new Error('RFCOMM link lost (mock)'));
+  await sleep(300);
+  const text = $('reconnectText').textContent;
+  await until(() => window.mockTransport !== first && starts() > 0
+    && !$('btnStreamStop').disabled, 15000);
+  const out = { text, newLink: window.mockTransport !== first,
+    streaming: !$('btnStreamStop').disabled };
+  $('btnDisconnect').click();
+  await sleep(800);
+  try { localStorage.removeItem('shimmerCaptureAutoReconnect'); } catch {}
+  return out;
+`);
+check(
+  "the unframed (Classic Bluetooth) link is reconnected and streams again too",
+  /Reconnecting/.test(arClassic.text) &&
+    arClassic.newLink &&
+    arClassic.streaming,
+  JSON.stringify(arClassic),
 );
 
 // ===========================================================================

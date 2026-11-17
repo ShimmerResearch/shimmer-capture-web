@@ -99,6 +99,38 @@ port rather than the device. A Shimmer3R pairs as two separate entries — one
 classic, one BLE — and only the classic one answers on this path; the page says
 so if you pick the wrong one.
 
+### Reconnecting automatically
+
+**Reconnect automatically**, at the end of the Link CRC row (its tooltip says
+what it does), is on by default; turning it off is remembered in this browser
+(DEV-1483). With it on, a BLE or Classic Bluetooth link that the sensor drops (out of range,
+switched off) is reconnected without the device or port picker, and a stream
+that was running starts again:
+
+- **No picker.** The page keeps the `BluetoothDevice` (BLE) or the serial port
+  (Classic) it was given and connects to the same one again. Reopening the
+  port is what brings the RFCOMM link back.
+- **When.** 1 s after the drop, then after 2, 4, 8 and 15 s, and every 15 s
+  after that, until it connects or you press **Cancel** on the banner. Each
+  try has 30 s; on Windows a BLE connect to a sensor out of range can
+  otherwise wait forever. The connect buttons are held meanwhile.
+- **What comes back.** The page runs its usual connect sequence, then restarts
+  the stream. The firmware stops the stream when the link drops but keeps an SD
+  log going, so a stream with SD logging comes back as a plain stream while the
+  log is still running, and as stream and log only if the sensor says the log
+  ended too (it was switched off and on). The SDK's `planStreamResume` makes
+  that call.
+- **What doesn't.** Samples sent while the link was down are lost; the card has
+  them if it was logging. A CSV recording is closed when the link drops, as
+  before, and a new one needs a click, because the file picker does. A page
+  reload loses the device, so there is no reconnect across one.
+- **What it leaves alone.** USB, your own Disconnect, and the drops the
+  Bluetooth module update causes and handles itself.
+
+Checked against the mock (below); a real sensor walked out of range has not
+been run yet. On a Shimmer3 with an RN4678 at v1.23, a Classic reconnect while
+it logs can leave it ignoring Bluetooth until it is power-cycled (DEV-1384).
+
 ## General
 
 The first tab, as in the Verisense device console, and for the same reason: the
@@ -811,7 +843,9 @@ dropped link. `mockTransport.factoryTest` reports how many self-tests have run,
 whether one is still printing and exactly what text it printed;
 `mockTransport.rtc` exposes the sensor's own running clock.
 `mockTransport.status` docks and undocks it (`setDocked`) and says whether it
-logs (`logging`). Setting `nackRefusedLogStart` makes it refuse a log start it
+logs (`logging`). `window.mockRefuseConnects = n` makes the next n connects
+fail, as a sensor still out of range does, so the automatic reconnect's retries
+can be watched. Setting `nackRefusedLogStart` makes it refuse a log start it
 cannot carry out, as firmware that says so does, and `setQuietly({ sdBadFile })`
 changes the card without telling the page. The panels
 themselves are `factoryTestPanel` and `rtcDriftPanel`, beside `sdBrowser`,

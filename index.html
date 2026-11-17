@@ -503,6 +503,21 @@
             <!-- Not hidden before connecting: it shows what the selection
                  WILL ask for, then what the sensor actually accepted. -->
             <span class="pill" id="crcPill">CRC 2 bytes</span>
+            <span class="link-sep" aria-hidden="true"></span>
+            <!-- DEV-1483. On this row, with its explanation in the tooltip,
+                 because a row of its own and a hint under it made this card
+                 the tallest thing above the tab strip and pushed the strip past
+                 its budget on Linux fonts (verify.mjs, TAB_STRIP_BUDGET_PX).
+                 On by default; turning it off is remembered per browser.
+                 Disconnect is never reconnected, so walking away from the
+                 sensor on purpose means pressing Disconnect first. -->
+            <label
+              for="chkAutoReconnect"
+              title="If the sensor goes out of range or is switched off, keep trying to reconnect to the same sensor, over BLE or Classic Bluetooth, without asking you to pick it again, and restart a stream that was running. Samples sent while the link was down are lost. A CSV recording is closed when the link drops; start a new one once it is back. Not across a page reload."
+            >
+              <input type="checkbox" id="chkAutoReconnect" checked />
+              Reconnect automatically
+            </label>
           </div>
           <div class="field-hint">
             Has the sensor append a checksum to every packet, so a corrupted
@@ -511,6 +526,12 @@
             way to tell a bad link from a bad decode; one byte lets roughly 1 in
             256 bad frames through. Firmware that does not support it falls back
             to off on its own. Applied when you connect.
+          </div>
+          <div class="banner info" id="reconnectBanner" hidden>
+            <span id="reconnectText"></span>
+            <button id="btnReconnectCancel" class="secondary" type="button">
+              Cancel
+            </button>
           </div>
           <!-- Where this page stops. It is a worked example of the Web SDK
                driving one sensor, and somebody who arrived from a search should
@@ -1686,11 +1707,31 @@
        */
       let otaBusy = false;
       /**
-       * Set only while the Bluetooth module update reconnects after the
-       * module's restart: the BLE factory then reuses this device instead of
-       * opening the picker.
+       * Set only while something reconnects to the sensor it already had: the
+       * Bluetooth module update after the module's restart, and the automatic
+       * reconnect (DEV-1483). The BLE factory then reuses this device instead
+       * of opening the picker.
        */
       let pendingBleDevice = null;
+      /**
+       * The same for Classic Bluetooth: set only while the automatic reconnect
+       * reopens the serial port the sensor was on, so the factory skips the
+       * port picker. Reopening it is what brings the RFCOMM link up again.
+       */
+      let pendingSerialPort = null;
+      /**
+       * The link the live session is on, kept past the drop so the automatic
+       * reconnect can go back to the same sensor: `{mode, device, port, mock}`.
+       * Set by afterConnect; `device` is the BluetoothDevice (BLE), `port`
+       * the SerialPort (Classic), which the transport lets go of on
+       * disconnect.
+       */
+      let lastLink = null;
+      /**
+       * The automatic reconnect's handle (`sdk.startAutoReconnect`) while it
+       * runs, else null. A drop while it is set belongs to one of its tries.
+       */
+      let reconnect = null;
       /** Mock link only: connects the scripted sensor; see setUpMock. */
       let connectMock = null;
       /**
@@ -5621,6 +5662,9 @@
               new sdk.WebSerialTransport({
                 ...sdk.SHIMMER3_SPP_SERIAL_OPTIONS,
                 bufferSize: 64 * 1024,
+                /* Set only by the automatic reconnect, which reopens the port
+                         the sensor was on rather than asking for one. */
+                port: pendingSerialPort,
               }),
             );
             return {
@@ -5650,6 +5694,19 @@
       async function afterConnect(session) {
         client = session.client;
         mode = session.mode;
+        /* Kept now, while the transport still holds them: the BLE transport
+                 keeps its device after a drop, but the serial transport lets go
+                 of its port, and the automatic reconnect needs one or the other
+                 to go back to this sensor without a picker. */
+        lastLink = {
+          mode,
+          mock: session.mock === true,
+          device:
+            mode === "ble"
+              ? (session.transport?.device ?? client.device ?? null)
+              : null,
+          port: mode === "rfcomm" ? (session.transport?.port ?? null) : null,
+        };
         caps = describeShimmer3Caps(client, mode);
         /* One capability the shared feature detection does not cover: a clock
                  write, which the dock client spells `writeRtcFromHostTime` rather
@@ -6278,6 +6335,14 @@
           );
           return;
         }
+        /* What was running, for the automatic reconnect to put back. Read
+                 before anything below clears it. */
+        const before = {
+          streaming,
+          sdLogging,
+          recording: recorder.active,
+        };
+        const link = lastLink;
         streaming = false;
         sdLogging = false;
         if (recorder.active) {
@@ -6291,14 +6356,268 @@
         const updateRestart = btUpdate.restartExpected;
         resetAfterDisconnect();
         connect.setConnected(false);
+        if (reconnect) {
+          /* One of the reconnect's own tries lost the link part-way through
+                   its connect sequence; the loop counts that try as failed and
+                   goes on. */
+          log.warn(
+            `the link dropped again while reconnecting (${reason?.message ?? reason ?? "link lost"})`,
+          );
+          return;
+        }
         if (updateRestart) {
           log.log("the sensor is restarting after its Bluetooth module update");
+        } else if (autoReconnectBlocked) {
+          // The link of a reconnect try that Cancel stopped.
+          log.log("the cancelled reconnect's link closed");
+        } else if (autoReconnectApplies(link)) {
+          startReconnect(link, before, reason);
         } else {
           showToast(
             `The sensor disconnected (${reason?.message ?? reason ?? "link lost"})`,
             "err",
           );
         }
+      }
+
+      // =====================================================================
+      // Automatic reconnect (DEV-1483)
+      // =====================================================================
+
+      const AUTO_RECONNECT_KEY = "shimmerCaptureAutoReconnect";
+
+      /**
+       * Whether a drop on `link` is reconnected automatically: the setting is
+       * on, the link was Bluetooth (BLE or Classic; a cable does not go out of
+       * range), and the page still has what it needs to go back to the same
+       * sensor without a picker. Never during the Bluetooth module update,
+       * which handles its own drops.
+       */
+      function autoReconnectApplies(link) {
+        if (!$("chkAutoReconnect")?.checked) return false;
+        if (!link || otaBusy || autoReconnectBlocked) return false;
+        if (typeof sdk.startAutoReconnect !== "function") {
+          log.warn(
+            "this SDK bundle has no startAutoReconnect, so the link is not reconnected automatically",
+          );
+          return false;
+        }
+        if (link.mock) return typeof connectMock === "function";
+        if (link.mode === "ble") return !!link.device;
+        if (link.mode === "rfcomm") return !!link.port;
+        return false;
+      }
+
+      function linkLabel(link) {
+        if (link.mock) return "the mock sensor";
+        return link.mode === "ble" ? "BLE" : "Classic Bluetooth";
+      }
+
+      function showReconnect(text) {
+        $("reconnectText").textContent = text;
+        $("reconnectBanner").hidden = false;
+      }
+
+      function hideReconnect() {
+        $("reconnectBanner").hidden = true;
+        $("reconnectText").textContent = "";
+      }
+
+      /**
+       * Start the automatic reconnect after a drop the page did not ask for.
+       *
+       * The connect buttons are held while it runs, Disconnect included:
+       * Cancel on the banner is the one way out, so a click cannot race a
+       * try for the link.
+       */
+      function startReconnect(link, before, reason) {
+        const why = reason?.message ?? reason ?? "link lost";
+        log.warn(
+          `the link dropped (${why}) — reconnecting over ${linkLabel(link)} automatically; Cancel stops it`,
+        );
+        connect.setLocked(
+          "Reconnecting to the sensor — press Cancel on the banner first",
+        );
+        showReconnect(
+          `The link dropped. Reconnecting over ${linkLabel(link)}…`,
+        );
+        const handle = sdk.startAutoReconnect({
+          attempt: async ({ attempt }) => {
+            showReconnect(
+              `The link dropped. Reconnecting over ${linkLabel(link)} (try ${attempt})…`,
+            );
+            await reconnectOnce(link);
+          },
+          abandon: ({ attempt, reason: why, late }) =>
+            abandonReconnect(link, attempt, why, late),
+          onAttemptFailed: ({ attempt, error, timedOut, nextDelayMs }) => {
+            const what = timedOut
+              ? "took too long"
+              : `failed: ${error?.message ?? error}`;
+            log.log(
+              `reconnect try ${attempt} ${what}` +
+                (nextDelayMs === null
+                  ? ""
+                  : `; next in ${Math.round(nextDelayMs / 1000)} s`),
+            );
+            if (nextDelayMs !== null) {
+              showReconnect(
+                `The link dropped. Try ${attempt} ${timedOut ? "took too long" : "failed"}; trying again in ${Math.round(nextDelayMs / 1000)} s…`,
+              );
+            }
+          },
+        });
+        reconnect = handle;
+        void handle.done.then((result) => onReconnectDone(result, before));
+      }
+
+      /**
+       * One try: the same connect the buttons run, on the device or port the
+       * page kept. Throws unless the sensor is connected and answered its
+       * connect sequence.
+       */
+      async function reconnectOnce(link) {
+        /* A try given up on for taking too long can still connect after; if
+                 one did, that link is the reconnect. */
+        if (client && (connect.session || link.mock)) return;
+        let ok;
+        if (link.mock) {
+          ok = await connectMock();
+        } else if (link.mode === "ble") {
+          pendingBleDevice = link.device;
+          try {
+            ok = await connect.connectVia("ble");
+          } finally {
+            pendingBleDevice = null;
+          }
+        } else {
+          pendingSerialPort = link.port;
+          try {
+            ok = await connect.connectVia("rfcomm");
+          } finally {
+            pendingSerialPort = null;
+          }
+        }
+        /* connectVia reports a live session even when the link dropped
+                 during the connect sequence after it; the drop handler has then
+                 cleared `client`. */
+        if (!ok || !client) {
+          throw new Error("the sensor did not come back");
+        }
+      }
+
+      /**
+       * Release a try the loop has given up on.
+       *
+       * Over BLE, `gatt.disconnect()` makes a connect stuck pending reject,
+       * which unwinds connectVia (DEV-845: on Windows it can otherwise wait
+       * forever). A serial port's open has its own time limit, shorter than a
+       * try's, so there is nothing to force there. A try that connects after
+       * being given up on is closed, unless the reconnect is still running or
+       * succeeded: then that link is the one in use.
+       */
+      function abandonReconnect(link, attempt, why, late) {
+        if (late) {
+          /* After Cancel, the user wants no link. After a timeout, the next
+                   try adopts it (see reconnectOnce). */
+          if (why === "cancelled" && client) {
+            log.log(
+              `reconnect try ${attempt} connected after Cancel; closing that link`,
+            );
+            void disconnectFromSensor();
+          } else {
+            log.warn(
+              `reconnect try ${attempt} connected after it was given up on`,
+            );
+          }
+          return;
+        }
+        log.log(
+          `reconnect try ${attempt} ${why === "timeout" ? "took too long" : "cancelled"}; releasing it`,
+        );
+        if (link.mode === "ble" && !link.mock) {
+          try {
+            link.device?.gatt?.disconnect();
+          } catch {
+            /* nothing to release */
+          }
+        }
+      }
+
+      /**
+       * Set by Cancel, cleared by the next connect the user starts. While set,
+       * a drop starts no reconnect: the cancelled try's own link closing would
+       * otherwise start the whole thing again.
+       */
+      let autoReconnectBlocked = false;
+
+      async function onReconnectDone(result, before) {
+        reconnect = null;
+        connect.setLocked(null);
+        hideReconnect();
+        regate();
+        if (result.outcome === "cancelled") {
+          log.log("automatic reconnect cancelled");
+          if (client) await disconnectFromSensor();
+          return;
+        }
+        if (result.outcome !== "connected") {
+          const why = result.lastError?.message ?? result.lastError ?? "";
+          log.error(`automatic reconnect gave up${why ? `: ${why}` : ""}`);
+          showToast(
+            "The sensor did not come back. Connect again by hand.",
+            "err",
+          );
+          return;
+        }
+        log.log(
+          `reconnected after ${result.attempts} ${result.attempts === 1 ? "try" : "tries"}, ${(result.elapsedMs / 1000).toFixed(1)} s after the drop`,
+        );
+        await resumeAfterReconnect(before);
+      }
+
+      /**
+       * Put back what was running when the link dropped, from what the
+       * sensor says now (`sdk.planStreamResume`): on a lost link the firmware
+       * stops the stream and leaves an SD log running.
+       */
+      async function resumeAfterReconnect(before) {
+        if (before.recording) {
+          log.warn(
+            "the CSV recording was closed when the link dropped; its file is saved — press Start recording for a new one",
+          );
+        }
+        const status = statusView?.status ?? null;
+        const action = sdk.planStreamResume(before, status);
+        if (before.streaming && before.sdLogging && status?.sdLogging == null) {
+          log.warn(
+            "could not read whether the SD log is still running, so only the stream is restarted",
+          );
+        }
+        if (action === "none") {
+          if (before.streaming) {
+            log.warn(
+              "the sensor reports it is still streaming, so no start was sent",
+            );
+          }
+          showToast("Reconnected to the sensor", "ok");
+          return;
+        }
+        const withSd = action === "start-streaming-and-logging";
+        log.log(
+          withSd
+            ? "restarting the stream and the SD log, which ended with the link"
+            : before.sdLogging
+              ? "restarting the stream; the SD log went on through the drop"
+              : "restarting the stream",
+        );
+        await startStream(withSd);
+        showToast(
+          streaming
+            ? "Reconnected and streaming again"
+            : "Reconnected, but the stream did not restart",
+          streaming ? "ok" : "warn",
+        );
       }
 
       // =====================================================================
@@ -6434,6 +6753,14 @@
         );
 
         connectMock = async () => {
+          /* `window.mockRefuseConnects = n` makes the next n connects fail,
+                   as a sensor still out of range does, so the automatic
+                   reconnect's retries can be exercised (DEV-1483). */
+          if (window.mockRefuseConnects > 0) {
+            window.mockRefuseConnects -= 1;
+            log.warn("mock sensor: connect refused (mockRefuseConnects)");
+            return false;
+          }
           const transport = createMockShimmer3RTransport({
             framed,
             rateHz,
@@ -6520,6 +6847,7 @@
               mode: framed ? "ble" : "rfcomm",
               transport,
               label: framed ? "mock (framed)" : "mock (unframed)",
+              mock: true,
             });
             log.log("mock sensor connected");
             return true;
@@ -6531,7 +6859,10 @@
             regate();
           }
         };
-        btn.addEventListener("click", () => void connectMock());
+        btn.addEventListener("click", () => {
+          autoReconnectBlocked = false;
+          void connectMock();
+        });
       }
 
       // =====================================================================
@@ -6552,9 +6883,39 @@
         fn().catch(() => {});
       };
 
-      $("btnBle").addEventListener("click", () => connect.connectVia("ble"));
-      $("btnBt").addEventListener("click", () => connect.connectVia("rfcomm"));
-      $("btnUsb").addEventListener("click", () => connect.connectVia("usb"));
+      /* A connect the user starts ends what a Cancel blocked: the next drop
+               may be reconnected again. */
+      const userConnect = (linkMode) => () => {
+        autoReconnectBlocked = false;
+        return connect.connectVia(linkMode);
+      };
+      $("btnBle").addEventListener("click", userConnect("ble"));
+      $("btnBt").addEventListener("click", userConnect("rfcomm"));
+      $("btnUsb").addEventListener("click", userConnect("usb"));
+
+      /* The automatic reconnect's setting: on unless turned off in this
+               browser. */
+      try {
+        $("chkAutoReconnect").checked =
+          localStorage.getItem(AUTO_RECONNECT_KEY) !== "off";
+      } catch {
+        /* storage blocked: the setting starts on, as the markup has it */
+      }
+      $("chkAutoReconnect").addEventListener("change", (e) => {
+        try {
+          localStorage.setItem(
+            AUTO_RECONNECT_KEY,
+            e.target.checked ? "on" : "off",
+          );
+        } catch {
+          /* storage blocked: the setting lasts for this page only */
+        }
+      });
+      $("btnReconnectCancel").addEventListener("click", () => {
+        if (!reconnect) return;
+        autoReconnectBlocked = true;
+        reconnect.cancel();
+      });
 
       /**
        * Put the sensor down properly: abort a transfer, stop a stream, close
