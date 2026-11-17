@@ -371,6 +371,79 @@
         min-height: 0;
       }
 
+      /* DEV-1485: the connection strip, fixed to the top of the window and
+         slid in only while the link row is out of view. Hidden as well as
+         moved off-screen when it is not shown, so its shadow never peeks in
+         at the top edge. */
+      .conn-strip {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 50;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+        padding: 7px 16px;
+        background: var(--card);
+        border-bottom: 1px solid var(--line);
+        box-shadow: var(--shadow-card);
+        font-size: 13px;
+        transform: translateY(-100%);
+        visibility: hidden;
+        transition:
+          transform 0.15s,
+          visibility 0s 0.15s;
+      }
+
+      .conn-strip.show {
+        transform: none;
+        visibility: visible;
+        transition: transform 0.15s;
+      }
+
+      .conn-strip > * {
+        flex: 0 0 auto;
+      }
+
+      /* `.pill` sets a display of its own, which would beat [hidden]. */
+      .conn-strip [hidden] {
+        display: none;
+      }
+
+      .conn-strip-name,
+      .conn-strip-note {
+        flex: 0 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .conn-strip-name {
+        font-weight: 600;
+      }
+
+      .conn-strip-note {
+        color: var(--warn);
+      }
+
+      @media (max-width: 560px) {
+        /* A phone keeps the link, the name and a reconnect under way. */
+        .conn-strip-batt,
+        .conn-strip #stripActivity {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .conn-strip,
+        .conn-strip.show {
+          transition: none;
+        }
+      }
+
       .action-bar {
         position: sticky;
         bottom: calc(var(--log-drawer-h) + 8px);
@@ -444,6 +517,19 @@
   </head>
 
   <body>
+    <!-- DEV-1485: a slim strip that slides in once the link row has scrolled
+         out of view, so which sensor this is, whether it is connected, its
+         battery, what it is doing and a reconnect under way stay in sight deep
+         in the tabs, as in the Verisense console (DEV-851). Mirrored from the
+         fields above by updateConnStrip(); aria-hidden because it repeats
+         them. -->
+    <div id="connStrip" class="conn-strip" aria-hidden="true">
+      <span class="pill" id="stripLink">disconnected</span>
+      <span class="conn-strip-name" id="stripName"></span>
+      <span class="muted conn-strip-batt" id="stripBatt"></span>
+      <span class="pill on" id="stripActivity" hidden></span>
+      <span class="conn-strip-note" id="stripReconnect" hidden></span>
+    </div>
     <div class="page">
       <header class="page-head">
         <div>
@@ -1921,6 +2007,9 @@
        * states no attribute can express.
        */
       function regate() {
+        // Streaming and SD logging live in variables, not in the DOM the
+        // connection strip watches, and every change to them comes here.
+        updateConnStrip();
         // Capability floors the markup gates on but only the page can know.
         caps.record = !!csvColumns;
         /* Each stop says what it stops. STOP_STREAMING (0x20) leaves an SD
@@ -6916,6 +7005,75 @@
         autoReconnectBlocked = true;
         reconnect.cancel();
       });
+
+      // =====================================================================
+      // Connection strip (DEV-1485)
+      // =====================================================================
+
+      /**
+       * Bring the strip in line with what the page shows above it: the link
+       * pill (its colour too), the sensor's name and battery, what the sensor
+       * is doing for this page, and the automatic reconnect's line while one
+       * runs. Mirrored rather than written to directly, so nothing that sets
+       * those fields has to know the strip exists.
+       */
+      function updateConnStrip() {
+        const pill = $("connPill");
+        const link = $("stripLink");
+        if (!pill || !link) return;
+        link.textContent = pill.textContent;
+        link.className = pill.className;
+        const known = (id) => {
+          const text = ($(id)?.textContent ?? "").trim();
+          return text === "–" ? "" : text;
+        };
+        $("stripName").textContent = known("idName");
+        $("stripBatt").textContent = known("idBatt");
+        const doing = [];
+        if (streaming) doing.push("streaming");
+        if (sdLogging) doing.push("SD logging");
+        if ($("recPill")?.textContent === "recording") doing.push("recording");
+        const activity = $("stripActivity");
+        activity.textContent = doing.join(" · ");
+        activity.hidden = doing.length === 0;
+        const reconnecting = !$("reconnectBanner").hidden;
+        const note = $("stripReconnect");
+        note.textContent = reconnecting ? $("reconnectText").textContent : "";
+        note.hidden = !reconnecting;
+      }
+
+      {
+        const strip = $("connStrip");
+        const watch = new MutationObserver(updateConnStrip);
+        for (const id of [
+          "connPill",
+          "idName",
+          "idBatt",
+          "recPill",
+          "reconnectBanner",
+          "reconnectText",
+        ]) {
+          const node = $(id);
+          if (node) {
+            watch.observe(node, {
+              childList: true,
+              characterData: true,
+              subtree: true,
+              attributes: true,
+              attributeFilter: ["class", "hidden"],
+            });
+          }
+        }
+        updateConnStrip();
+        /* Shown exactly while the link row is out of view, from real layout
+                 rather than a guessed scroll offset. */
+        const linkRow = document.querySelector(".link-row");
+        if (linkRow && "IntersectionObserver" in window) {
+          new IntersectionObserver((entries) => {
+            strip.classList.toggle("show", !entries[0].isIntersecting);
+          }).observe(linkRow);
+        }
+      }
 
       /**
        * Put the sensor down properly: abort a transfer, stop a stream, close

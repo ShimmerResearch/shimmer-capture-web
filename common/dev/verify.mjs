@@ -7502,6 +7502,103 @@ check(
 );
 
 // ===========================================================================
+// The connection strip (DEV-1485): hidden while the link row is in view,
+// slid in once it scrolls out, mirroring the link, the sensor, what it is
+// doing and an automatic reconnect under way.
+// ===========================================================================
+console.log("\n--- connection strip (DEV-1485) ---");
+await goto(`${BASE}?mock=1`);
+const strip = await evaluate(`${AR}
+  const S = $('connStrip');
+  const shown = () => S.classList.contains('show') && getComputedStyle(S).visibility === 'visible';
+  const read = () => ({
+    shown: shown(),
+    link: $('stripLink').textContent, linkOn: $('stripLink').classList.contains('on'),
+    name: $('stripName').textContent, batt: $('stripBatt').textContent,
+    activity: $('stripActivity').hidden ? null : $('stripActivity').textContent,
+    note: $('stripReconnect').hidden ? null : $('stripReconnect').textContent,
+  });
+  window.scrollTo(0, 0);
+  await sleep(200);
+  const atTop = { ...read(), ariaHidden: S.getAttribute('aria-hidden') };
+  const chk = $('chkAutoReconnect');
+  chk.checked = true; chk.dispatchEvent(new Event('change'));
+  $('btnMock').click();
+  await until(connected, 8000);
+  await sleep(400);
+  $('btnStreamStart').click();
+  await until(() => !$('btnStreamStop').disabled, 4000);
+  document.querySelector('[data-tab="tabConfig"]').click();
+  await sleep(200);
+  window.scrollTo(0, document.documentElement.scrollHeight);
+  // Shown, and done sliding in (0.15 s), before its position is read.
+  await until(() => shown() && Math.round(S.getBoundingClientRect().top) === 0, 2000);
+  const scrolled = { ...read(),
+    pill: $('connPill').textContent, idName: $('idName').textContent, idBatt: $('idBatt').textContent,
+    top: Math.round(S.getBoundingClientRect().top),
+    wide: document.documentElement.scrollWidth <= innerWidth };
+  const first = window.mockTransport;
+  window.mockRefuseConnects = 1;
+  first.emitDisconnect(new Error('walked out of range (mock)'));
+  await until(() => /trying again/.test($('stripReconnect').textContent), 4000);
+  const dropped = read();
+  await until(() => window.mockTransport !== first && !$('btnStreamStop').disabled
+    && $('reconnectBanner').hidden, 15000);
+  await sleep(300);
+  const back = read();
+  window.scrollTo(0, 0);
+  await until(() => !shown(), 2000);
+  const upAgain = read();
+  $('btnDisconnect').click();
+  await sleep(800);
+  try { localStorage.removeItem('shimmerCaptureAutoReconnect'); } catch {}
+  return { atTop, scrolled, dropped, back, upAgain };
+`);
+check(
+  "the connection strip stays hidden while the link row is in view",
+  !strip.atTop.shown &&
+    strip.atTop.ariaHidden === "true" &&
+    strip.atTop.link === "disconnected",
+  JSON.stringify(strip.atTop),
+);
+check(
+  "scrolled past the link row, it slides in at the top and mirrors the link, sensor, battery and stream",
+  strip.scrolled.shown &&
+    strip.scrolled.top === 0 &&
+    strip.scrolled.wide &&
+    strip.scrolled.link === strip.scrolled.pill &&
+    strip.scrolled.linkOn &&
+    strip.scrolled.name === strip.scrolled.idName &&
+    strip.scrolled.name.length > 0 &&
+    strip.scrolled.batt === strip.scrolled.idBatt &&
+    strip.scrolled.activity === "streaming" &&
+    strip.scrolled.note === null,
+  JSON.stringify(strip.scrolled),
+);
+check(
+  "a drop shows the automatic reconnect's line in the strip",
+  strip.dropped.shown &&
+    strip.dropped.link === "disconnected" &&
+    !strip.dropped.linkOn &&
+    strip.dropped.activity === null &&
+    /Try 1 failed; trying again in 2 s/.test(strip.dropped.note ?? ""),
+  JSON.stringify(strip.dropped),
+);
+check(
+  "once reconnected the line goes and the stream shows again",
+  strip.back.shown &&
+    strip.back.linkOn &&
+    strip.back.activity === "streaming" &&
+    strip.back.note === null,
+  JSON.stringify(strip.back),
+);
+check(
+  "scrolled back up, the strip hides again",
+  !strip.upAgain.shown,
+  JSON.stringify(strip.upAgain),
+);
+
+// ===========================================================================
 console.log("\n--- console ---");
 check(
   "no console errors across the whole pass",
