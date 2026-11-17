@@ -136,7 +136,7 @@ repeats what they say:
 - the link, in the same colour as the pill under the buttons;
 - the sensor's name and battery;
 - what it is doing for this page: streaming, SD logging, recording;
-- while an automatic reconnect runs, its line, with the next try's countdown.
+- while an automatic reconnect runs, its line, with the wait before the next try.
 
 On a phone it keeps the link, the name and a reconnect, and drops the rest.
 It is for looking at only, and screen readers skip it, since it repeats the
