@@ -3717,6 +3717,7 @@ const SDK_CONSUMERS = [
   "common/kinematic-block-editor.js",
   "common/rtc-drift-panel.js",
   "common/sd-browser.js",
+  "common/sr-number-panel.js",
   "common/stream-stats.js",
   "common/dev/mock-shimmer3r.js",
 ];
@@ -5208,6 +5209,309 @@ check(
     !identZero.hw.includes("SR0") &&
     identZero.board === "null",
   `${identZero.hw}  (readSrBoard -> ${identZero.board})`,
+);
+
+// ===========================================================================
+// SR number programming (DEV-1493). Factory only: the card is on the Test tab
+// when the page is opened with ?factory=1, and nowhere otherwise. The write is
+// SET_DAUGHTER_CARD_ID with the whole 16-byte page Consensys writes, and it
+// counts only once it reads back. The last number programmed is remembered on
+// this computer, so a production run picks the board once.
+// ===========================================================================
+console.log("\n--- SR number (factory) ---");
+
+const SR = `
+  const P = () => document.getElementById('srPanel');
+  const r = (n) => P().querySelector('[data-sr-role="' + n + '"]');
+  const ops = (op) => (window.mockTransport?.writes ?? [])
+    .map(w => Array.from(w.bytes ?? w.data)).filter(b => b[0] === op);
+  const set = (node, v) => {
+    node.value = v;
+    node.dispatchEvent(new Event('input', { bubbles: true }));
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  const settle = async () => {
+    for (let i = 0; i < 60 && (r('result').hidden || r('program').textContent === ''); i++)
+      await new Promise(res => setTimeout(res, 50));
+  };
+`;
+const SR_KEY = "shimmerCaptureLastSrBoard";
+
+await goto(`${BASE}?mock=1&srBoard=232-8-1`);
+await evaluate(
+  `try { localStorage.removeItem('${SR_KEY}'); } catch {} return 1;`,
+);
+await goto(`${BASE}?mock=1&srBoard=232-8-1`);
+check(
+  "the SR number card is not on the public page",
+  await evaluate(`return document.getElementById('srCard').hidden`),
+);
+
+await goto(`${BASE}?mock=1&factory=1&srBoard=232-8-1`);
+check(
+  "connect a Shimmer3R whose SR number is wrong, with ?factory=1",
+  (await evaluate(CONNECT)) === "mock",
+);
+const srOpen = await evaluate(`${SR}
+  document.querySelector('[data-tab="tabTest"]').click();
+  await new Promise(res => setTimeout(res, 50));
+  return { hidden: document.getElementById('srCard').hidden,
+    inTest: document.getElementById('srCard').closest('#tabTest') !== null,
+    current: r('current').textContent, last: r('last').textContent,
+    options: [...r('board').options].map(o => o.textContent),
+    picked: r('board').value, sr: r('sr').value, srOff: r('sr').readOnly || r('sr').disabled,
+    preview: r('preview').textContent, programOff: r('program').disabled };
+`);
+check(
+  "with ?factory=1 the card is on the Test tab",
+  !srOpen.hidden && srOpen.inTest,
+);
+check(
+  "it shows the number the sensor reports, an unnamed one included",
+  srOpen.current === "SR232-8-1" && srOpen.last === "nothing yet",
+  `${srOpen.current}; last: ${srOpen.last}`,
+);
+check(
+  "a Shimmer3R is offered its five boards, each by name and SR number",
+  JSON.stringify(srOpen.options) ===
+    JSON.stringify([
+      "Choose a board…",
+      "IMU (SR31)",
+      "PROTO3 Deluxe (SR38)",
+      "ECG/EMG/Resp (SR47)",
+      "GSR+ (SR48)",
+      "Bridge Amplifier+ (SR49)",
+      "Other SR number…",
+    ]),
+  srOpen.options.join(" | "),
+);
+check(
+  "with nothing remembered the form starts from the sensor's own number, and warns about it",
+  srOpen.picked === "other" &&
+    srOpen.sr === "232" &&
+    srOpen.srOff === false &&
+    /SR232 is not a board a Shimmer3R is built on/.test(srOpen.preview) &&
+    srOpen.programOff === false,
+  srOpen.preview,
+);
+
+/* The board list and the SR number box are one control. Checked by what is
+   on screen, not by attributes: `.field` is display:flex, which overrode the
+   `hidden` attribute the first version relied on, and an attribute check
+   passed while the box sat there editable on every choice. */
+const srLink = await evaluate(`${SR}
+  const box = r('sr');
+  const fire = (type) => box.dispatchEvent(new Event(type, { bubbles: true }));
+  const shown = () => getComputedStyle(box.closest('.field')).display !== 'none';
+  set(r('board'), '48');
+  const listed = { value: box.value, off: box.readOnly, shown: shown(),
+    hint: r('srHint').textContent };
+  set(r('board'), 'other');
+  const other = { value: box.value, off: box.readOnly || box.disabled,
+    focused: document.activeElement === box, hint: r('srHint').textContent };
+  box.value = '49'; fire('input');
+  const typing = { picked: r('board').value };
+  fire('change');
+  const left = { picked: r('board').value, value: box.value, off: box.readOnly };
+  set(r('board'), 'other');
+  box.value = '140'; fire('input'); fire('change');
+  const unlisted = { picked: r('board').value, value: box.value,
+    preview: r('preview').textContent };
+  set(r('board'), '');
+  const cleared = { value: box.value, program: r('program').disabled };
+  return { listed, other, typing, left, unlisted, cleared };
+`);
+check(
+  "choosing a board fills the SR number box with its number, shown but locked",
+  srLink.listed.value === "48" &&
+    srLink.listed.off === true &&
+    srLink.listed.shown &&
+    /Set by the board chosen/.test(srLink.listed.hint),
+  `${srLink.listed.value}, ${srLink.listed.off ? "locked" : "editable"}, ${srLink.listed.shown ? "shown" : "not shown"}`,
+);
+check(
+  "Other unlocks the box with the number kept, ready to type",
+  srLink.other.value === "48" &&
+    srLink.other.off === false &&
+    srLink.other.focused &&
+    /Type the board's SR number/.test(srLink.other.hint),
+  `${srLink.other.value}, ${srLink.other.off ? "locked" : "editable"}, focused=${srLink.other.focused}`,
+);
+check(
+  "a listed number typed on Other picks that board once the box is left, not while typing",
+  srLink.typing.picked === "other" &&
+    srLink.left.picked === "49" &&
+    srLink.left.value === "49" &&
+    srLink.left.off === true,
+  `typing: ${srLink.typing.picked}; left: ${srLink.left.picked}`,
+);
+check(
+  "an unlisted number stays on Other, with the warning",
+  srLink.unlisted.picked === "other" &&
+    srLink.unlisted.value === "140" &&
+    /SR140 is not a board a Shimmer3R is built on/.test(
+      srLink.unlisted.preview,
+    ),
+  srLink.unlisted.preview,
+);
+check(
+  "Choose a board… empties the box and leaves nothing to program",
+  srLink.cleared.value === "" && srLink.cleared.program === true,
+);
+
+const srWrite = await evaluate(`${SR}
+  window.mockTransport.writes.length = 0;
+  set(r('board'), '47'); set(r('rev'), '8'); set(r('special'), '1');
+  const preview = r('preview').textContent;
+  window.__confirm = null;
+  r('program').click();
+  await settle();
+  await new Promise(res => setTimeout(res, 100));
+  return { preview, confirm: window.__confirm,
+    sets: ops(0x64), reads: ops(0x66).length,
+    result: r('result').textContent, resultClass: r('result').className,
+    hw: document.getElementById('idHw').textContent,
+    stored: localStorage.getItem('${SR_KEY}'),
+    onDevice: JSON.stringify(window.mockTransport.identity.srBoard),
+    current: r('current').textContent, last: r('last').textContent,
+    restartShown: !r('restart-banner').hidden, restartBtn: !r('restart').hidden };
+`);
+check(
+  "changing the board id is called out before it is written",
+  /This changes the board type, not just its revision/.test(srWrite.preview) &&
+    /Now: SR232-8-1/.test(srWrite.confirm ?? "") &&
+    /New: ECG\/EMG\/Resp \(SR47-8-1\)/.test(srWrite.confirm ?? ""),
+  (srWrite.confirm ?? "(no confirmation asked)")
+    .split("\n")
+    .slice(0, 4)
+    .join(" / "),
+);
+check(
+  "it writes Consensys's page with SET_DAUGHTER_CARD_ID, then reads it back",
+  srWrite.sets.length === 1 &&
+    srWrite.sets[0].join() ===
+      [0x64, 16, 0, 47, 8, 1, ...Array(13).fill(0xff)].join() &&
+    srWrite.reads === 1 &&
+    srWrite.onDevice === '{"boardId":47,"boardRev":8,"specialRev":1}',
+  `${srWrite.sets.map((s) => s.slice(0, 6).join(" ")).join("; ")} …, ${srWrite.reads} read-back`,
+);
+check(
+  "the read-back is reported, the identity line follows, and the number is remembered",
+  srWrite.resultClass.includes("ok") &&
+    /read back: ECG\/EMG\/Resp \(SR47-8-1\)/.test(srWrite.result) &&
+    srWrite.hw === "Shimmer3R ECG/EMG/Resp (SR47-8-1)" &&
+    srWrite.current === "ECG/EMG/Resp (SR47-8-1)" &&
+    srWrite.last === "ECG/EMG/Resp (SR47-8-1)" &&
+    srWrite.stored === '{"boardId":47,"boardRev":8,"specialRev":1}',
+  `${srWrite.hw}; stored ${srWrite.stored}`,
+);
+check(
+  "and a restart is offered, because the firmware chooses its sensors at boot",
+  srWrite.restartShown && srWrite.restartBtn,
+);
+
+const srRestart = await evaluate(`${SR}
+  window.mockTransport.writes.length = 0;
+  const ok = await window.srNumberPanel.restart();
+  await new Promise(res => setTimeout(res, 400));
+  return { ok, feature: ops(0xB7)[0] ?? null,
+    reboots: window.mockTransport.eeprom.reboots,
+    connPill: document.getElementById('connPill').textContent };
+`);
+check(
+  "Restart now arms the one-shot restart and drops the link",
+  srRestart.ok === true &&
+    srRestart.feature?.join() === "183,2,1" &&
+    srRestart.connPill === "disconnected" &&
+    srRestart.reboots >= 1,
+  `SET_FEATURE ${srRestart.feature?.join(" ")} → ${srRestart.connPill}`,
+);
+
+/* The next sensor of the run: a fresh page and a fresh unit, and the board is
+   already chosen. */
+await goto(`${BASE}?mock=1&factory=1&srBoard=none`);
+check(
+  "connect the next sensor of the run, an unprogrammed one",
+  (await evaluate(CONNECT)) === "mock",
+);
+const srNext = await evaluate(`${SR}
+  return { current: r('current').textContent, picked: r('board').value,
+    rev: r('rev').value, special: r('special').value,
+    preview: r('preview').textContent, programOff: r('program').disabled };
+`);
+check(
+  "the remembered number is preselected for the next sensor",
+  srNext.current === "not programmed" &&
+    srNext.picked === "47" &&
+    srNext.rev === "8" &&
+    srNext.special === "1" &&
+    /Will program ECG\/EMG\/Resp \(SR47-8-1\)\./.test(srNext.preview) &&
+    srNext.programOff === false,
+  `${srNext.current} → ${srNext.preview}`,
+);
+
+/* A write the sensor acknowledges but does not make must not be reported as
+   done, nor remembered: the mock drops it the way the firmware drops an
+   out-of-range one. */
+const srLost = await evaluate(`${SR}
+  window.mockTransport.identity.srWritesLand = false;
+  set(r('board'), '48'); set(r('rev'), '8'); set(r('special'), '3');
+  r('program').click();
+  await settle();
+  await new Promise(res => setTimeout(res, 100));
+  window.mockTransport.identity.srWritesLand = true;
+  return { result: r('result').textContent, resultClass: r('result').className,
+    stored: localStorage.getItem('${SR_KEY}'),
+    restartShown: !r('restart-banner').hidden };
+`);
+check(
+  "a write that does not read back is reported as failed and not remembered",
+  srLost.resultClass.includes("err") &&
+    /did not read back: wrote SR48-8-3, read a blank page/.test(
+      srLost.result,
+    ) &&
+    srLost.stored === '{"boardId":47,"boardRev":8,"specialRev":1}' &&
+    !srLost.restartShown,
+  srLost.result,
+);
+
+const srBusy = await evaluate(`${SR}
+  document.getElementById('btnStreamStart').click();
+  for (let i = 0; i < 40 && document.getElementById('btnStreamStop').disabled; i++)
+    await new Promise(res => setTimeout(res, 50));
+  await new Promise(res => setTimeout(res, 300));
+  const during = { programOff: r('program').disabled,
+    note: document.getElementById('srNote').textContent };
+  document.getElementById('btnStreamStop').click();
+  await new Promise(res => setTimeout(res, 500));
+  return { ...during, after: r('program').disabled };
+`);
+check(
+  "the write is refused while the sensor streams, and says why",
+  srBusy.programOff === true &&
+    /sensing/.test(srBusy.note) &&
+    srBusy.after === false,
+  srBusy.note,
+);
+
+await goto(`${BASE}?mock=1&factory=1&hw=3&srBoard=48-2-0`);
+check(
+  "connect a Shimmer3 with ?factory=1",
+  (await evaluate(CONNECT)) === "mock",
+);
+const srS3 = await evaluate(`${SR}
+  return [...r('board').options].map(o => o.textContent);
+`);
+check(
+  "a Shimmer3 is offered its sensor boards and never a dock or the Span",
+  srS3.length === 14 &&
+    srS3.includes("GSR+ (SR14)") &&
+    srS3.includes("GSR+ (SR48)") &&
+    !srS3.some((o) => /SR(9|41|42)\)/.test(o)),
+  `${srS3.length - 2} boards`,
+);
+await evaluate(
+  `try { localStorage.removeItem('${SR_KEY}'); } catch {} return 1;`,
 );
 
 // ===========================================================================

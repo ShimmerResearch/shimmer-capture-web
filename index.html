@@ -1166,6 +1166,29 @@
           </div>
         </div>
 
+        <!-- Factory only (DEV-1493): shown when the page is opened with
+             ?factory=1, the counterpart of Consensys's internal build. A
+             wrong SR number changes how the firmware drives the board (a
+             misprogrammed GSR+ once stuck at boot, DEV-629), so the public
+             page does not offer it by default. -->
+        <div class="card" id="srCard" hidden>
+          <div class="card-title">SR number</div>
+          <div class="field-hint" id="srNote"></div>
+          <!-- common/sr-number-panel.js builds the whole panel in here. -->
+          <div id="srPanel"></div>
+          <div class="field-hint" style="margin-top: 8px">
+            The SR number — board, revision and special revision, as printed on
+            the board — is what the firmware decides the sensor's hardware from:
+            which sensors are fitted, which pressure chip, whether ExG is there.
+            This is the same write Consensys's factory build makes from Manage
+            Devices, over any link here: the whole identity page, then a
+            read-back that has to match. The firmware chooses its sensors when
+            it starts, so restart the sensor after programming. The last number
+            programmed is remembered on this computer, for a run of sensors that
+            all take the same one.
+          </div>
+        </div>
+
         <div class="card">
           <div class="card-title">Real-time clock drift</div>
           <div class="field-hint" id="driftNote"></div>
@@ -1304,6 +1327,7 @@
       import { createCalibrationEditor } from "./common/calibration-editor.js";
       import { createFactoryTestPanel } from "./common/factory-test-panel.js";
       import { createRtcDriftPanel } from "./common/rtc-drift-panel.js";
+      import { createSrNumberPanel } from "./common/sr-number-panel.js";
       import { createBtModuleUpdate } from "./common/bt-module-update.js";
       import { readDeviceRwc, canReadRwc } from "./common/device-clock.js";
       import {
@@ -2154,6 +2178,22 @@
         drift.setEnabled(
           !!client && !!caps.rtcRead && !streaming && !sdLogging && !testBusy,
         );
+        /* Through `withDevice`, so its own write is the plain `busy` here: the
+                 panel greys for the two round trips and says why in its result. */
+        srNumber.setEnabled(
+          !!client &&
+            !!caps.srWrite &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !sdBusy &&
+            !brandBusy &&
+            !calibBusy &&
+            !testBusy &&
+            !linkTesting &&
+            !otaBusy,
+        );
+        $("srNote").textContent = srUnavailableReason() ?? "";
         paintTestGating();
 
         /* The update's own flag is excluded, like every panel's: its Cancel
@@ -4812,6 +4852,45 @@
         },
       });
 
+      /* SR number programming (DEV-1493), offered only on `?factory=1` — see
+               the card's markup for why. Mounted either way, so the gate below
+               needs no special case; it is simply never seen without the flag.
+               The write goes through `withDevice`, so it holds the page's own
+               busy flag and every other panel already waits for it: it is two
+               round trips, like an Apply, not a long transfer with a flag of
+               its own. */
+      const factoryMode =
+        new URLSearchParams(location.search).get("factory") === "1";
+      $("srCard").hidden = !factoryMode;
+      const srNumber = createSrNumberPanel($("srPanel"), {
+        client: () => client,
+        mode: () => mode,
+        identifiedHardwareVersion: () => identifiedHardwareVersion,
+        board: () => srBoard,
+        withLink: (what, fn) => withDevice(what, fn),
+        onProgrammed: (board) => {
+          srBoard = board;
+          setIdentity({
+            idHw: hardwareLabel(identifiedHardwareVersion, srBoard),
+          });
+        },
+        disconnect: () => disconnectFromSensor(),
+        log,
+        toast: showToast,
+      });
+
+      /** Why the SR number cannot be programmed right now, or null. */
+      function srUnavailableReason() {
+        if (!client) return null;
+        if (!caps.srWrite) {
+          return "This SDK build cannot program an SR number on this link. Re-vendor the SDK bundle.";
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing, and the firmware refuses the write while it is. Stop the stream first.";
+        }
+        return null;
+      }
+
       const drift = createRtcDriftPanel($("driftPanel"), {
         client: () => client,
         mode: () => mode,
@@ -5808,6 +5887,11 @@
                  over USB is the protocol, not a missing SDK export. */
         caps.linkTest =
           mode !== "usb" && typeof client.runDataRateTest === "function";
+        /* SR programming (DEV-1493): the radio client spells it
+                 `writeSrBoard`, the dock client `writeExpansionBoard`. */
+        caps.srWrite =
+          typeof client.writeSrBoard === "function" ||
+          typeof client.writeExpansionBoard === "function";
         regate();
 
         /* The sensor's own news, which nothing on this page used to hear.
@@ -6888,6 +6972,7 @@
           window.rtcDriftPanel = drift;
           window.eventChannelPanel = evtPanel;
           window.audioPanel = audioPanel;
+          window.srNumberPanel = srNumber;
           /* Also the client itself, so a link's feature set can be taken
                    apart from the console: shadowing a method on it is how the
                    "this link cannot do X" paths get exercised without owning the

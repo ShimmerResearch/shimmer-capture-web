@@ -13,7 +13,7 @@
      * from it by the Bump step in cut-release.yml — the release bumps this file
      * as well as package.json, so a published bundle reports its own version.
      */
-    const SDK_VERSION = '0.5.15';
+    const SDK_VERSION = '0.5.16';
 
     /**
      * Container for a single decoded sensor frame.
@@ -9905,6 +9905,121 @@
         if (board.boardId !== boardId)
             return false;
         return board.boardRev > rev || (board.boardRev === rev && board.specialRev >= specialRev);
+    }
+    // ---------------------------------------------------------------------------
+    // Programming the SR identity
+    // ---------------------------------------------------------------------------
+    /**
+     * The daughter-card identity page: page 0 of the board's CAT24C16 EEPROM,
+     * absolute bytes 0-15. Only its first three bytes mean anything to a
+     * Shimmer3 or Shimmer3R (`Boards/shimmer_boards.c`, which reads
+     * `exp_brd_id`, `exp_brd_major` and `exp_brd_minor` and nothing past them).
+     */
+    const SHIMMER_SR_ID_PAGE_SIZE = 16;
+    /**
+     * The SR codes a Shimmer3R is built on: the five fourth-generation boards in
+     * the "Shimmer3R revision quick reference" of log-and-stream-common's
+     * `docs/SHIMMER3_BOARD_REVISIONS.md`. A Shimmer3R has no separate expansion
+     * board, so its page names the main board itself.
+     */
+    const SHIMMER3R_SR_BOARD_IDS = Object.freeze([31, 38, 47, 48, 49]);
+    /**
+     * The SR codes a Shimmer3 can carry: every board in
+     * {@link SHIMMER_SR_BOARD_NAMES} that is fitted to a sensor. The docks
+     * (SR41 Base15U, SR42 Base6U) and the Span (SR9) are left out: they are
+     * products of their own, and a sensor that claimed to be one would be
+     * misprogrammed.
+     */
+    const SHIMMER3_SR_BOARD_IDS = Object.freeze([
+        8, 14, 31, 36, 37, 38, 44, 46, 47, 48, 49, 55,
+    ]);
+    /**
+     * `'ECG/EMG/Resp (SR47)'` for a named code, `'SR232'` for one this SDK has no
+     * name for. The form is Consensys's (`PnlExpBrdIdSelection.createListOfExpBrds`).
+     */
+    function formatShimmerSrBoardName(boardId) {
+        const name = SHIMMER_SR_BOARD_NAMES[boardId];
+        return name ? `${name} (SR${boardId})` : `SR${boardId}`;
+    }
+    /**
+     * The boards a host should offer when it programs a sensor's SR number, in SR
+     * order, each with its friendly name.
+     *
+     * `hardwareVersion` 10 (Shimmer3R) gives {@link SHIMMER3R_SR_BOARD_IDS};
+     * anything else, a Shimmer3 or a sensor that has not said, gives
+     * {@link SHIMMER3_SR_BOARD_IDS}, which contains the Shimmer3R's five.
+     *
+     * GSR+ and Bridge Amplifier+ each appear twice on a Shimmer3, as the
+     * separate-board and the unified-board code. The label's SR number is what
+     * tells them apart.
+     */
+    function listShimmerSrBoards(hardwareVersion) {
+        const ids = hardwareVersion === 10 ? SHIMMER3R_SR_BOARD_IDS : SHIMMER3_SR_BOARD_IDS;
+        return ids.map((boardId) => {
+            const name = SHIMMER_SR_BOARD_NAMES[boardId] ?? `SR${boardId}`;
+            return { boardId, name, label: formatShimmerSrBoardName(boardId) };
+        });
+    }
+    /**
+     * Check that `board` can be written as an SR identity, and throw if not.
+     *
+     * - `boardId` is an integer 1..254. 0x00 and 0xFF are the two "nothing here"
+     *   patterns ({@link isShimmerSrBoardValid}), so writing either would leave
+     *   the sensor with no board at all; the firmware treats both as unset
+     *   (`ShimBrd_isDaughterCardIdSet`).
+     * - `boardRev` and `specialRev` are integers 0..255, one byte each.
+     *
+     * A code outside the SR table is accepted: a board newer than this SDK has to
+     * be programmable. It is the host's job to warn about one.
+     */
+    function assertShimmerSrBoardWritable(board) {
+        const byte = (v) => Number.isInteger(v) && v >= 0 && v <= 255;
+        if (!board || !Number.isInteger(board.boardId) || board.boardId < 1 || board.boardId > 254) {
+            throw new Error(`SR board id must be an integer 1..254 (got ${board?.boardId}); 0 and 255 mean "no board".`);
+        }
+        if (!byte(board.boardRev)) {
+            throw new Error(`SR board revision must be an integer 0..255 (got ${board.boardRev}).`);
+        }
+        if (!byte(board.specialRev)) {
+            throw new Error(`SR special revision must be an integer 0..255 (got ${board.specialRev}).`);
+        }
+    }
+    /**
+     * The 16-byte identity page that programs `board`:
+     * `[boardId, boardRev, specialRev, 0xFF × 13]`.
+     *
+     * Port of the Java driver's `ExpansionBoardDetails.generateExpBrdIdArray`,
+     * which is what Consensys writes: the whole page, so bytes left over from an
+     * earlier programming do not survive. Bytes 3-4 are reserved and 5-10 carry a
+     * MAC on a ShimmerGQ 802.15.4 board only, so a Shimmer3 or Shimmer3R leaves
+     * them erased.
+     *
+     * Throws as {@link assertShimmerSrBoardWritable} does.
+     */
+    function buildShimmerSrIdPage(board) {
+        assertShimmerSrBoardWritable(board);
+        const page = new Uint8Array(SHIMMER_SR_ID_PAGE_SIZE).fill(0xff);
+        page[0] = board.boardId;
+        page[1] = board.boardRev;
+        page[2] = board.specialRev;
+        return page;
+    }
+    /** True when `a` and `b` name the same board, revision and special revision. */
+    function isSameShimmerSrBoard(a, b) {
+        if (!a || !b)
+            return false;
+        return a.boardId === b.boardId && a.boardRev === b.boardRev && a.specialRev === b.specialRev;
+    }
+    /**
+     * The error a client throws when the page it wrote does not read back. The
+     * read-back is the only proof a write landed: the Bluetooth command is
+     * acknowledged whether or not its range was accepted, and an out-of-range
+     * write is acknowledged with nothing written (`Comms/shimmer_bt_uart.c`,
+     * `SET_DAUGHTER_CARD_ID_COMMAND`).
+     */
+    function srReadBackError(wanted, got) {
+        return new Error(`SR number did not read back: wrote ${formatShimmerSrCode(wanted)}, ` +
+            `read ${got ? formatShimmerSrCode(got) : 'a blank page'}.`);
     }
     /**
      * Describe a sensor's hardware for display: platform, board name and SR code.
@@ -20280,6 +20395,56 @@
             return board;
         }
         /**
+         * Program the board's SR identity — the counterpart of {@link readSrBoard},
+         * and what Consensys's factory "Program Exp. Board ID" does over a dock.
+         *
+         * Writes the whole 16-byte identity page, `[boardId, boardRev, specialRev,
+         * 0xFF × 13]` ({@link buildShimmerSrIdPage}), with SET_DAUGHTER_CARD_ID_COMMAND
+         * (0x64, `[0x64][16][offset 0][page…]` → ACK; `Comms/shimmer_bt_uart.c`,
+         * `SET_DAUGHTER_CARD_ID_COMMAND`), then reads the page back and returns what
+         * it read. A read-back that differs from what was written throws: the ACK
+         * alone proves nothing, because the firmware acknowledges an out-of-range
+         * write without writing anything.
+         *
+         * The firmware writes the EEPROM and its cached copy of the page together,
+         * so the read-back sees the new board at once. What the firmware decided
+         * from the old board at boot (which sensors are fitted, which pressure
+         * chip, whether ExG is there) does not change until the sensor restarts,
+         * so a host should have the sensor rebooted before it is used as the new
+         * board.
+         *
+         * Refused while streaming here, and by the firmware while it is sensing
+         * (`ShimBt_isCmdBlockedWhileSensing`), as every SET is.
+         *
+         * HARDWARE-VERIFY: the command and the read-back follow the firmware
+         * source; no Shimmer3R has been reprogrammed over this client yet.
+         */
+        async writeSrBoard(board) {
+            if (!this._transport)
+                throw new Error('Not connected (RX missing)');
+            if (this._streaming)
+                throw new Error('Cannot program the SR number while streaming');
+            const page = buildShimmerSrIdPage(board);
+            const link = this._linkGeneration;
+            const code = formatShimmerSrCode(board);
+            this._emitStatus(`SET_DAUGHTER_CARD_ID ${code} → waiting for ACK…`);
+            const cmd = new Uint8Array(3 + page.length);
+            cmd[0] = OPCODES.SET_DAUGHTER_CARD_ID_COMMAND;
+            cmd[1] = page.length;
+            cmd[2] = 0;
+            cmd.set(page, 3);
+            await this._writeExpectingAck(cmd, 1500, link);
+            if (link !== this._linkGeneration) {
+                throw new Error('The link was reset before the SR number could be read back');
+            }
+            const readBack = await this.readSrBoard();
+            if (!readBack || !isSameShimmerSrBoard(readBack, board)) {
+                throw srReadBackError(board, readBack);
+            }
+            this._emitStatus(`SR number programmed: ${code}`);
+            return readBack;
+        }
+        /**
          * Read what the Bluetooth module says its own version is
          * (GET_BT_VERSION_STR_COMMAND 0xA1 → `[0xA2][length][ASCII…]`,
          * `Comms/shimmer_bt_uart.c:2092-2099`).
@@ -27580,6 +27745,49 @@
             return board;
         }
         /**
+         * Program the daughter-card id — the board's SR identity — and read it back.
+         *
+         * Writes the whole 16-byte identity page, `[boardId, boardRev, specialRev,
+         * 0xFF × 13]` ({@link buildShimmerSrIdPage}, the page Consensys writes), with
+         * SET_DAUGHTER_CARD_ID_COMMAND (0x64, `[0x64][16][offset 0][page…]` → ACK;
+         * log-and-stream-common `Comms/shimmer_bt_uart.c`). Then
+         * {@link readExpansionBoard} reads it back, which also takes the new board's
+         * IMU generation into this client, and a read-back that differs from what
+         * was written throws: the firmware acknowledges an out-of-range write
+         * without writing anything, so the ACK alone proves nothing.
+         *
+         * The sensor keeps what it decided from the old board at boot (its sensors,
+         * its pressure chip, whether ExG is fitted) until it restarts, so have it
+         * rebooted before it is used as the new board.
+         *
+         * Refused while streaming here, and by the firmware while it is sensing.
+         *
+         * HARDWARE-VERIFY: follows the firmware source; no Shimmer3 has been
+         * reprogrammed over this client yet.
+         */
+        async writeExpansionBoard(board) {
+            const link = this._link.current;
+            if (!this._linkLive)
+                throw new Error('Not connected');
+            if (this._streaming)
+                throw new Error('Cannot program the SR number while streaming');
+            const page = buildShimmerSrIdPage(board);
+            const code = formatShimmerSrCode(board);
+            this._emitStatus(`SET_DAUGHTER_CARD_ID ${code} → waiting for ACK…`);
+            const cmd = new Uint8Array(3 + page.length);
+            cmd[0] = OPCODES.SET_DAUGHTER_CARD_ID_COMMAND;
+            cmd[1] = page.length;
+            cmd[2] = 0;
+            cmd.set(page, 3);
+            await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS, link);
+            const readBack = await this._readExpansionBoardOn(link);
+            if (!readBack || !isSameShimmerSrBoard(readBack, board)) {
+                throw srReadBackError(board, readBack);
+            }
+            this._emitStatus(`SR number programmed: ${code}`);
+            return readBack;
+        }
+        /**
          * Read from the daughter-card EEPROM memory. `offset` is a HOST offset —
          * firmware maps it past the first (HW details) EEPROM page, so host offsets
          * 0..2031 cover absolute EEPROM bytes 16..2047.
@@ -28501,10 +28709,15 @@
          * - The whole run holds this client's command queue. Nothing else reaches the
          *   sensor until the report ends — which is the truth about the firmware, not
          *   a limitation here: its main loop is blocked for the duration.
-         * - **The ExG chip test cannot pass from the dock.** Shimmer3 firmware prints
-         *   `- FAIL: ADS1292R test will not work from dock` because the dock UART and
-         *   that chip share pins. A FAIL on that line from this transport says nothing
-         *   about the board; run the test over Bluetooth to judge it.
+         * - **On a Shimmer3, the ExG chip test cannot pass from the dock.** Shimmer3
+         *   (MSP430) firmware does not run it there: it prints
+         *   `- FAIL: ADS1292R test will not work from dock` instead, because on that
+         *   board the dock UART and the chip share pins (`hal_FactoryTest.c`,
+         *   `SPI_test()`). A FAIL on that line from this transport says nothing about
+         *   the board; run the test over Bluetooth to judge it. **This is Shimmer3
+         *   only.** A Shimmer3R runs its ExG test (S3R_TEST_0021) normally over USB-C
+         *   and over the dock alike — its ExG SPI3 (PB4/PB5/PG9) and dock USART1
+         *   (PB6/PB7) share no pins — so an ExG FAIL from a Shimmer3R is a real result.
          *
          * @param type 0 MAIN, 1 LEDS, 2 ICS, 3 LED_STATES (`Test/shimmer_test.h:21-27`).
          * @param opts see {@link FactoryTestRunOptions}; `timeoutMs` defaults to the
@@ -28712,6 +28925,41 @@
         async _readExpansionBoardImpl() {
             const payload = await this._readMem(UART_PROP.DAUGHTER_CARD.CARD_ID, 0, 16);
             return parseExpansionBoard(payload);
+        }
+        /**
+         * Program the daughter-card (expansion board) ID — the SR identity — and
+         * read it back. This is exactly what Consensys's factory "Program Exp.
+         * Board ID" does: `DockManager.writeExpansionBoardId` →
+         * `CommsProtocolWiredShimmerViaDock.writeDaughterCardId`, a WRITE of
+         * `DAUGHTER_CARD.CARD_ID` at address 0 with the 16-byte page
+         * `[boardId, boardRev, specialRev, 0xFF × 13]` ({@link buildShimmerSrIdPage}).
+         *
+         * The page is then read back (READ `CARD_ID`, 16 bytes from 0), and a
+         * read-back that differs from what was written throws. On success
+         * {@link identity}, when it has been read, takes the new board.
+         *
+         * The sensor keeps what it decided from the old board at boot until it
+         * restarts, so have it rebooted (undocked and powered off and on) before it
+         * is used as the new board.
+         *
+         * HARDWARE-VERIFY: the WRITE is the Java driver's, which Consensys has used
+         * in production for years; this client has not yet sent it to a sensor.
+         */
+        async writeExpansionBoard(board) {
+            const page = buildShimmerSrIdPage(board);
+            const code = formatShimmerSrCode(board);
+            return this._serialize(async () => {
+                const payload = buildMemWritePayload(UART_PROP.DAUGHTER_CARD.CARD_ID, 0, page);
+                await this._writeRaw(UART_PROP.DAUGHTER_CARD.CARD_ID, payload);
+                const readBack = await this._readExpansionBoardImpl();
+                if (!readBack || !isSameShimmerSrBoard(readBack, board)) {
+                    throw srReadBackError(board, readBack);
+                }
+                if (this.identity)
+                    this.identity = { ...this.identity, expansionBoard: readBack };
+                this._emitStatus(`SR number programmed: ${code}`);
+                return readBack;
+            });
         }
         /**
          * Read what the Bluetooth module says its own version is
@@ -39383,11 +39631,48 @@
             addDetail(trimmed);
             return true;
         }
-        // The SD card's CID, printed as one line above the read/write verdict.
-        const card = /^-?\s*Manufacturer\s*:\s*(.+?)\s*,\s*Manufacture Date\s*=\s*(\S+)\s*$/i.exec(trimmed);
+        // The SD card's identity, above its read/write verdict. Shimmer3R firmware
+        // from DEV-1398 prints three lines, Manufacturer, Model and CID
+        // (SHIMMER3R_FACTORY_TEST_REPORT.md §5.5); older firmware prints only the
+        // first, with the card's size run into the name ("SanDisk7.45GB").
+        const card = /^-?\s*Manufacturer\s*:\s*(.*?)\s*,\s*Manufacture Date\s*=\s*(\S+)\s*$/i.exec(trimmed);
         if (card) {
-            put('sd_manufacturer', card[1]);
+            const runOn = /^(.*?)(\d+\.\d{2})GB$/.exec(card[1]);
+            put('sd_manufacturer', runOn ? runOn[1] : card[1]);
+            if (runOn)
+                put('sd_size_gb', Number(runOn[2]));
             put('sd_manufacture_date', card[2]);
+            addDetail(trimmed);
+            return true;
+        }
+        // "matches <brand> <part>" when the firmware recognises the card, else
+        // "not recognised". "matches" is all it claims: several brands sell other
+        // makers' cards, so a generic CID can fit more than one part.
+        const model = /^-?\s*Model\s*:\s*(?:matches\s+(.+?)|(not recognised))\s*$/i.exec(trimmed);
+        if (model) {
+            put('sd_model_recognised', model[1] !== undefined);
+            if (model[1] !== undefined)
+                put('sd_model', model[1]);
+            addDetail(trimmed);
+            return true;
+        }
+        // The CID register. OID is 2 characters and PNM 5, or "0x" and their bytes in
+        // hex when one is unprintable, so each is matched by width: PNM may hold a
+        // space or a comma.
+        const cid = /^-?\s*CID\s*:\s*MID=0x([0-9A-F]{2}),\s*OID=(0x[0-9A-F]{4}|.{2}),\s*PNM=(0x[0-9A-F]{10}|.{5}),\s*PRV=(\d+\.\d+),\s*PSN=0x([0-9A-F]{1,8}),\s*Size=([\d.]+)GB\s*$/i.exec(trimmed);
+        if (cid) {
+            put('sd_cid_available', true);
+            put('sd_mid', parseInt(cid[1], 16));
+            put('sd_oid', cid[2]);
+            put('sd_pnm', cid[3]);
+            put('sd_prv', cid[4]);
+            put('sd_psn', parseInt(cid[5], 16));
+            put('sd_size_gb', Number(cid[6]));
+            addDetail(trimmed);
+            return true;
+        }
+        if (/^-?\s*CID\s*:\s*unavailable\b/i.test(trimmed)) {
+            put('sd_cid_available', false);
             addDetail(trimmed);
             return true;
         }
@@ -39741,6 +40026,7 @@
     exports.SHIMMER3R_INQ_NUM_CHANNELS_OFFSET = SHIMMER3R_INQ_NUM_CHANNELS_OFFSET;
     exports.SHIMMER3R_LINK_CRC_MIN_FIRMWARE = SHIMMER3R_LINK_CRC_MIN_FIRMWARE;
     exports.SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS = SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS;
+    exports.SHIMMER3R_SR_BOARD_IDS = SHIMMER3R_SR_BOARD_IDS;
     exports.SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE = SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE;
     exports.SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE = SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE;
     exports.SHIMMER3_ACK = ACK;
@@ -39797,10 +40083,12 @@
     exports.SHIMMER3_SENSOR_LABELS = SHIMMER3_SENSOR_LABELS;
     exports.SHIMMER3_SPP_SERIAL_OPTIONS = SHIMMER3_SPP_SERIAL_OPTIONS;
     exports.SHIMMER3_SPP_UUID = SHIMMER3_SPP_UUID;
+    exports.SHIMMER3_SR_BOARD_IDS = SHIMMER3_SR_BOARD_IDS;
     exports.SHIMMER3_STATUS_PAYLOAD_BYTES = SHIMMER3_STATUS_PAYLOAD_BYTES;
     exports.SHIMMER_FACTORY_TEST_CLASSIFIERS = SHIMMER_FACTORY_TEST_CLASSIFIERS;
     exports.SHIMMER_PLATFORM_NAMES = SHIMMER_PLATFORM_NAMES;
     exports.SHIMMER_SR_BOARD_NAMES = SHIMMER_SR_BOARD_NAMES;
+    exports.SHIMMER_SR_ID_PAGE_SIZE = SHIMMER_SR_ID_PAGE_SIZE;
     exports.SHIMMER_UART_CRC_INIT = SHIMMER_UART_CRC_INIT;
     exports.SMARTDOCK_BASE_CMD = SMARTDOCK_BASE_CMD;
     exports.SMARTDOCK_CONNECTION_TYPE = SMARTDOCK_CONNECTION_TYPE;
@@ -39902,6 +40190,7 @@
     exports.applyTcxoRule = applyTcxoRule;
     exports.asmRtcBytesToUnixSeconds = asmRtcBytesToUnixSeconds;
     exports.asmRtcMinutesBytesToUnixSeconds = asmRtcMinutesBytesToUnixSeconds;
+    exports.assertShimmerSrBoardWritable = assertShimmerSrBoardWritable;
     exports.audioFingerprintRecordTicks = audioFingerprintRecordTicks;
     exports.audioGainPresetOf = audioGainPresetOf;
     exports.audioModeOf = audioModeOf;
@@ -39933,6 +40222,7 @@
     exports.buildSetExgRegsCommand = buildSetExgRegsCommand;
     exports.buildSetFactoryTestCommand = buildSetFactoryTestCommand;
     exports.buildShimmer3Schema = buildShimmer3Schema;
+    exports.buildShimmerSrIdPage = buildShimmerSrIdPage;
     exports.buildStatCmd = buildStatCmd;
     exports.buildStreamSchema = buildStreamSchema;
     exports.buildUartPacket = buildUartPacket;
@@ -40050,6 +40340,7 @@
     exports.formatPendingEventProperties = formatPendingEventProperties;
     exports.formatSchedulerPayloadForLog = formatSchedulerPayloadForLog;
     exports.formatSdImportStamp = formatSdImportStamp;
+    exports.formatShimmerSrBoardName = formatShimmerSrBoardName;
     exports.formatShimmerSrCode = formatShimmerSrCode;
     exports.formatStatusPayloadForLog = formatStatusPayloadForLog;
     exports.formatVerisenseChargerStatus = formatVerisenseChargerStatus;
@@ -40103,6 +40394,7 @@
     exports.isNewImuSensors = isNewImuSensors;
     exports.isRoutineVerisenseDfuLogMessage = isRoutineVerisenseDfuLogMessage;
     exports.isSafeFirmwareArchiveName = isSafeFirmwareArchiveName;
+    exports.isSameShimmerSrBoard = isSameShimmerSrBoard;
     exports.isSdLoggingFirmware = isSdLoggingFirmware;
     exports.isShimmerSrBoardAtLeast = isShimmerSrBoardAtLeast;
     exports.isShimmerSrBoardValid = isShimmerSrBoardValid;
@@ -40122,6 +40414,7 @@
     exports.joinAudioMode = joinAudioMode;
     exports.joinButtonMode = joinButtonMode;
     exports.keepsLinkCrcWhenSensingStops = keepsLinkCrcWhenSensingStops;
+    exports.listShimmerSrBoards = listShimmerSrBoards;
     exports.localCivilUnixSecondsNow = localCivilUnixSecondsNow;
     exports.logTriggersOf = logTriggersOf;
     exports.lsm6dsvAccelGyroRateHz = lsm6dsvAccelGyroRateHz;

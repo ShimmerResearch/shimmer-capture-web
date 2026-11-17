@@ -1602,6 +1602,12 @@ export function createMockShimmer3RTransport(opts = {}) {
     get btVersion() {
       return btVersionString;
     },
+    /**
+     * False makes SET_DAUGHTER_CARD_ID acknowledge without writing, which is
+     * what the firmware does with an out-of-range one: the case a host's
+     * read-back exists for (DEV-1493).
+     */
+    srWritesLand: true,
   };
 
   transport.rtc = {
@@ -3197,6 +3203,32 @@ export function createMockShimmer3RTransport(opts = {}) {
         out[1] = len;
         out.set(srBoardPage.subarray(off, off + len), 2);
         reply(concat([ACK], out));
+        return;
+      }
+
+      case CMD.SET_DAUGHTER_CARD_ID: {
+        /* [0x64][len][offset][data…] → ACK (DEV-1493). The firmware writes the
+           EEPROM and its cached copy of the page together, so the next
+           GET_DAUGHTER_CARD_ID reads the new bytes at once. A range outside the
+           page is ACKed with NOTHING written (`len <= 16 && offset <= 15 &&
+           len + offset <= 16`), which is why a host has to read it back, and
+           every SET is NACKed while sensing (`ShimBt_isCmdBlockedWhileSensing`). */
+        if (state.streaming || state.logging) {
+          reply([NACK]);
+          return;
+        }
+        const len = cmd[1] ?? 0;
+        const off = cmd[2] ?? 0;
+        if (
+          transport.identity.srWritesLand &&
+          len <= 16 &&
+          off <= 15 &&
+          len + off <= 16 &&
+          cmd.length >= 3 + len
+        ) {
+          srBoardPage.set(cmd.subarray(3, 3 + len), off);
+        }
+        reply([ACK]);
         return;
       }
 
