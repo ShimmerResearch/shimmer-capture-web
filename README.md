@@ -695,7 +695,8 @@ the same way whether the sensor is on a radio or in a dock.
 
 Three things that take the sensor's link exclusively for a while. (The red LED
 used to be here too; it is on **General** now, because nothing about it is a
-test.)
+test.) A page opened with `?factory=1` has a fourth, the SR number, described
+at the end of this section.
 
 **Throughput** free-runs the firmware's data-rate test for five seconds and
 counts what arrives, which is the only honest way to know a link's throughput:
@@ -752,6 +753,41 @@ First measurements on hardware, docked: a stock Shimmer3R read about −9 ppm,
 and a unit reworked to 22 pF crystal load capacitors about −98 ppm. Docked
 sensors read a few ppm low from charge self-heating, so a battery run at room
 temperature gives the comparable figure.
+
+### SR number (factory only)
+
+Open the page with **`?factory=1`** and the Test tab gains a fourth card that
+programs the sensor's SR number: the board, revision and special revision
+printed on the board, such as `SR47-8-1`. The firmware decides the sensor's
+hardware from it — which sensors are fitted, which pressure chip, whether ExG
+is there — so a wrong one changes how the sensor behaves, and a misprogrammed
+GSR+ has been left stuck at boot by one (DEV-629). That is why the public page
+does not show the card. The flag is the counterpart of Consensys's internal
+build, and it guards against accidents, not against someone who means to do it.
+(DEV-1493)
+
+- **What it writes** is what Consensys's factory build writes from Manage
+  Devices → _Program Exp. Board ID_: the whole 16-byte identity page,
+  `[SR, revision, special revision, 0xFF × 13]`. It works over every link here,
+  not just the dock: SET_DAUGHTER_CARD_ID (0x64) over BLE and Classic
+  Bluetooth, and the dock protocol's WRITE of `CARD_ID` over USB-C. The page
+  then reads it back. A number that does not read back as written is reported
+  as a failure, because the firmware acknowledges an out-of-range write without
+  writing anything.
+- **The board list** names each board with its SR number, as Consensys's does:
+  `ECG/EMG/Resp (SR47)`. A Shimmer3R is offered its five boards (SR31, SR38,
+  SR47, SR48, SR49), and a Shimmer3 its sensor boards, with the docks and the
+  Span left out. _Other SR number…_ takes a board id the list does not have,
+  with a warning that the firmware will not recognise its sensors. Changing
+  the board id, not just the revision, is called out before the write as well.
+- **The last number programmed is remembered** on this computer (in the
+  browser's local storage) and preselected for the next sensor, so a
+  production run of one board picks it once. With nothing remembered, the form
+  starts from the number the sensor reports.
+- **Restart afterwards.** The firmware chooses its sensors when it starts, so
+  the sensor still runs as its old board until it restarts. Over Bluetooth,
+  _Restart now_ arms the firmware's one-shot restart-on-disconnect and drops the
+  link, as the device-naming tab does. Over USB-C, power-cycle it by hand.
 
 ## Requirements
 

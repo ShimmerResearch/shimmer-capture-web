@@ -7,7 +7,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.5.13';
+const SDK_VERSION = '0.5.15';
 
 /**
  * Container for a single decoded sensor frame.
@@ -9530,6 +9530,121 @@ function isShimmerSrBoardAtLeast(board, boardId, rev, specialRev) {
         return false;
     return board.boardRev > rev || (board.boardRev === rev && board.specialRev >= specialRev);
 }
+// ---------------------------------------------------------------------------
+// Programming the SR identity
+// ---------------------------------------------------------------------------
+/**
+ * The daughter-card identity page: page 0 of the board's CAT24C16 EEPROM,
+ * absolute bytes 0-15. Only its first three bytes mean anything to a
+ * Shimmer3 or Shimmer3R (`Boards/shimmer_boards.c`, which reads
+ * `exp_brd_id`, `exp_brd_major` and `exp_brd_minor` and nothing past them).
+ */
+const SHIMMER_SR_ID_PAGE_SIZE = 16;
+/**
+ * The SR codes a Shimmer3R is built on: the five fourth-generation boards in
+ * the "Shimmer3R revision quick reference" of log-and-stream-common's
+ * `docs/SHIMMER3_BOARD_REVISIONS.md`. A Shimmer3R has no separate expansion
+ * board, so its page names the main board itself.
+ */
+const SHIMMER3R_SR_BOARD_IDS = Object.freeze([31, 38, 47, 48, 49]);
+/**
+ * The SR codes a Shimmer3 can carry: every board in
+ * {@link SHIMMER_SR_BOARD_NAMES} that is fitted to a sensor. The docks
+ * (SR41 Base15U, SR42 Base6U) and the Span (SR9) are left out: they are
+ * products of their own, and a sensor that claimed to be one would be
+ * misprogrammed.
+ */
+const SHIMMER3_SR_BOARD_IDS = Object.freeze([
+    8, 14, 31, 36, 37, 38, 44, 46, 47, 48, 49, 55,
+]);
+/**
+ * `'ECG/EMG/Resp (SR47)'` for a named code, `'SR232'` for one this SDK has no
+ * name for. The form is Consensys's (`PnlExpBrdIdSelection.createListOfExpBrds`).
+ */
+function formatShimmerSrBoardName(boardId) {
+    const name = SHIMMER_SR_BOARD_NAMES[boardId];
+    return name ? `${name} (SR${boardId})` : `SR${boardId}`;
+}
+/**
+ * The boards a host should offer when it programs a sensor's SR number, in SR
+ * order, each with its friendly name.
+ *
+ * `hardwareVersion` 10 (Shimmer3R) gives {@link SHIMMER3R_SR_BOARD_IDS};
+ * anything else, a Shimmer3 or a sensor that has not said, gives
+ * {@link SHIMMER3_SR_BOARD_IDS}, which contains the Shimmer3R's five.
+ *
+ * GSR+ and Bridge Amplifier+ each appear twice on a Shimmer3, as the
+ * separate-board and the unified-board code. The label's SR number is what
+ * tells them apart.
+ */
+function listShimmerSrBoards(hardwareVersion) {
+    const ids = hardwareVersion === 10 ? SHIMMER3R_SR_BOARD_IDS : SHIMMER3_SR_BOARD_IDS;
+    return ids.map((boardId) => {
+        const name = SHIMMER_SR_BOARD_NAMES[boardId] ?? `SR${boardId}`;
+        return { boardId, name, label: formatShimmerSrBoardName(boardId) };
+    });
+}
+/**
+ * Check that `board` can be written as an SR identity, and throw if not.
+ *
+ * - `boardId` is an integer 1..254. 0x00 and 0xFF are the two "nothing here"
+ *   patterns ({@link isShimmerSrBoardValid}), so writing either would leave
+ *   the sensor with no board at all; the firmware treats both as unset
+ *   (`ShimBrd_isDaughterCardIdSet`).
+ * - `boardRev` and `specialRev` are integers 0..255, one byte each.
+ *
+ * A code outside the SR table is accepted: a board newer than this SDK has to
+ * be programmable. It is the host's job to warn about one.
+ */
+function assertShimmerSrBoardWritable(board) {
+    const byte = (v) => Number.isInteger(v) && v >= 0 && v <= 255;
+    if (!board || !Number.isInteger(board.boardId) || board.boardId < 1 || board.boardId > 254) {
+        throw new Error(`SR board id must be an integer 1..254 (got ${board?.boardId}); 0 and 255 mean "no board".`);
+    }
+    if (!byte(board.boardRev)) {
+        throw new Error(`SR board revision must be an integer 0..255 (got ${board.boardRev}).`);
+    }
+    if (!byte(board.specialRev)) {
+        throw new Error(`SR special revision must be an integer 0..255 (got ${board.specialRev}).`);
+    }
+}
+/**
+ * The 16-byte identity page that programs `board`:
+ * `[boardId, boardRev, specialRev, 0xFF × 13]`.
+ *
+ * Port of the Java driver's `ExpansionBoardDetails.generateExpBrdIdArray`,
+ * which is what Consensys writes: the whole page, so bytes left over from an
+ * earlier programming do not survive. Bytes 3-4 are reserved and 5-10 carry a
+ * MAC on a ShimmerGQ 802.15.4 board only, so a Shimmer3 or Shimmer3R leaves
+ * them erased.
+ *
+ * Throws as {@link assertShimmerSrBoardWritable} does.
+ */
+function buildShimmerSrIdPage(board) {
+    assertShimmerSrBoardWritable(board);
+    const page = new Uint8Array(SHIMMER_SR_ID_PAGE_SIZE).fill(0xff);
+    page[0] = board.boardId;
+    page[1] = board.boardRev;
+    page[2] = board.specialRev;
+    return page;
+}
+/** True when `a` and `b` name the same board, revision and special revision. */
+function isSameShimmerSrBoard(a, b) {
+    if (!a || !b)
+        return false;
+    return a.boardId === b.boardId && a.boardRev === b.boardRev && a.specialRev === b.specialRev;
+}
+/**
+ * The error a client throws when the page it wrote does not read back. The
+ * read-back is the only proof a write landed: the Bluetooth command is
+ * acknowledged whether or not its range was accepted, and an out-of-range
+ * write is acknowledged with nothing written (`Comms/shimmer_bt_uart.c`,
+ * `SET_DAUGHTER_CARD_ID_COMMAND`).
+ */
+function srReadBackError(wanted, got) {
+    return new Error(`SR number did not read back: wrote ${formatShimmerSrCode(wanted)}, ` +
+        `read ${got ? formatShimmerSrCode(got) : 'a blank page'}.`);
+}
 /**
  * Describe a sensor's hardware for display: platform, board name and SR code.
  *
@@ -11394,16 +11509,26 @@ function shimmer3SupportsSetFeature(fw, hardwareVersion) {
 /**
  * Whether this firmware might record audio (DEV-99), and so is worth asking:
  * Shimmer3R LogAndStream v1.01.025 or later. False rules it out without
- * sending anything; true means ask the device
+ * sending anything. True from v1.01.026 means yes
+ * ({@link shimmer3RRecordsAudio}); on v1.01.025 it means ask the device
  * (`Shimmer3RClient.supportsAudio`).
  *
- * No release has audio yet, and the builds that do report the release they
- * were cut from, v1.01.025, so the version can only rule older firmware out.
- * Once a release carries it, that release's version answers yes on its own.
+ * LogAndStream_Shimmer3R v1.01.026 is the first release with audio. The
+ * development builds before it that have audio report the release they were
+ * cut from, v1.01.025, so for that version only the device can say.
  * A Shimmer3 has no microphone.
  */
 function shimmer3RMayRecordAudio(fw, hardwareVersion) {
     return isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3R, FW_ID.LOGANDSTREAM, 1, 1, 25);
+}
+/**
+ * Whether this firmware records audio (DEV-99) by its version alone:
+ * Shimmer3R LogAndStream v1.01.026, the first release with audio, or later.
+ * Every build from that release on has it, so a host need not ask. False
+ * does not rule audio out on v1.01.025 ({@link shimmer3RMayRecordAudio}).
+ */
+function shimmer3RRecordsAudio(fw, hardwareVersion) {
+    return isVersionAtLeast(fw, hardwareVersion, HW_ID.SHIMMER_3R, FW_ID.LOGANDSTREAM, 1, 1, 26);
 }
 // ---------------------------------------------------------------------------
 // Unframed-stream control-message framing
@@ -19768,12 +19893,16 @@ class Shimmer3RClient extends BaseShimmerClient {
      * Pass the answer to the InfoMem context as `audio`, which is what brings
      * byte 233 into the layout and the field schema.
      *
-     * The version alone cannot say. No release has audio yet, and the builds
-     * that do report the release they were cut from, so:
+     * LogAndStream_Shimmer3R v1.01.026 is the first release with audio, but the
+     * development builds before it that have audio report v1.01.025, the
+     * release they were cut from. So the version answers for every release, and
+     * the device is asked only on v1.01.025:
      *
-     * 1. Firmware older than that, or not LogAndStream, is ruled out by its
+     * 1. Firmware older than v1.01.025, or not LogAndStream, is ruled out by its
      *    version ({@link shimmer3RMayRecordAudio}) and is sent nothing.
-     * 2. Otherwise this sends `GET_AUDIO_STATUS_COMMAND` (0xBC) and waits a
+     * 2. v1.01.026 or later records audio ({@link shimmer3RRecordsAudio}), and
+     *    is sent nothing either.
+     * 3. On v1.01.025 this sends `GET_AUDIO_STATUS_COMMAND` (0xBC) and waits a
      *    second (`AUDIO_PROBE_TIMEOUT_MS`): a status reply is yes, silence no.
      *
      * The probe is safe on firmware without audio, which SET_FEATURE was not:
@@ -19794,8 +19923,9 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (this._audioSupport !== null)
             return this._audioSupport;
         const link = this._linkGeneration;
-        let answer = false;
-        if (await this._mayRecordAudio()) {
+        const byVersion = await this._audioByVersion();
+        let answer = byVersion === 'yes';
+        if (byVersion === 'ask') {
             try {
                 await this.getAudioStatus(AUDIO_PROBE_TIMEOUT_MS);
                 answer = true;
@@ -19814,14 +19944,21 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._audioSupport = answer;
         return answer;
     }
-    /** Whether the firmware's version leaves room for audio ({@link shimmer3RMayRecordAudio}). */
-    async _mayRecordAudio() {
+    /**
+     * What the firmware's version says about audio: 'yes' from v1.01.026
+     * ({@link shimmer3RRecordsAudio}), 'ask' on v1.01.025
+     * ({@link shimmer3RMayRecordAudio}), 'no' otherwise.
+     */
+    async _audioByVersion() {
         try {
             const v = await this.readFwVersion();
-            return shimmer3RMayRecordAudio({ firmwareIdentifier: v.fwId, major: v.major, minor: v.minor, internal: v.patch }, HW_ID$1.SHIMMER_3R);
+            const fw = { firmwareIdentifier: v.fwId, major: v.major, minor: v.minor, internal: v.patch };
+            if (shimmer3RRecordsAudio(fw, HW_ID$1.SHIMMER_3R))
+                return 'yes';
+            return shimmer3RMayRecordAudio(fw, HW_ID$1.SHIMMER_3R) ? 'ask' : 'no';
         }
         catch {
-            return false;
+            return 'no';
         }
     }
     /**
@@ -19880,6 +20017,56 @@ class Shimmer3RClient extends BaseShimmerClient {
         const board = parseExpansionBoard(payload);
         this._emitStatus(board ? `SR board ${formatShimmerSrCode(board)}` : 'SR board id page is blank');
         return board;
+    }
+    /**
+     * Program the board's SR identity — the counterpart of {@link readSrBoard},
+     * and what Consensys's factory "Program Exp. Board ID" does over a dock.
+     *
+     * Writes the whole 16-byte identity page, `[boardId, boardRev, specialRev,
+     * 0xFF × 13]` ({@link buildShimmerSrIdPage}), with SET_DAUGHTER_CARD_ID_COMMAND
+     * (0x64, `[0x64][16][offset 0][page…]` → ACK; `Comms/shimmer_bt_uart.c`,
+     * `SET_DAUGHTER_CARD_ID_COMMAND`), then reads the page back and returns what
+     * it read. A read-back that differs from what was written throws: the ACK
+     * alone proves nothing, because the firmware acknowledges an out-of-range
+     * write without writing anything.
+     *
+     * The firmware writes the EEPROM and its cached copy of the page together,
+     * so the read-back sees the new board at once. What the firmware decided
+     * from the old board at boot (which sensors are fitted, which pressure
+     * chip, whether ExG is there) does not change until the sensor restarts,
+     * so a host should have the sensor rebooted before it is used as the new
+     * board.
+     *
+     * Refused while streaming here, and by the firmware while it is sensing
+     * (`ShimBt_isCmdBlockedWhileSensing`), as every SET is.
+     *
+     * HARDWARE-VERIFY: the command and the read-back follow the firmware
+     * source; no Shimmer3R has been reprogrammed over this client yet.
+     */
+    async writeSrBoard(board) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (this._streaming)
+            throw new Error('Cannot program the SR number while streaming');
+        const page = buildShimmerSrIdPage(board);
+        const link = this._linkGeneration;
+        const code = formatShimmerSrCode(board);
+        this._emitStatus(`SET_DAUGHTER_CARD_ID ${code} → waiting for ACK…`);
+        const cmd = new Uint8Array(3 + page.length);
+        cmd[0] = OPCODES.SET_DAUGHTER_CARD_ID_COMMAND;
+        cmd[1] = page.length;
+        cmd[2] = 0;
+        cmd.set(page, 3);
+        await this._writeExpectingAck(cmd, 1500, link);
+        if (link !== this._linkGeneration) {
+            throw new Error('The link was reset before the SR number could be read back');
+        }
+        const readBack = await this.readSrBoard();
+        if (!readBack || !isSameShimmerSrBoard(readBack, board)) {
+            throw srReadBackError(board, readBack);
+        }
+        this._emitStatus(`SR number programmed: ${code}`);
+        return readBack;
     }
     /**
      * Read what the Bluetooth module says its own version is
@@ -27182,6 +27369,49 @@ class Shimmer3Client extends BaseShimmerClient {
         return board;
     }
     /**
+     * Program the daughter-card id — the board's SR identity — and read it back.
+     *
+     * Writes the whole 16-byte identity page, `[boardId, boardRev, specialRev,
+     * 0xFF × 13]` ({@link buildShimmerSrIdPage}, the page Consensys writes), with
+     * SET_DAUGHTER_CARD_ID_COMMAND (0x64, `[0x64][16][offset 0][page…]` → ACK;
+     * log-and-stream-common `Comms/shimmer_bt_uart.c`). Then
+     * {@link readExpansionBoard} reads it back, which also takes the new board's
+     * IMU generation into this client, and a read-back that differs from what
+     * was written throws: the firmware acknowledges an out-of-range write
+     * without writing anything, so the ACK alone proves nothing.
+     *
+     * The sensor keeps what it decided from the old board at boot (its sensors,
+     * its pressure chip, whether ExG is fitted) until it restarts, so have it
+     * rebooted before it is used as the new board.
+     *
+     * Refused while streaming here, and by the firmware while it is sensing.
+     *
+     * HARDWARE-VERIFY: follows the firmware source; no Shimmer3 has been
+     * reprogrammed over this client yet.
+     */
+    async writeExpansionBoard(board) {
+        const link = this._link.current;
+        if (!this._linkLive)
+            throw new Error('Not connected');
+        if (this._streaming)
+            throw new Error('Cannot program the SR number while streaming');
+        const page = buildShimmerSrIdPage(board);
+        const code = formatShimmerSrCode(board);
+        this._emitStatus(`SET_DAUGHTER_CARD_ID ${code} → waiting for ACK…`);
+        const cmd = new Uint8Array(3 + page.length);
+        cmd[0] = OPCODES.SET_DAUGHTER_CARD_ID_COMMAND;
+        cmd[1] = page.length;
+        cmd[2] = 0;
+        cmd.set(page, 3);
+        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS, link);
+        const readBack = await this._readExpansionBoardOn(link);
+        if (!readBack || !isSameShimmerSrBoard(readBack, board)) {
+            throw srReadBackError(board, readBack);
+        }
+        this._emitStatus(`SR number programmed: ${code}`);
+        return readBack;
+    }
+    /**
      * Read from the daughter-card EEPROM memory. `offset` is a HOST offset —
      * firmware maps it past the first (HW details) EEPROM page, so host offsets
      * 0..2031 cover absolute EEPROM bytes 16..2047.
@@ -28314,6 +28544,41 @@ class WiredShimmerClient extends BaseShimmerClient {
     async _readExpansionBoardImpl() {
         const payload = await this._readMem(UART_PROP.DAUGHTER_CARD.CARD_ID, 0, 16);
         return parseExpansionBoard(payload);
+    }
+    /**
+     * Program the daughter-card (expansion board) ID — the SR identity — and
+     * read it back. This is exactly what Consensys's factory "Program Exp.
+     * Board ID" does: `DockManager.writeExpansionBoardId` →
+     * `CommsProtocolWiredShimmerViaDock.writeDaughterCardId`, a WRITE of
+     * `DAUGHTER_CARD.CARD_ID` at address 0 with the 16-byte page
+     * `[boardId, boardRev, specialRev, 0xFF × 13]` ({@link buildShimmerSrIdPage}).
+     *
+     * The page is then read back (READ `CARD_ID`, 16 bytes from 0), and a
+     * read-back that differs from what was written throws. On success
+     * {@link identity}, when it has been read, takes the new board.
+     *
+     * The sensor keeps what it decided from the old board at boot until it
+     * restarts, so have it rebooted (undocked and powered off and on) before it
+     * is used as the new board.
+     *
+     * HARDWARE-VERIFY: the WRITE is the Java driver's, which Consensys has used
+     * in production for years; this client has not yet sent it to a sensor.
+     */
+    async writeExpansionBoard(board) {
+        const page = buildShimmerSrIdPage(board);
+        const code = formatShimmerSrCode(board);
+        return this._serialize(async () => {
+            const payload = buildMemWritePayload(UART_PROP.DAUGHTER_CARD.CARD_ID, 0, page);
+            await this._writeRaw(UART_PROP.DAUGHTER_CARD.CARD_ID, payload);
+            const readBack = await this._readExpansionBoardImpl();
+            if (!readBack || !isSameShimmerSrBoard(readBack, board)) {
+                throw srReadBackError(board, readBack);
+            }
+            if (this.identity)
+                this.identity = { ...this.identity, expansionBoard: readBack };
+            this._emitStatus(`SR number programmed: ${code}`);
+            return readBack;
+        });
     }
     /**
      * Read what the Bluetooth module says its own version is
@@ -39128,5 +39393,5 @@ function shimmerFactoryTestReportToCsvRows(parsed, meta = {}) {
     return factoryTestReportToCsvRows(parsed, meta);
 }
 
-export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, AUDIO_FAULT, AUDIO_FILE, AUDIO_FILE_OPEN_REASON, AUDIO_FINGERPRINT_FILE, AUDIO_GAIN_PRESET, AUDIO_MODE, AUDIO_MODE_BYTE, AUDIO_MODE_OPTIONS, AUDIO_OPCODES, AUDIO_STATE, AUDIO_STATUS_BITS, AUDIO_STATUS_LENGTH, AUDIO_STATUS_VERSION, AudioFileFormatError, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BUTTON_LOGGING, BUTTON_LOGGING_OPTIONS, BUTTON_LOG_MODE, BUTTON_MODE, BUTTON_MODE_OPTIONS, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, DERIVED_GYRO_ON_THE_FLY_CAL, EVENT_CHANNEL, EVENT_CHANNEL_OPCODES, EVENT_CHANNEL_STATUS_LENGTH, EVENT_FILE, EVENT_FILE_OPEN_REASON, EVENT_FRAME_LENGTH, EVENT_INPUT, EVENT_RECORD_FLAG, EVENT_RECORD_TYPE, EVENT_TICKS_PER_SECOND, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, EventFileFormatError, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, GYRO_ON_THE_FLY_THRESHOLD_DPS, GyroOnTheFlyCal, IF820_OTA, IF820_OTA_COMMAND, IF820_OTA_DEFAULT_CHUNK_SIZE, IF820_OTA_FAST_CHUNK_SIZE, IF820_OTA_FIRST_WRITE_TIMEOUT_MS, IF820_OTA_MIN_CHUNK_SIZE, IF820_OTA_MIN_SENSOR_FIRMWARE, IF820_OTA_RECONNECT_ATTEMPTS, IF820_OTA_RECONNECT_DELAY_MS, IF820_OTA_RESPONSE_TIMEOUT_MS, IF820_OTA_SAFE_CHUNK_SIZE, IF820_OTA_SERVICE_UUIDS, IF820_OTA_STATUS, IF820_OTA_TRANSIENT_ERROR_REGEX, IF820_OTA_VERIFY_TIMEOUT_MS, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID$1 as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID$1 as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, If820OtaError, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LOG_TRIGGERS, LOG_TRIGGER_OPTIONS, LSM6DSV_ODR, LogStartRefusedError, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_COMPANION_KINDS, SD_DATA_ROOT, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_LINK_CRC_MIN_FIRMWARE, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE, SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_OLD_IMU_MAG_FORMATS, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER3_STATUS_PAYLOAD_BYTES, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SOUND_LEVEL_CHANNEL_ID, SOUND_LEVEL_COUNTS_PER_DB, SOUND_LEVEL_NAME, SOUND_LEVEL_NO_LEVEL, SOUND_LEVEL_UNIT, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, allowsSingleTouch, appendCrc, applyAudioModeRules, applyButtonLogModeRules, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, applyTcxoRule, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, audioFingerprintRecordTicks, audioGainPresetOf, audioModeOf, audioModeRecordsSpeech, audioSampleTicks, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, buttonModeOf, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, canRecordPressesWith, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareIf820Versions, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, correctAudioMode, correctButtonLogMode, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeButtonLogMode, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describeAudioFault, describeAudioMode, describeAudioState, describeButtonLogMode, describeEventRecord, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, doesPressToggleLogging, doesUndockStartLogging, downloadCsvBlob, downloadSdTree, drainByteStream, encodeAudioMode, encodeButtonLogMode, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, eventChannelBoardSupport, eventFrameLength, eventTicksToUnixMs, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, gyroOnTheFlyWindow, hasSensorBit, hhmmToMinutesSinceMidnight, if820OtaSensorSupport, if820OtaStatusText, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isAudioFaultFatal, isBadResponse, isBmp581PresentPerSrNumber, isButtonDisabled, isCrcMode, isDoublePress, isExgRespirationEnabled, isGenerationSensitiveChannel, isGyroOnTheFlyEnabled, isIf820OtaTransientError, isIf820UpdateAvailable, isLoggingDisabled, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isTtlInputEnabled, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, joinAudioMode, joinButtonMode, keepsLinkCrcWhenSensingStops, localCivilUnixSecondsNow, logTriggersOf, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nearestUserButtonEnable, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseAudioFingerprintFile, parseAudioFingerprintHeader, parseAudioFingerprintRecord, parseAudioStatus, parseAudioWavHeader, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventChannelStatus, parseEventFile, parseEventFrame, parseEventLogPayload, parseEventRecord, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, recordsAudioFingerprint, recordsButtonPresses, recordsRawAudio, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runIf820OtaUpdate, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCompanionKindOf, sdCompanionPathFor, sdCrc16, sdDataPathForCompanion, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3RMayRecordAudio, shimmer3SensorLabel, shimmer3SupportsBatteryRequest, shimmer3SupportsExg, shimmer3SupportsSetFeature, shimmer3SupportsStatusRequest, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, soundLevelDbA, soundLevelEnabled, soundLevelSupportedByReadback, splitAudioMode, splitButtonMode, statusPayloadBytesFor, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, twoByteCrcOverrunsStatusPush, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, whenIf820OtaDeviceIdle, wiredPacketLength, withPressRecording, withSoundLevel, withoutPressRecording, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, AUDIO_FAULT, AUDIO_FILE, AUDIO_FILE_OPEN_REASON, AUDIO_FINGERPRINT_FILE, AUDIO_GAIN_PRESET, AUDIO_MODE, AUDIO_MODE_BYTE, AUDIO_MODE_OPTIONS, AUDIO_OPCODES, AUDIO_STATE, AUDIO_STATUS_BITS, AUDIO_STATUS_LENGTH, AUDIO_STATUS_VERSION, AudioFileFormatError, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BUTTON_LOGGING, BUTTON_LOGGING_OPTIONS, BUTTON_LOG_MODE, BUTTON_MODE, BUTTON_MODE_OPTIONS, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, DERIVED_GYRO_ON_THE_FLY_CAL, EVENT_CHANNEL, EVENT_CHANNEL_OPCODES, EVENT_CHANNEL_STATUS_LENGTH, EVENT_FILE, EVENT_FILE_OPEN_REASON, EVENT_FRAME_LENGTH, EVENT_INPUT, EVENT_RECORD_FLAG, EVENT_RECORD_TYPE, EVENT_TICKS_PER_SECOND, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, EventFileFormatError, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, GYRO_ON_THE_FLY_THRESHOLD_DPS, GyroOnTheFlyCal, IF820_OTA, IF820_OTA_COMMAND, IF820_OTA_DEFAULT_CHUNK_SIZE, IF820_OTA_FAST_CHUNK_SIZE, IF820_OTA_FIRST_WRITE_TIMEOUT_MS, IF820_OTA_MIN_CHUNK_SIZE, IF820_OTA_MIN_SENSOR_FIRMWARE, IF820_OTA_RECONNECT_ATTEMPTS, IF820_OTA_RECONNECT_DELAY_MS, IF820_OTA_RESPONSE_TIMEOUT_MS, IF820_OTA_SAFE_CHUNK_SIZE, IF820_OTA_SERVICE_UUIDS, IF820_OTA_STATUS, IF820_OTA_TRANSIENT_ERROR_REGEX, IF820_OTA_VERIFY_TIMEOUT_MS, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID$1 as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID$1 as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, If820OtaError, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LOG_TRIGGERS, LOG_TRIGGER_OPTIONS, LSM6DSV_ODR, LogStartRefusedError, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_COMPANION_KINDS, SD_DATA_ROOT, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_LINK_CRC_MIN_FIRMWARE, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, SHIMMER3R_SR_BOARD_IDS, SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE, SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_OLD_IMU_MAG_FORMATS, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER3_SR_BOARD_IDS, SHIMMER3_STATUS_PAYLOAD_BYTES, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_SR_ID_PAGE_SIZE, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SOUND_LEVEL_CHANNEL_ID, SOUND_LEVEL_COUNTS_PER_DB, SOUND_LEVEL_NAME, SOUND_LEVEL_NO_LEVEL, SOUND_LEVEL_UNIT, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, allowsSingleTouch, appendCrc, applyAudioModeRules, applyButtonLogModeRules, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, applyTcxoRule, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, assertShimmerSrBoardWritable, audioFingerprintRecordTicks, audioGainPresetOf, audioModeOf, audioModeRecordsSpeech, audioSampleTicks, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildShimmerSrIdPage, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, buttonModeOf, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, canRecordPressesWith, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareIf820Versions, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, correctAudioMode, correctButtonLogMode, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeButtonLogMode, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describeAudioFault, describeAudioMode, describeAudioState, describeButtonLogMode, describeEventRecord, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, doesPressToggleLogging, doesUndockStartLogging, downloadCsvBlob, downloadSdTree, drainByteStream, encodeAudioMode, encodeButtonLogMode, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, eventChannelBoardSupport, eventFrameLength, eventTicksToUnixMs, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrBoardName, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, gyroOnTheFlyWindow, hasSensorBit, hhmmToMinutesSinceMidnight, if820OtaSensorSupport, if820OtaStatusText, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isAudioFaultFatal, isBadResponse, isBmp581PresentPerSrNumber, isButtonDisabled, isCrcMode, isDoublePress, isExgRespirationEnabled, isGenerationSensitiveChannel, isGyroOnTheFlyEnabled, isIf820OtaTransientError, isIf820UpdateAvailable, isLoggingDisabled, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSameShimmerSrBoard, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isTtlInputEnabled, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, joinAudioMode, joinButtonMode, keepsLinkCrcWhenSensingStops, listShimmerSrBoards, localCivilUnixSecondsNow, logTriggersOf, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nearestUserButtonEnable, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseAudioFingerprintFile, parseAudioFingerprintHeader, parseAudioFingerprintRecord, parseAudioStatus, parseAudioWavHeader, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventChannelStatus, parseEventFile, parseEventFrame, parseEventLogPayload, parseEventRecord, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, recordsAudioFingerprint, recordsButtonPresses, recordsRawAudio, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runIf820OtaUpdate, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCompanionKindOf, sdCompanionPathFor, sdCrc16, sdDataPathForCompanion, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3RMayRecordAudio, shimmer3RRecordsAudio, shimmer3SensorLabel, shimmer3SupportsBatteryRequest, shimmer3SupportsExg, shimmer3SupportsSetFeature, shimmer3SupportsStatusRequest, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, soundLevelDbA, soundLevelEnabled, soundLevelSupportedByReadback, splitAudioMode, splitButtonMode, statusPayloadBytesFor, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, twoByteCrcOverrunsStatusPush, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, whenIf820OtaDeviceIdle, wiredPacketLength, withPressRecording, withSoundLevel, withoutPressRecording, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map
