@@ -777,9 +777,15 @@ build, and it guards against accidents, not against someone who means to do it.
 - **The board list** names each board with its SR number, as Consensys's does:
   `ECG/EMG/Resp (SR47)`. A Shimmer3R is offered its five boards (SR31, SR38,
   SR47, SR48, SR49), and a Shimmer3 its sensor boards, with the docks and the
-  Span left out. _Other SR number…_ takes a board id the list does not have,
-  with a warning that the firmware will not recognise its sensors. Changing
-  the board id, not just the revision, is called out before the write as well.
+  Span left out. Changing the board id, not just the revision, is called out
+  before the write.
+- **The SR number box goes with the list.** It always shows the number that
+  will be written. Choosing a board fills it with that board's number, read-only.
+  _Other SR number…_ makes it editable, keeps the number already there and
+  focuses it, for a board id the list does not have; the page warns that the
+  firmware will not recognise its sensors. A number typed there that the list
+  has selects that board once you leave the box, but not while you type, so 140
+  is not cut off at 14.
 - **The last number programmed is remembered** on this computer (in the
   browser's local storage) and preselected for the next sensor, so a
   production run of one board picks it once. With nothing remembered, the form

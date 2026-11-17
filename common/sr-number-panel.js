@@ -158,19 +158,24 @@ export function createSrNumberPanel(host, opts = {}) {
     if (node) node.textContent = text ?? "–";
   };
 
+  /* The board list and the SR number box are one control in two parts: the
+     box always shows the number of the board chosen, and is typed into only
+     on "Other SR number…". Choosing a board fills the box; a number typed
+     there that the list has picks that board once the box is left. */
   const selBoard = el("select", {
     dataset: { srRole: "board" },
-    onchange: edited,
+    onchange: boardChosen,
   });
-  const inOther = el("input", {
+  const inSr = el("input", {
     type: "number",
     min: "1",
     max: "254",
     step: "1",
     inputmode: "numeric",
     placeholder: "1–254",
-    dataset: { srRole: "other" },
+    dataset: { srRole: "sr" },
     oninput: edited,
+    onchange: srTyped,
   });
   const inRev = el("input", {
     type: "number",
@@ -190,15 +195,18 @@ export function createSrNumberPanel(host, opts = {}) {
     dataset: { srRole: "special" },
     oninput: edited,
   });
-  const otherField = el(
+  /* Not hidden on any choice: `.field` is display:flex in the theme, which
+     overrides the `hidden` attribute, and a box that is always there and
+     always says which number will be written is the clearer control anyway. */
+  const srHint = el("div", {
+    class: "field-hint",
+    dataset: { srRole: "srHint" },
+  });
+  const srField = el(
     "div",
-    { class: "field", hidden: true },
-    el("label", {}, "SR number", inOther),
-    el(
-      "div",
-      { class: "field-hint" },
-      "A board id this page has no name for. The firmware only knows the boards it was built for.",
-    ),
+    { class: "field" },
+    el("label", {}, "SR number", inSr),
+    srHint,
   );
 
   const preview = el("div", {
@@ -252,7 +260,7 @@ export function createSrNumberPanel(host, opts = {}) {
       "div",
       { class: "row" },
       el("div", { class: "field" }, el("label", {}, "Board", selBoard)),
-      otherField,
+      srField,
       el("div", { class: "field" }, el("label", {}, "Revision", inRev)),
       el(
         "div",
@@ -327,8 +335,15 @@ export function createSrNumberPanel(host, opts = {}) {
       ...list.map((c) => el("option", { value: String(c.boardId) }, c.label)),
       el("option", { value: OTHER }, "Other SR number…"),
     );
-    if ([...selBoard.options].some((o) => o.value === keep))
+    if ([...selBoard.options].some((o) => o.value === keep)) {
       selBoard.value = keep;
+    } else if (keep) {
+      /* The list changed under a choice it no longer has (the sensor said
+         which platform it is): keep the number, and show it by name if the
+         new list has it, or as "Other" if not. */
+      const id = intOf(inSr.value);
+      selBoard.value = id == null ? "" : isListed(id) ? String(id) : OTHER;
+    }
   }
 
   /** Put `board` into the form, as a list entry when it is one. */
@@ -336,16 +351,51 @@ export function createSrNumberPanel(host, opts = {}) {
     fillBoardList();
     if (!board) {
       selBoard.value = "";
-      inOther.value = "";
+      inSr.value = "";
       inRev.value = "";
       inSpecial.value = "";
       return;
     }
-    const listed = choices().some((c) => c.boardId === board.boardId);
-    selBoard.value = listed ? String(board.boardId) : OTHER;
-    inOther.value = listed ? "" : String(board.boardId);
+    selBoard.value = isListed(board.boardId) ? String(board.boardId) : OTHER;
+    inSr.value = String(board.boardId);
     inRev.value = String(board.boardRev);
     inSpecial.value = String(board.specialRev);
+  }
+
+  function isListed(boardId) {
+    return choices().some((c) => c.boardId === boardId);
+  }
+
+  /**
+   * The board list changed: a board fills the SR number box with its number;
+   * "Other SR number…" keeps whatever number is there and hands the box over
+   * to be typed in; "Choose a board…" empties it.
+   */
+  function boardChosen() {
+    const pick = selBoard.value;
+    if (pick === OTHER) {
+      touched = true;
+      sync();
+      inSr.focus();
+      inSr.select?.();
+      return;
+    }
+    inSr.value = pick;
+    edited();
+  }
+
+  /**
+   * A number typed on "Other" and then left: if the list has that board, it
+   * is chosen there, so a listed board is always shown by name. Done on
+   * `change` rather than on every keystroke, or typing 140 would be cut off
+   * at 14, the separate-board GSR+.
+   */
+  function srTyped() {
+    const id = intOf(inSr.value);
+    if (selBoard.value === OTHER && id != null && isListed(id)) {
+      selBoard.value = String(id);
+    }
+    edited();
   }
 
   /**
@@ -355,7 +405,9 @@ export function createSrNumberPanel(host, opts = {}) {
   function readForm() {
     const pick = selBoard.value;
     if (!pick) return { board: null, problem: "Choose a board." };
-    const boardId = pick === OTHER ? intOf(inOther.value) : Number(pick);
+    /* The box is the number written. On a listed board it holds that board's
+       number, since choosing the board put it there. */
+    const boardId = intOf(inSr.value);
     if (boardId == null)
       return { board: null, problem: "Enter the SR number, 1–254." };
     const boardRev = intOf(inRev.value);
@@ -426,7 +478,12 @@ export function createSrNumberPanel(host, opts = {}) {
       fillBoardList();
     }
 
-    otherField.hidden = selBoard.value !== OTHER;
+    const typing = selBoard.value === OTHER;
+    srHint.textContent = typing
+      ? "Type the board's SR number. A number in the list picks that board."
+      : selBoard.value
+        ? "Set by the board chosen. Choose “Other SR number…” to type one."
+        : "";
 
     const current = client ? getBoard() : null;
     setStat(
@@ -455,7 +512,13 @@ export function createSrNumberPanel(host, opts = {}) {
     }
 
     const live = enabled && !!client && !working;
-    for (const c of [selBoard, inOther, inRev, inSpecial]) c.disabled = !live;
+    for (const c of [selBoard, inRev, inSpecial]) c.disabled = !live;
+    /* Typed into only on "Other"; otherwise it shows the chosen board's
+       number, read-only, in the theme's look for a value that is shown but
+       not edited. `disabled` stays for the whole card being off. */
+    inSr.disabled = !live;
+    inSr.readOnly = !typing;
+    srField.classList.toggle("readonly", !typing);
     btnProgram.disabled = !live || !board;
     btnFromSensor.disabled = !live || !sdk.isShimmerSrBoardValid(current);
     btnRestart.disabled = !enabled || !client || working;

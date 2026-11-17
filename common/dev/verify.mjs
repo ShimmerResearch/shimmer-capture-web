@@ -5254,7 +5254,7 @@ const srOpen = await evaluate(`${SR}
     inTest: document.getElementById('srCard').closest('#tabTest') !== null,
     current: r('current').textContent, last: r('last').textContent,
     options: [...r('board').options].map(o => o.textContent),
-    picked: r('board').value, other: r('other').value,
+    picked: r('board').value, sr: r('sr').value, srOff: r('sr').readOnly || r('sr').disabled,
     preview: r('preview').textContent, programOff: r('program').disabled };
 `);
 check(
@@ -5283,10 +5283,75 @@ check(
 check(
   "with nothing remembered the form starts from the sensor's own number, and warns about it",
   srOpen.picked === "other" &&
-    srOpen.other === "232" &&
+    srOpen.sr === "232" &&
+    srOpen.srOff === false &&
     /SR232 is not a board a Shimmer3R is built on/.test(srOpen.preview) &&
     srOpen.programOff === false,
   srOpen.preview,
+);
+
+/* The board list and the SR number box are one control. Checked by what is
+   on screen, not by attributes: `.field` is display:flex, which overrode the
+   `hidden` attribute the first version relied on, and an attribute check
+   passed while the box sat there editable on every choice. */
+const srLink = await evaluate(`${SR}
+  const box = r('sr');
+  const fire = (type) => box.dispatchEvent(new Event(type, { bubbles: true }));
+  const shown = () => getComputedStyle(box.closest('.field')).display !== 'none';
+  set(r('board'), '48');
+  const listed = { value: box.value, off: box.readOnly, shown: shown(),
+    hint: r('srHint').textContent };
+  set(r('board'), 'other');
+  const other = { value: box.value, off: box.readOnly || box.disabled,
+    focused: document.activeElement === box, hint: r('srHint').textContent };
+  box.value = '49'; fire('input');
+  const typing = { picked: r('board').value };
+  fire('change');
+  const left = { picked: r('board').value, value: box.value, off: box.readOnly };
+  set(r('board'), 'other');
+  box.value = '140'; fire('input'); fire('change');
+  const unlisted = { picked: r('board').value, value: box.value,
+    preview: r('preview').textContent };
+  set(r('board'), '');
+  const cleared = { value: box.value, program: r('program').disabled };
+  return { listed, other, typing, left, unlisted, cleared };
+`);
+check(
+  "choosing a board fills the SR number box with its number, shown but locked",
+  srLink.listed.value === "48" &&
+    srLink.listed.off === true &&
+    srLink.listed.shown &&
+    /Set by the board chosen/.test(srLink.listed.hint),
+  `${srLink.listed.value}, ${srLink.listed.off ? "locked" : "editable"}, ${srLink.listed.shown ? "shown" : "not shown"}`,
+);
+check(
+  "Other unlocks the box with the number kept, ready to type",
+  srLink.other.value === "48" &&
+    srLink.other.off === false &&
+    srLink.other.focused &&
+    /Type the board's SR number/.test(srLink.other.hint),
+  `${srLink.other.value}, ${srLink.other.off ? "locked" : "editable"}, focused=${srLink.other.focused}`,
+);
+check(
+  "a listed number typed on Other picks that board once the box is left, not while typing",
+  srLink.typing.picked === "other" &&
+    srLink.left.picked === "49" &&
+    srLink.left.value === "49" &&
+    srLink.left.off === true,
+  `typing: ${srLink.typing.picked}; left: ${srLink.left.picked}`,
+);
+check(
+  "an unlisted number stays on Other, with the warning",
+  srLink.unlisted.picked === "other" &&
+    srLink.unlisted.value === "140" &&
+    /SR140 is not a board a Shimmer3R is built on/.test(
+      srLink.unlisted.preview,
+    ),
+  srLink.unlisted.preview,
+);
+check(
+  "Choose a board… empties the box and leaves nothing to program",
+  srLink.cleared.value === "" && srLink.cleared.program === true,
 );
 
 const srWrite = await evaluate(`${SR}
