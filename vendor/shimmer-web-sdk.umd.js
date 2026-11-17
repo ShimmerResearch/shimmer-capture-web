@@ -13,7 +13,7 @@
      * from it by the Bump step in cut-release.yml — the release bumps this file
      * as well as package.json, so a published bundle reports its own version.
      */
-    const SDK_VERSION = '0.5.15';
+    const SDK_VERSION = '0.5.16';
 
     /**
      * Container for a single decoded sensor frame.
@@ -3844,6 +3844,376 @@
                 perSensor,
             };
         }
+    }
+
+    /**
+     * Reconnecting to a sensor whose link dropped, without asking the user to pick
+     * it again (DEV-1483).
+     *
+     * The browser's pickers appear only when a page asks for a NEW device:
+     * `navigator.bluetooth.requestDevice()` and `navigator.serial.requestPort()`.
+     * A page that kept what it was given can reconnect with neither:
+     *
+     * - **BLE:** a transport built with the same `BluetoothDevice`
+     *   (`WebBluetoothTransportOptions.device`) reconnects through
+     *   `device.gatt.connect()`.
+     * - **Classic Bluetooth:** a transport built with the same `SerialPort`
+     *   (`WebSerialTransportOptions.port`) reopens it, which brings the
+     *   RFCOMM link up again.
+     *
+     * Neither needs a user gesture, so a timer can drive them.
+     *
+     * This module is the policy around those calls:
+     * - when to try, and how long to wait between tries ({@link reconnectDelayMs},
+     *   {@link nextReconnectDelayMs});
+     * - the loop that runs the tries ({@link startAutoReconnect});
+     * - what to send once the link is back ({@link planStreamResume}).
+     *
+     * What a try IS belongs to the caller: build a fresh client on a fresh
+     * transport around the device or port it kept, connect, and run whatever its
+     * own connect sequence is.
+     *
+     * @module
+     */
+    /**
+     * The policy {@link startAutoReconnect} uses for anything not given.
+     *
+     * Tries at 1 s, then 2, 4, 8 and every 15 s after that, each allowed 30 s,
+     * until cancelled. 30 s covers a Shimmer3R connect sequence over BLE, which
+     * reads its configuration and calibration (a few seconds), and a Classic
+     * Bluetooth port's own open timeout (15 s, `WebSerialTransportOptions.openTimeoutMs`).
+     */
+    const DEFAULT_RECONNECT_POLICY = Object.freeze({
+        initialDelayMs: 1000,
+        retryDelayMs: 2000,
+        backoffFactor: 2,
+        maxDelayMs: 15000,
+        attemptTimeoutMs: 30000,
+        settleMs: 5000,
+        maxAttempts: Infinity,
+        maxDurationMs: Infinity,
+    });
+    /** A non-negative finite number, else the default. */
+    function nonNegative(value, fallback) {
+        return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+    }
+    /** A positive limit, `Infinity` included; anything else means no limit. */
+    function limit(value) {
+        return typeof value === 'number' && value > 0 ? value : Infinity;
+    }
+    /**
+     * A complete policy from a partial one.
+     *
+     * Each field not given, or given as something it cannot be, takes its value
+     * from {@link DEFAULT_RECONNECT_POLICY}:
+     * - the waits must be finite and not negative;
+     * - `attemptTimeoutMs` must be finite and above 0;
+     * - `backoffFactor` must be finite and at least 1, so waits never shrink;
+     * - `maxAttempts` is rounded down, and must be at least 1;
+     * - `maxAttempts` and `maxDurationMs` that are 0, negative or not numbers mean
+     *   no limit.
+     */
+    function resolveReconnectPolicy(partial = {}) {
+        const d = DEFAULT_RECONNECT_POLICY;
+        const timeout = partial.attemptTimeoutMs;
+        const factor = partial.backoffFactor;
+        const attempts = limit(partial.maxAttempts);
+        return {
+            initialDelayMs: nonNegative(partial.initialDelayMs, d.initialDelayMs),
+            retryDelayMs: nonNegative(partial.retryDelayMs, d.retryDelayMs),
+            backoffFactor: typeof factor === 'number' && Number.isFinite(factor) && factor >= 1
+                ? factor
+                : d.backoffFactor,
+            maxDelayMs: nonNegative(partial.maxDelayMs, d.maxDelayMs),
+            attemptTimeoutMs: typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+                ? timeout
+                : d.attemptTimeoutMs,
+            settleMs: nonNegative(partial.settleMs, d.settleMs),
+            maxAttempts: attempts === Infinity ? Infinity : Math.max(1, Math.floor(attempts)),
+            maxDurationMs: limit(partial.maxDurationMs),
+        };
+    }
+    /**
+     * How long to wait before try `attempt` (1 for the first).
+     *
+     * The first waits {@link ReconnectPolicy.initialDelayMs}. Try n (n ≥ 2) waits
+     * `retryDelayMs × backoffFactor^(n−2)`, rounded to the millisecond, and never
+     * more than `maxDelayMs`. With the default policy: 1000, 2000, 4000, 8000,
+     * 15000, 15000, …
+     */
+    function reconnectDelayMs(policy, attempt) {
+        if (!(attempt > 1))
+            return policy.initialDelayMs;
+        const grown = policy.retryDelayMs * Math.pow(policy.backoffFactor, Math.floor(attempt) - 2);
+        return Math.round(Math.min(policy.maxDelayMs, grown));
+    }
+    /**
+     * After a try fails, how long to wait before the next, or `null` to give up.
+     *
+     * Gives up once `failedAttempts` reaches {@link ReconnectPolicy.maxAttempts},
+     * or when the next try would start after {@link ReconnectPolicy.maxDurationMs}
+     * (counted, like `elapsedMs`, from the drop).
+     *
+     * @param failedAttempts tries made so far, all of which failed
+     * @param elapsedMs time since the link dropped
+     */
+    function nextReconnectDelayMs(policy, failedAttempts, elapsedMs) {
+        if (failedAttempts >= policy.maxAttempts)
+            return null;
+        const delay = reconnectDelayMs(policy, failedAttempts + 1);
+        if (elapsedMs + delay > policy.maxDurationMs)
+            return null;
+        return delay;
+    }
+    /**
+     * What to send to a Shimmer3 or Shimmer3R, once reconnected, to put back what
+     * was running when the link dropped.
+     *
+     * The firmware's rule on a lost link (log-and-stream-common
+     * `Comms/shimmer_bt_uart.c`, the "BT is disconnected" branch): it stops the
+     * stream (`ShimTask_setStopStreaming`) and leaves an SD log running, because
+     * `ShimSens_stopSensing` closes the log only when the log itself was told to
+     * stop (`Sensing/shimmer_sensing.c`). So:
+     *
+     * | Before the drop | Status read after | Send |
+     * |---|---|---|
+     * | not streaming | anything | nothing |
+     * | streaming | streaming | nothing: it never stopped |
+     * | streaming, no log | not streaming | start streaming |
+     * | streaming and logging | logging | start streaming: the log went on |
+     * | streaming and logging | not logging | start streaming and logging: the log ended too, so the sensor restarted |
+     * | streaming and logging | no status | start streaming |
+     *
+     * Only a stream is put back. A log that was running on its own goes on without
+     * the link, and one that ended is not restarted: the sensor ended it for a
+     * reason a host cannot see. Without a status, a second log is never started on
+     * a guess; the host should say the log's state is unknown.
+     *
+     * Fields of `statusAfter` that are `null` or missing count as unknown. A
+     * Verisense has no SD log in this sense: pass `sdLogging: false`.
+     */
+    function planStreamResume(before, statusAfter) {
+        if (!before.streaming)
+            return 'none';
+        if (statusAfter?.streaming === true)
+            return 'none';
+        if (before.sdLogging && statusAfter?.sdLogging === false)
+            return 'start-streaming-and-logging';
+        return 'start-streaming';
+    }
+    const defaultTimers = {
+        /* Looked up on every call rather than captured, so a test's fake timers,
+           installed after this module loaded, are the ones used. */
+        setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
+        clearTimeout: (handle) => globalThis.clearTimeout(handle),
+        now: () => typeof globalThis.performance?.now === 'function' ? globalThis.performance.now() : Date.now(),
+    };
+    /** An `Error` with a `name`, for the reasons a try is abandoned. */
+    function namedError(name, message) {
+        const e = new Error(message);
+        e.name = name;
+        return e;
+    }
+    /**
+     * Start reconnecting: wait, try, wait longer, try again, until a try succeeds,
+     * {@link AutoReconnectHandle.cancel} is called, or the policy runs out.
+     *
+     * Call it from the client's `onDisconnect`, which reports only a drop the
+     * application did not ask for (see `BaseShimmerClient.onDisconnect`), so a
+     * user's own Disconnect never starts it.
+     *
+     * Each try is abandoned if it overruns {@link ReconnectPolicy.attemptTimeoutMs}:
+     * its signal aborts, {@link AutoReconnectOptions.abandon} is called, and once
+     * the try has unwound (or {@link ReconnectPolicy.settleMs} has passed) the
+     * loop moves on. A try that succeeds after being abandoned has opened a link
+     * nobody wants, so `abandon` is called again with `late: true` to close it.
+     *
+     * The loop sends nothing to the sensor itself. Once `done` resolves
+     * `'connected'`, put back what was running with {@link planStreamResume}.
+     *
+     * ```ts
+     * const handle = startAutoReconnect({
+     *   attempt: () => connectTo(keptDevice),   // no picker: the same BluetoothDevice
+     *   abandon: () => keptDevice.gatt?.disconnect(),
+     *   onAttemptFailed: ({ nextDelayMs }) => show(`retrying in ${nextDelayMs} ms`),
+     * });
+     * cancelButton.onclick = () => handle.cancel();
+     * const { outcome } = await handle.done;
+     * ```
+     */
+    function startAutoReconnect(options) {
+        const policy = resolveReconnectPolicy(options);
+        const timers = options.timers ?? defaultTimers;
+        const started = timers.now();
+        let attempts = 0;
+        let finished = false;
+        let lastError;
+        let inFlight = null;
+        /** Ends the current wait early; set while the loop is waiting. */
+        let wake = null;
+        let resolveDone;
+        const done = new Promise((resolve) => {
+            resolveDone = resolve;
+        });
+        const quietly = (fn) => {
+            try {
+                const r = fn();
+                // A handler that returns a rejected promise must not surface as an
+                // unhandled rejection either.
+                if (r && typeof r.catch === 'function') {
+                    r.catch(() => undefined);
+                }
+            }
+            catch {
+                /* the caller's handler; the loop goes on */
+            }
+        };
+        function finish(outcome) {
+            if (finished)
+                return;
+            finished = true;
+            wake?.();
+            resolveDone({
+                outcome,
+                attempts,
+                ...(lastError !== undefined ? { lastError } : {}),
+                elapsedMs: timers.now() - started,
+            });
+        }
+        /** Wait `ms`, or less if the loop ends meanwhile. */
+        function wait(ms) {
+            return new Promise((resolve) => {
+                if (finished) {
+                    resolve();
+                    return;
+                }
+                const handle = timers.setTimeout(() => {
+                    wake = null;
+                    resolve();
+                }, ms);
+                wake = () => {
+                    timers.clearTimeout(handle);
+                    wake = null;
+                    resolve();
+                };
+            });
+        }
+        function abandon(entry, reason) {
+            if (entry.abandoned)
+                return;
+            entry.abandoned = reason;
+            try {
+                entry.controller.abort(reason === 'timeout'
+                    ? namedError('TimeoutError', `reconnect attempt ${entry.attempt} timed out`)
+                    : namedError('AbortError', 'reconnect cancelled'));
+            }
+            catch {
+                /* an abort listener threw; the try is abandoned regardless */
+            }
+            quietly(() => options.abandon?.({ attempt: entry.attempt, reason, late: false }));
+            entry.promise.then(() => quietly(() => options.abandon?.({ attempt: entry.attempt, reason, late: true })), () => undefined);
+        }
+        async function runAttempt(n) {
+            const controller = new AbortController();
+            let promise;
+            try {
+                promise = Promise.resolve(options.attempt({ attempt: n, signal: controller.signal }));
+            }
+            catch (e) {
+                promise = Promise.reject(e);
+            }
+            const entry = { attempt: n, controller, promise, abandoned: null, interrupt: null };
+            inFlight = entry;
+            const result = await new Promise((resolve) => {
+                const timer = timers.setTimeout(() => resolve({ kind: 'timeout' }), policy.attemptTimeoutMs);
+                entry.interrupt = () => {
+                    timers.clearTimeout(timer);
+                    resolve({ kind: 'interrupted' });
+                };
+                promise.then(() => {
+                    timers.clearTimeout(timer);
+                    resolve({ kind: 'ok' });
+                }, (error) => {
+                    timers.clearTimeout(timer);
+                    resolve({ kind: 'error', error });
+                });
+            });
+            entry.interrupt = null;
+            inFlight = null;
+            if (result.kind === 'interrupted')
+                return { kind: 'error', error: undefined };
+            if (result.kind === 'timeout') {
+                abandon(entry, 'timeout');
+                // Let the abandoned try unwind before the next one, or the next would
+                // meet a link that is still held. Bounded: the premise is that it may
+                // never settle.
+                const settled = promise.then(() => undefined, () => undefined);
+                let settleTimer;
+                await Promise.race([
+                    settled,
+                    new Promise((resolve) => {
+                        settleTimer = timers.setTimeout(resolve, policy.settleMs);
+                        wake = () => {
+                            wake = null;
+                            resolve();
+                        };
+                    }),
+                ]);
+                timers.clearTimeout(settleTimer);
+                wake = null;
+            }
+            return result;
+        }
+        void (async () => {
+            await wait(reconnectDelayMs(policy, 1));
+            for (;;) {
+                if (finished)
+                    return;
+                attempts += 1;
+                const n = attempts;
+                quietly(() => options.onAttempt?.({ attempt: n }));
+                const result = await runAttempt(n);
+                if (finished)
+                    return;
+                if (result.kind === 'ok') {
+                    finish('connected');
+                    return;
+                }
+                const timedOut = result.kind === 'timeout';
+                lastError = timedOut
+                    ? namedError('TimeoutError', `reconnect attempt ${n} did not finish within ${policy.attemptTimeoutMs} ms`)
+                    : result.error;
+                const next = nextReconnectDelayMs(policy, n, timers.now() - started);
+                quietly(() => options.onAttemptFailed?.({ attempt: n, error: lastError, timedOut, nextDelayMs: next }));
+                if (next === null) {
+                    finish('gave-up');
+                    return;
+                }
+                await wait(next);
+            }
+        })().catch((e) => {
+            lastError = e;
+            finish('gave-up');
+        });
+        return {
+            done,
+            cancel() {
+                if (finished)
+                    return;
+                const entry = inFlight;
+                if (entry) {
+                    abandon(entry, 'cancelled');
+                    entry.interrupt?.();
+                }
+                finish('cancelled');
+            },
+            get active() {
+                return !finished;
+            },
+            get attempts() {
+                return attempts;
+            },
+        };
     }
 
     /**
@@ -28339,10 +28709,15 @@
          * - The whole run holds this client's command queue. Nothing else reaches the
          *   sensor until the report ends — which is the truth about the firmware, not
          *   a limitation here: its main loop is blocked for the duration.
-         * - **The ExG chip test cannot pass from the dock.** Shimmer3 firmware prints
-         *   `- FAIL: ADS1292R test will not work from dock` because the dock UART and
-         *   that chip share pins. A FAIL on that line from this transport says nothing
-         *   about the board; run the test over Bluetooth to judge it.
+         * - **On a Shimmer3, the ExG chip test cannot pass from the dock.** Shimmer3
+         *   (MSP430) firmware does not run it there: it prints
+         *   `- FAIL: ADS1292R test will not work from dock` instead, because on that
+         *   board the dock UART and the chip share pins (`hal_FactoryTest.c`,
+         *   `SPI_test()`). A FAIL on that line from this transport says nothing about
+         *   the board; run the test over Bluetooth to judge it. **This is Shimmer3
+         *   only.** A Shimmer3R runs its ExG test (S3R_TEST_0021) normally over USB-C
+         *   and over the dock alike — its ExG SPI3 (PB4/PB5/PG9) and dock USART1
+         *   (PB6/PB7) share no pins — so an ExG FAIL from a Shimmer3R is a real result.
          *
          * @param type 0 MAIN, 1 LEDS, 2 ICS, 3 LED_STATES (`Test/shimmer_test.h:21-27`).
          * @param opts see {@link FactoryTestRunOptions}; `timeoutMs` defaults to the
@@ -39256,11 +39631,48 @@
             addDetail(trimmed);
             return true;
         }
-        // The SD card's CID, printed as one line above the read/write verdict.
-        const card = /^-?\s*Manufacturer\s*:\s*(.+?)\s*,\s*Manufacture Date\s*=\s*(\S+)\s*$/i.exec(trimmed);
+        // The SD card's identity, above its read/write verdict. Shimmer3R firmware
+        // from DEV-1398 prints three lines, Manufacturer, Model and CID
+        // (SHIMMER3R_FACTORY_TEST_REPORT.md §5.5); older firmware prints only the
+        // first, with the card's size run into the name ("SanDisk7.45GB").
+        const card = /^-?\s*Manufacturer\s*:\s*(.*?)\s*,\s*Manufacture Date\s*=\s*(\S+)\s*$/i.exec(trimmed);
         if (card) {
-            put('sd_manufacturer', card[1]);
+            const runOn = /^(.*?)(\d+\.\d{2})GB$/.exec(card[1]);
+            put('sd_manufacturer', runOn ? runOn[1] : card[1]);
+            if (runOn)
+                put('sd_size_gb', Number(runOn[2]));
             put('sd_manufacture_date', card[2]);
+            addDetail(trimmed);
+            return true;
+        }
+        // "matches <brand> <part>" when the firmware recognises the card, else
+        // "not recognised". "matches" is all it claims: several brands sell other
+        // makers' cards, so a generic CID can fit more than one part.
+        const model = /^-?\s*Model\s*:\s*(?:matches\s+(.+?)|(not recognised))\s*$/i.exec(trimmed);
+        if (model) {
+            put('sd_model_recognised', model[1] !== undefined);
+            if (model[1] !== undefined)
+                put('sd_model', model[1]);
+            addDetail(trimmed);
+            return true;
+        }
+        // The CID register. OID is 2 characters and PNM 5, or "0x" and their bytes in
+        // hex when one is unprintable, so each is matched by width: PNM may hold a
+        // space or a comma.
+        const cid = /^-?\s*CID\s*:\s*MID=0x([0-9A-F]{2}),\s*OID=(0x[0-9A-F]{4}|.{2}),\s*PNM=(0x[0-9A-F]{10}|.{5}),\s*PRV=(\d+\.\d+),\s*PSN=0x([0-9A-F]{1,8}),\s*Size=([\d.]+)GB\s*$/i.exec(trimmed);
+        if (cid) {
+            put('sd_cid_available', true);
+            put('sd_mid', parseInt(cid[1], 16));
+            put('sd_oid', cid[2]);
+            put('sd_pnm', cid[3]);
+            put('sd_prv', cid[4]);
+            put('sd_psn', parseInt(cid[5], 16));
+            put('sd_size_gb', Number(cid[6]));
+            addDetail(trimmed);
+            return true;
+        }
+        if (/^-?\s*CID\s*:\s*unavailable\b/i.test(trimmed)) {
+            put('sd_cid_available', false);
             addDetail(trimmed);
             return true;
         }
@@ -39455,6 +39867,7 @@
     exports.DATA_RATE_LABELS = DATA_RATE_LABELS;
     exports.DATA_RATE_OPTIONS = DATA_RATE_OPTIONS;
     exports.DEBUG_COMMAND_ID = DEBUG_COMMAND_ID;
+    exports.DEFAULT_RECONNECT_POLICY = DEFAULT_RECONNECT_POLICY;
     exports.DEFAULT_TRIAL_NAME = DEFAULT_TRIAL_NAME;
     exports.DERIVED_GYRO_ON_THE_FLY_CAL = DERIVED_GYRO_ON_THE_FLY_CAL;
     exports.EVENT_CHANNEL = EVENT_CHANNEL;
@@ -40013,6 +40426,7 @@
     exports.msToRtcBytesLE = msToRtcBytesLE;
     exports.nearestUserButtonEnable = nearestUserButtonEnable;
     exports.nextAvailableDuplicateFileName = nextAvailableDuplicateFileName;
+    exports.nextReconnectDelayMs = nextReconnectDelayMs;
     exports.normalizeBytePayload = normalizeBytePayload;
     exports.normalizeOperationalConfig = normalizeOperationalConfig;
     exports.nudgeGsrResistance = nudgeGsrResistance;
@@ -40073,11 +40487,13 @@
     exports.parseVerisenseFactoryTestReport = parseVerisenseFactoryTestReport;
     exports.parseVersionInfo = parseVersionInfo;
     exports.patchSecureDfuSendOperation = patchSecureDfuSendOperation;
+    exports.planStreamResume = planStreamResume;
     exports.promiseWithTimeout = promiseWithTimeout;
     exports.readExgField = readExgField;
     exports.readExgKnobs = readExgKnobs;
     exports.readInfoMemFieldValue = readInfoMemFieldValue;
     exports.readVerisenseOperationalFieldValue = readVerisenseOperationalFieldValue;
+    exports.reconnectDelayMs = reconnectDelayMs;
     exports.recordsAudioFingerprint = recordsAudioFingerprint;
     exports.recordsButtonPresses = recordsButtonPresses;
     exports.recordsRawAudio = recordsRawAudio;
@@ -40088,6 +40504,7 @@
     exports.resolveFieldIndex = resolveFieldIndex;
     exports.resolveHardwarePpgSupport = resolveHardwarePpgSupport;
     exports.resolveInfoMemLayout = resolveInfoMemLayout;
+    exports.resolveReconnectPolicy = resolveReconnectPolicy;
     exports.resolveVerisenseSensorRateFieldKey = resolveVerisenseSensorRateFieldKey;
     exports.respirationPhaseOptions = respirationPhaseOptions;
     exports.runIf820OtaUpdate = runIf820OtaUpdate;
@@ -40132,6 +40549,7 @@
     exports.soundLevelSupportedByReadback = soundLevelSupportedByReadback;
     exports.splitAudioMode = splitAudioMode;
     exports.splitButtonMode = splitButtonMode;
+    exports.startAutoReconnect = startAutoReconnect;
     exports.statusPayloadBytesFor = statusPayloadBytesFor;
     exports.summariseExgBanks = summariseExgBanks;
     exports.summariseExgCalibration = summariseExgCalibration;

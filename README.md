@@ -75,10 +75,14 @@ those controls out rather than guessing. It does have a clock write, so
 setting the clock works over all three links, and it has a test command, so the
 self-test runs over all three too.
 
-\*\* Over the dock the ExG chip test reports FAIL, because that connection and
-the chip share pins and the firmware says so in the report itself. That is the
-docked test, not the board — run the self-test over Bluetooth to judge an ExG
-expansion board.
+\*\* **On a Shimmer3 only**, the ExG chip test reports FAIL over the dock,
+because on that board the dock connection and the chip share pins, and the
+firmware says so in the report itself instead of running the test. That is the
+docked test, not the board — run the self-test over Bluetooth to judge a
+Shimmer3's ExG expansion board. A Shimmer3R has no such limit: its ExG test
+runs normally over USB-C and over the dock, so an ExG FAIL from a Shimmer3R is
+a real result. The page's note beside the self-test says which applies once
+the sensor has identified itself.
 
 \*\*\* **The throughput test is Bluetooth-only**, and for the same command-set
 reason: the dock protocol has no data-rate test in it, so there is nothing over USB-C for the
@@ -94,6 +98,53 @@ paired, so the sensor must already be paired with this host and you pick the
 port rather than the device. A Shimmer3R pairs as two separate entries — one
 classic, one BLE — and only the classic one answers on this path; the page says
 so if you pick the wrong one.
+
+### Reconnecting automatically
+
+**Reconnect automatically**, at the end of the Link CRC row (its tooltip says
+what it does), is on by default; turning it off is remembered in this browser
+(DEV-1483). With it on, a BLE or Classic Bluetooth link that the sensor drops (out of range,
+switched off) is reconnected without the device or port picker, and a stream
+that was running starts again:
+
+- **No picker.** The page keeps the `BluetoothDevice` (BLE) or the serial port
+  (Classic) it was given and connects to the same one again. Reopening the
+  port is what brings the RFCOMM link back.
+- **When.** 1 s after the drop, then after 2, 4, 8 and 15 s, and every 15 s
+  after that, until it connects or you press **Cancel** on the banner. Each
+  try has 30 s; on Windows a BLE connect to a sensor out of range can
+  otherwise wait forever. The connect buttons are held meanwhile.
+- **What comes back.** The page runs its usual connect sequence, then restarts
+  the stream. The firmware stops the stream when the link drops but keeps an SD
+  log going, so a stream with SD logging comes back as a plain stream while the
+  log is still running, and as stream and log only if the sensor says the log
+  ended too (it was switched off and on). The SDK's `planStreamResume` makes
+  that call.
+- **What doesn't.** Samples sent while the link was down are lost; the card has
+  them if it was logging. A CSV recording is closed when the link drops, as
+  before, and a new one needs a click, because the file picker does. A page
+  reload loses the device, so there is no reconnect across one.
+- **What it leaves alone.** USB, your own Disconnect, and the drops the
+  Bluetooth module update causes and handles itself.
+
+Checked against the mock (below); a real sensor walked out of range has not
+been run yet. On a Shimmer3 with an RN4678 at v1.23, a Classic reconnect while
+it logs can leave it ignoring Bluetooth until it is power-cycled (DEV-1384).
+
+### The strip at the top
+
+Scroll the connect buttons and the Device card out of view and a slim strip
+slides in at the top of the window, as in the Verisense console (DEV-1485). It
+repeats what they say:
+
+- the link, in the same colour as the pill under the buttons;
+- the sensor's name and battery;
+- what it is doing for this page: streaming, SD logging, recording;
+- while an automatic reconnect runs, its line, with the wait before the next try.
+
+On a phone it keeps the link, the name and a reconnect, and drops the rest.
+It is for looking at only, and screen readers skip it, since it repeats the
+fields above.
 
 ## General
 
@@ -731,9 +782,10 @@ is the only way out early. The LED suites are meant to be watched — each line
 names the LED that should be lit at that moment.
 
 Over the USB-C/dock link the test runs through the dock protocol's own test
-command. One line comes out differently there: the ExG chip test reports FAIL
-from the dock, because that connection and the chip share pins. That is the
-docked test, not the board.
+command. On a Shimmer3 one line comes out differently there: the ExG chip test
+reports FAIL from the dock, because on that board the dock connection and the
+chip share pins. That is the docked test, not the board. A Shimmer3R runs the
+ExG test normally over USB-C and over the dock, so there a FAIL is real.
 
 **The clock-drift monitor** samples the sensor's real-world clock against this
 host's on an interval and least-squares fits the slope in ppm, with a plot, a
@@ -848,7 +900,9 @@ dropped link. `mockTransport.factoryTest` reports how many self-tests have run,
 whether one is still printing and exactly what text it printed;
 `mockTransport.rtc` exposes the sensor's own running clock.
 `mockTransport.status` docks and undocks it (`setDocked`) and says whether it
-logs (`logging`). Setting `nackRefusedLogStart` makes it refuse a log start it
+logs (`logging`). `window.mockRefuseConnects = n` makes the next n connects
+fail, as a sensor still out of range does, so the automatic reconnect's retries
+can be watched. Setting `nackRefusedLogStart` makes it refuse a log start it
 cannot carry out, as firmware that says so does, and `setQuietly({ sdBadFile })`
 changes the card without telling the page. The panels
 themselves are `factoryTestPanel` and `rtcDriftPanel`, beside `sdBrowser`,
