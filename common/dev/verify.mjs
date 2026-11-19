@@ -8005,11 +8005,23 @@ const brIdle = await evaluate(`${BR}
   const titleRow = fresh.closest('.device-panel-title');
   const freshWas = fresh.textContent;
   fresh.textContent = 'inferred 23:59:59, unconfirmed';
-  const crowded = {
+  /* Measured as laid out, and again with the row 40px narrower, which stands
+     in for fonts wider than this machine's: CI's Linux fonts set this row
+     about 17% wider than Windows does, and a check that only passes on the
+     fonts it was written on is how it first failed there. */
+  const measure = () => ({
     overflow: titleRow.scrollWidth - titleRow.clientWidth,
     rowH: Math.round(titleRow.getBoundingClientRect().height),
+    noteH: Math.round(fresh.getBoundingClientRect().height),
     buttonH: Math.round($('btnRefreshDevice').getBoundingClientRect().height),
-  };
+    shown: fresh.offsetParent !== null,
+  });
+  const crowded = { asLaidOut: measure() };
+  titleRow.style.boxSizing = 'border-box';
+  titleRow.style.width = (titleRow.getBoundingClientRect().width - 40) + 'px';
+  crowded.narrower = measure();
+  titleRow.style.width = '';
+  titleRow.style.boxSizing = '';
   fresh.textContent = freshWas;
   await sleep(${BATT_MS} - 600);
   const early = vbatt() - atConnect;
@@ -8040,8 +8052,13 @@ check(
 );
 check(
   "and the freshness note at its longest wraps in that row instead of pushing Refresh out",
-  brIdle.crowded.overflow === 0 &&
-    brIdle.crowded.rowH <= brIdle.crowded.buttonH + 1,
+  [brIdle.crowded.asLaidOut, brIdle.crowded.narrower].every(
+    (m) =>
+      m.shown &&
+      m.overflow === 0 &&
+      m.rowH <= m.buttonH + 1 &&
+      m.noteH <= m.rowH,
+  ),
   JSON.stringify(brIdle.crowded),
 );
 check(

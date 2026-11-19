@@ -217,16 +217,31 @@
 
          It may wrap, right-aligned, within that height. Since the battery
          auto-refresh's list joined the row (DEV-1512), its longest form
-         ("inferred 15:07:40, unconfirmed") no longer fits on one line in a
-         1366px-wide window, and kept on one line it pushed Refresh out of the
-         panel. Two lines at this size are shorter than the button. */
+         ("inferred 15:07:40, unconfirmed") no longer fits on one line, and
+         kept on one line it pushed Refresh out of the panel. So it gives way
+         instead: at most three lines, which at this size are shorter than the
+         button, broken mid-word and cut with an ellipsis only when even that
+         is too narrow, as it is on CI's wider Linux fonts. Its tooltip says
+         the whole of it anyway. `display` is set for the line clamp, so
+         `hidden` has to be restated. */
       .device-panel-title .status-fresh {
         margin-left: auto;
+        min-width: 0;
         font-size: 11px;
         font-weight: 400;
         line-height: 1.15;
         text-align: right;
         color: var(--faint);
+        overflow-wrap: anywhere;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 3;
+        line-clamp: 3;
+        overflow: hidden;
+      }
+
+      .device-panel-title .status-fresh[hidden] {
+        display: none;
       }
 
       /* The battery auto-refresh's interval (DEV-1512), as compact as the
