@@ -8224,6 +8224,85 @@ check(
   JSON.stringify(brResume),
 );
 
+/* A link where every read fails: on the bench a Shimmer3 whose replies failed
+   their link CRC gave one warning per poll for as long as it stayed
+   connected. The poll logs the first failure only, until a read succeeds.
+   The client's getBattery is shadowed to refuse, as the mock's own comment
+   suggests for a link that cannot do something. */
+await goto(`${BASE}?mock=1&battMs=400`);
+const brFail = await evaluate(`${BR}
+  $('btnMock').click();
+  await until(() => logHas(/mock sensor connected/), 8000);
+  await until(() => !$('btnRefreshDevice').disabled, 3000);
+  const c = window.mockClient;
+  const own = Object.prototype.hasOwnProperty.call(c, 'getBattery');
+  const real = c.getBattery;
+  let calls = 0;
+  const fail = () => {
+    c.getBattery = async () => { calls++; throw new Error('NACK (mock)'); };
+  };
+  const heal = () => { if (own) c.getBattery = real; else delete c.getBattery; };
+  const refused = () => logCount(/refused "read the battery"/);
+  const notes = () => logCount(/logs nothing more until a read succeeds/);
+  const now = () => logCount(/battery now/);
+  const snap = () => ({ calls, refused: refused(), notes: notes(), now: now() });
+
+  fail();
+  await until(() => calls >= 3, 4000);
+  await sleep(100);
+  const failing = snap();
+
+  /* Refresh's read was asked for, so it warns every time, and its failure
+     does not end the run: the polls stay quiet after it. */
+  await until(() => !$('btnRefreshDevice').disabled, 2000);
+  const r0 = calls;
+  $('btnRefreshDevice').click();
+  await until(() => calls > r0 && !$('btnRefreshDevice').disabled, 3000);
+  const r1 = calls;
+  await until(() => calls >= r1 + 2, 3000);
+  await sleep(100);
+  const afterRefresh = snap();
+
+  heal();
+  const v0 = vbatt();
+  await until(() => vbatt() > v0, 3000);
+  await sleep(100);
+  const healed = snap();
+
+  fail();
+  const f0 = calls;
+  await until(() => calls >= f0 + 2, 3000);
+  await sleep(100);
+  const again = snap();
+
+  heal();
+  $('btnDisconnect').click();
+  await sleep(800);
+  try { localStorage.removeItem('${BATT_KEY}'); } catch {}
+  return { failing, afterRefresh, healed, again };
+`);
+check(
+  "a poll's read that keeps failing is logged once, not once per poll",
+  brFail.failing.calls >= 3 &&
+    brFail.failing.refused === 1 &&
+    brFail.failing.notes === 1,
+  JSON.stringify(brFail.failing),
+);
+check(
+  "Refresh's own failed read still warns, and the polls after it stay quiet",
+  brFail.afterRefresh.refused === 2 && brFail.afterRefresh.notes === 1,
+  JSON.stringify(brFail.afterRefresh),
+);
+check(
+  "a read that succeeds logs the reading, and the next failure is logged again",
+  brFail.healed.now === brFail.afterRefresh.now + 1 &&
+    brFail.healed.notes === 1 &&
+    brFail.again.calls >= brFail.healed.calls + 2 &&
+    brFail.again.refused === 3 &&
+    brFail.again.notes === 2,
+  `${JSON.stringify(brFail.healed)} → ${JSON.stringify(brFail.again)}`,
+);
+
 // ===========================================================================
 console.log("\n--- console ---");
 check(

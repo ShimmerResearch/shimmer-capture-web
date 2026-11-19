@@ -167,7 +167,9 @@ stale with nothing to say so. Hover over the reading to see when it was read.
   Refresh still reads the status flags and the clock as well. The first read
   comes one interval after connecting, because connecting has just read it.
 - **The log.** A read adds a line only when the percentage or the charger state
-  changes, or when it fails.
+  changes. A failed read adds a warning, and further failures add nothing
+  until a read succeeds, which logs the reading. So a link that keeps failing
+  is not reported every interval. Refresh's own read still warns every time.
 
 Checked against the mock; a real sensor docked and undocked over a minute has
 not been run yet.

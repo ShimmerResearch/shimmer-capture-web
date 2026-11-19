@@ -2405,12 +2405,17 @@
        *
        * @param {string} what user-facing name of the operation
        * @param {() => Promise<unknown>} fn
-       * @param {{quiet?: boolean, tolerate?: boolean}} [opts]
+       * @param {{quiet?: boolean, tolerate?: boolean,
+       *   onFailure?: (message: string) => void}} [opts]
        *   `quiet` skips the success log line; `tolerate` downgrades a failure to
-       *   a warning and resolves with undefined instead of rejecting
+       *   a warning and resolves with undefined instead of rejecting; with
+       *   `tolerate`, `onFailure` takes the failure's message in place of that
+       *   warning, for a caller that decides itself what to log
        * @returns {Promise<unknown>}
        */
       async function withDevice(what, fn, opts = {}) {
+        const tolerated = (message) =>
+          opts.onFailure ? opts.onFailure(message) : log.warn(message);
         if (!client) {
           /* A tolerated read is a diagnostic, and the connect hook runs them
              across many awaits - so reaching here usually means the link went
@@ -2418,7 +2423,7 @@
              sensor first" would be untrue, and one toast per remaining read
              buries the real event. Say what happened, in the log, once each. */
           if (opts.tolerate) {
-            log.warn(`${what}: the link dropped before this could run`);
+            tolerated(`${what}: the link dropped before this could run`);
           } else {
             showToast("Connect a sensor first", "warn");
           }
@@ -2437,7 +2442,7 @@
         } catch (err) {
           const message = humanError(what, err);
           if (opts.tolerate) {
-            log.warn(message);
+            tolerated(message);
             return undefined;
           }
           log.error(message);
@@ -2449,9 +2454,13 @@
         }
       }
 
-      /** withDevice for a best-effort read: never rejects, never toasts. */
-      function tryDevice(what, fn) {
-        return withDevice(what, fn, { tolerate: true, quiet: true });
+      /**
+       * withDevice for a best-effort read: never rejects, never toasts.
+       *
+       * @param {{onFailure?: (message: string) => void}} [opts] see withDevice
+       */
+      function tryDevice(what, fn, opts = {}) {
+        return withDevice(what, fn, { ...opts, tolerate: true, quiet: true });
       }
 
       // =====================================================================
@@ -2791,19 +2800,32 @@
        * reading. A failed read leaves the last value and its time, which is
        * then the honest description of what is on screen.
        *
-       * @param {{fromPoll?: boolean}} [opts] `fromPoll` logs the reading when
-       *   it differs from the last one shown, since the poll's own SDK status
-       *   lines are kept out of the log
+       * @param {{fromPoll?: boolean,
+       *   onFailure?: (message: string) => void}} [opts] `fromPoll` logs the
+       *   reading when it differs from the last one shown, or is the first
+       *   since the poll's reads started failing, since the poll's own SDK
+       *   status lines are kept out of the log. `onFailure` takes a failure's
+       *   message in place of the usual warning (withDevice).
        * @returns {Promise<object|undefined>} the reading, or undefined when
        *   the read failed or the link was not free
        */
-      async function readBatteryIntoPanel({ fromPoll = false } = {}) {
-        const batt = await tryDevice("read the battery", () =>
-          typeof client.getBattery === "function"
-            ? client.getBattery()
-            : client.getStatus(),
+      async function readBatteryIntoPanel({
+        fromPoll = false,
+        onFailure,
+      } = {}) {
+        const batt = await tryDevice(
+          "read the battery",
+          () =>
+            typeof client.getBattery === "function"
+              ? client.getBattery()
+              : client.getStatus(),
+          { onFailure },
         );
         if (!batt) return undefined;
+        /* Any read that succeeds, Refresh's included, ends a run of failed
+           polls: the next failure is news again (batteryRefreshTick). */
+        const recovered = batteryRefresh.failed !== null;
+        batteryRefresh.failed = null;
         const label = batteryLabel(batt);
         setIdentity({ idBatt: label });
         $("idBatt").title = `Read at ${clockTime(Date.now())}`;
@@ -2815,7 +2837,8 @@
         };
         if (
           fromPoll &&
-          (!lastBattery ||
+          (recovered ||
+            !lastBattery ||
             reading.pct !== lastBattery.pct ||
             reading.charger !== lastBattery.charger)
         ) {
@@ -6957,6 +6980,12 @@
         skipLogged: null,
         /** True while a poll's own read runs: its SDK status lines are dropped. */
         muted: false,
+        /**
+         * While the poll's reads have failed since the last read that
+         * succeeded, the latest failure's message; null otherwise. Only the
+         * first failure of such a run is logged.
+         */
+        failed: null,
       };
 
       /**
@@ -6986,6 +7015,7 @@
       /** Called at the end of the connect sequence. */
       function startBatteryRefresh() {
         batteryRefresh.armed = true;
+        batteryRefresh.failed = null;
         scheduleBatteryRefresh();
       }
 
@@ -7024,10 +7054,31 @@
         batteryRefresh.skipLogged = null;
         batteryRefresh.muted = true;
         try {
-          await readBatteryIntoPanel({ fromPoll: true });
+          await readBatteryIntoPanel({
+            fromPoll: true,
+            onFailure: noteBatteryRefreshFailure,
+          });
         } finally {
           batteryRefresh.muted = false;
         }
+      }
+
+      /**
+       * A poll's read failed. Logged the first time only, until a read
+       * succeeds: a link that keeps failing (a Shimmer3 whose replies fail
+       * their CRC, one streaming behind the page's back) would otherwise add a
+       * warning every interval for as long as it stays connected. The
+       * recovery is logged as the reading (readBatteryIntoPanel). Connect's
+       * and Refresh's reads still warn every time: someone asked for those.
+       */
+      function noteBatteryRefreshFailure(message) {
+        if (batteryRefresh.failed === null) {
+          const said = /\.$/.test(message) ? message : `${message}.`;
+          log.warn(
+            `${said} The battery auto-refresh keeps trying, and logs nothing more until a read succeeds.`,
+          );
+        }
+        batteryRefresh.failed = message;
       }
 
       /**
