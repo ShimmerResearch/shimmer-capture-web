@@ -2875,6 +2875,13 @@ await goto(`${BASE}?mock=1&rate=1024`);
 const tapBytes = await evaluate(`
   const chk = document.getElementById('chkRawBytes');
   chk.checked = true; chk.dispatchEvent(new Event('change'));
+  /* The pass's link CRC, as CONNECT sets it: the CRC trailer is part of what
+     the tap has to show, so VERIFY_CRC=0 has to reach this section too. */
+  const crcSel = document.getElementById('crcMode');
+  if (crcSel && !crcSel.disabled) {
+    crcSel.value = '${CRC_MODE}';
+    crcSel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
   document.getElementById('btnMock').click();
   for (let i = 0; i < 80 && !document.getElementById('rateHelper'); i++)
     await new Promise(r => setTimeout(r, 100));
@@ -2904,6 +2911,72 @@ check(
   tapBytes.rxCount >= tapBytes.tx.length - 1 &&
     /^RX ff /.test(tapBytes.firstRx),
   `${tapBytes.rxCount} RX lines, first ${tapBytes.firstRx}`,
+);
+
+/* DEV-1519: the tap used to stop every line at 32 bytes, so a 128-byte
+   InfoMem page -- 131 bytes with its ACK and header, 133 with a 2-byte CRC --
+   was logged as its first 32 and "… +101 of 133", and the CRC trailer never
+   appeared at all. Long traffic in both directions, each line compared with
+   what actually crossed the link: the InfoMem page read, then written back
+   unchanged (132 bytes out), then the calibration dump in 128-byte chunks. */
+const tapLong = await evaluate(`
+  const mt = window.mockTransport;
+  const client = window.mockClient;
+  const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join(' ');
+  const sent = [];
+  const ownNotify = Object.prototype.hasOwnProperty.call(mt, 'notify');
+  const realNotify = mt.notify;
+  mt.notify = function (data) {
+    sent.push('RX ' + hex(data instanceof Uint8Array ? data : new Uint8Array(data)));
+    return realNotify.call(this, data);
+  };
+  const writesBefore = mt.writes.length;
+  document.getElementById('btnLogClear').click();
+  let error = null;
+  try {
+    const page = await client.readInfoMem(0, 128);
+    await client.writeInfoMem(0, page);
+    await client.readCalibDump();
+  } catch (e) {
+    error = String(e?.message ?? e);
+  } finally {
+    if (ownNotify) mt.notify = realNotify;
+    else delete mt.notify;
+  }
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const strip = sel => [...document.querySelectorAll(sel)]
+    .map(l => l.textContent.replace(/^\\S+ \\S+ /, ''));
+  const tx = strip('#log .log-line.sev-tx');
+  const rx = strip('#log .log-line.sev-rx');
+  const width = l => l.split(' ').length - 1;
+  const infoMem = rx.find(l => /^RX ff 8d 80 /.test(l)) ?? '';
+  return {
+    error, crc: client.crcMode,
+    tx, rx,
+    wrote: mt.writes.slice(writesBefore).map(w => 'TX ' + hex(w.bytes)),
+    // Data packets are the tap's to leave out; nothing else is.
+    sent: sent.filter(l => !/^RX 00 /.test(l)),
+    infoMemBytes: width(infoMem), infoMemTail: infoMem.slice(-17),
+    longestTx: Math.max(0, ...tx.map(width)),
+    longestRx: Math.max(0, ...rx.map(width)),
+    elided: tx.concat(rx).filter(l => l.includes('…')).length,
+  };
+`);
+check(
+  "a reply longer than 32 bytes is logged whole, CRC trailer included, and so is a long command",
+  tapLong.error === null &&
+    tapLong.crc === Number(CRC_MODE) &&
+    tapLong.elided === 0 &&
+    tapLong.infoMemBytes === 131 + tapLong.crc &&
+    tapLong.longestRx > 32 &&
+    tapLong.longestTx === 132 &&
+    tapLong.rx.length > 2 &&
+    tapLong.rx.join("|") === tapLong.sent.join("|") &&
+    tapLong.tx.join("|") === tapLong.wrote.join("|"),
+  tapLong.error ??
+    `InfoMem page ${tapLong.infoMemBytes} bytes on CRC ${tapLong.crc} ` +
+      `(ends ${tapLong.infoMemTail}), ${tapLong.rx.length} RX lines up to ` +
+      `${tapLong.longestRx} bytes, ${tapLong.tx.length} TX up to ${tapLong.longestTx}`,
 );
 
 const tapStream = await evaluate(`
