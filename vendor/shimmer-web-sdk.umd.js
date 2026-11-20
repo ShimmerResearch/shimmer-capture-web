@@ -13,7 +13,7 @@
      * from it by the Bump step in cut-release.yml — the release bumps this file
      * as well as package.json, so a published bundle reports its own version.
      */
-    const SDK_VERSION = '0.5.20';
+    const SDK_VERSION = '0.5.22';
 
     /**
      * Container for a single decoded sensor frame.
@@ -15136,9 +15136,11 @@
      * Wire protocol for Shimmer3R SD-card file transfer over BLE.
      *
      * Mirrors the firmware implementation in
-     * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.011;
-     * v1.01.009/.010 speak the protocol but corrupt every block — see
-     * Shimmer3RClient.supportsSdTransfer).
+     * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}`, which only the
+     * Shimmer3R build serves: LogAndStream_Shimmer3R v1.01.011 and later
+     * (v1.01.009/.010 speak the protocol but corrupt every block), and no
+     * Shimmer3 release — see SD_TRANSFER_MIN_FIRMWARE and
+     * Shimmer3RClient.supportsSdTransfer.
      *
      * Command/response shapes (all multi-byte fields little-endian):
      *
@@ -15156,6 +15158,30 @@
      *   data:   [0x8A][0xC5][sessionId][seq u16][len u16][payload…][crc16 u16]
      *   status: [0x8A][0xC6][sessionId][status][nextOffset u32][crc16 u16]
      */
+    /**
+     * The first LogAndStream release of each generation that serves the SD
+     * file-transfer commands and transfers files intact; null where no release
+     * does. The two generations number their releases separately, so a version
+     * means nothing without the generation beside it.
+     *
+     * - **Shimmer3R: v1.01.011.** v1.01.009 and v1.01.010 serve the commands but
+     *   ship every 512-byte block shifted 3 bytes, with a zero-padded tail. The
+     *   STM32U5's SDMMC IDMA ignores the two low address bits, so each sector
+     *   landed 3 bytes below the misaligned payload buffer, and the frame CRC,
+     *   computed afterwards, covered the damage. Fixed by word-aligning the buffer
+     *   (log-and-stream-common `679f94c`).
+     * - **Shimmer3: none.** The Shimmer3 build compiles the transfer module as
+     *   empty stubs, and every SD opcode in the shared command parser sits inside
+     *   `#if defined(SHIMMER3R)` (`Comms/shimmer_bt_uart.c`). That has held since
+     *   the feature landed (`71d283f`), through LogAndStream_Shimmer3 v1.01.009.
+     *
+     * Firmware without the commands ignores them rather than refusing them, so
+     * this table is the only way a host can tell.
+     */
+    const SD_TRANSFER_MIN_FIRMWARE = {
+        shimmer3r: { major: 1, minor: 1, patch: 11 },
+        shimmer3: null,
+    };
     const SD_TRANSFER_OPCODES = {
         // Command opcodes must avoid the CYW20820 EZ-Serial SOF bytes 0x80/0xC0/
         // 0xD0 (the firmware's UART RX demux would route them to the EZ-Serial
@@ -15181,8 +15207,9 @@
         SD_UNAVAILABLE: 0xf0,
         BUSY: 0xf1,
         BAD_ARGS: 0xf2,
-        /** Host-side only, never on the wire: the connected firmware's version is
-         * below the transfer gate (see Shimmer3RClient.supportsSdTransfer). */
+        /** Host-side only, never on the wire: the connected sensor does not pass the
+         * transfer gate — a Shimmer3, or Shimmer3R firmware before v1.01.011 (see
+         * Shimmer3RClient.supportsSdTransfer). */
         UNSUPPORTED_FW: 0xff,
     };
     /** Codes carried in SD_FILE_STATUS_RESPONSE frames. */
@@ -15226,7 +15253,7 @@
             case SD_STATUS.BAD_ARGS:
                 return 'bad arguments';
             case SD_STATUS.UNSUPPORTED_FW:
-                return 'firmware too old for SD file transfer (update required)';
+                return 'this sensor or its firmware cannot transfer SD files (a Shimmer3, or Shimmer3R firmware before v1.01.011)';
             default:
                 return `FatFs error ${status}`;
         }
@@ -20146,7 +20173,8 @@
                 this._keepAliveRun = run;
             };
             // ---------------------------------------------------------------------------
-            // SD-card file transfer (FW >= v1.01.011; see supportsSdTransfer)
+            // SD-card file transfer (Shimmer3R FW >= v1.01.011, never a Shimmer3; see
+            // supportsSdTransfer)
             //
             // A dedicated, self-resynchronising RX pipeline: while any SD operation is
             // active, a persistent temp handler accumulates notification chunks and
@@ -24973,24 +25001,66 @@
             return this._fwVersionCache;
         }
         /**
-         * True when the connected firmware serves the SD file-transfer commands
-         * AND transfers them intact (LogAndStream_Shimmer3R >= v1.01.011).
-         * v1.01.009 and v1.01.010 implement the protocol but ship every 512-byte
-         * block shifted 3 bytes with a zero-padded tail — the firmware's sector DMA
-         * landed below the misaligned payload buffer and the frame CRC was computed
-         * after the fact, so the corruption arrives as valid frames the host cannot
-         * detect. Those versions are therefore gated out. Firmware older than that
-         * silently ignores unknown opcodes, so version gating is the only reliable
-         * probe.
+         * True when the connected sensor serves the SD file-transfer commands AND
+         * transfers files intact. That takes the generation as well as the version,
+         * because the Shimmer3 and the Shimmer3R number their LogAndStream releases
+         * separately ({@link SD_TRANSFER_MIN_FIRMWARE} has the reasons):
+         *
+         * - **Shimmer3R:** LogAndStream_Shimmer3R v1.01.011 or later. v1.01.009 and
+         *   v1.01.010 serve the commands but shift every 512-byte block 3 bytes, and
+         *   the frame CRC covers the damage, so nothing on the host could detect it.
+         * - **Shimmer3:** never. No LogAndStream_Shimmer3 release serves the
+         *   commands, and it must not be sent them: its parser skips an unknown
+         *   opcode a byte at a time and reads the arguments behind it as commands.
+         * - **Hardware this SDK does not recognise:** never.
+         *
+         * Reads the hardware version ({@link readDeviceVersion}) and, on a
+         * Shimmer3R, the firmware version ({@link readFwVersion}); both are cached
+         * for the connection, so this costs at most two round trips once. False when
+         * either read fails. Firmware without the commands ignores them rather than
+         * refusing them, so the versions are the only reliable probe.
          */
         async supportsSdTransfer() {
+            return (await this._sdTransferRefusal()) === null;
+        }
+        /**
+         * Why {@link supportsSdTransfer} answers false, as a sentence for the error
+         * the SD entry points throw; null when it answers true.
+         */
+        async _sdTransferRefusal() {
+            let hardwareVersion;
             try {
-                const v = await this.readFwVersion();
-                return v.major * 1000000 + v.minor * 1000 + v.patch >= 1001011;
+                hardwareVersion = (await this.readDeviceVersion()).hardwareVersion;
             }
             catch {
-                return false;
+                return 'SD file transfer was refused: the sensor did not report its hardware version, and only Shimmer3R firmware serves it';
             }
+            const generation = generationFromHardwareVersion(hardwareVersion);
+            if (generation === null) {
+                return `SD file transfer is served only by Shimmer3R firmware, and this sensor reports hardware version ${hardwareVersion}`;
+            }
+            const name = generation === 'shimmer3r' ? 'Shimmer3R' : 'Shimmer3';
+            const min = SD_TRANSFER_MIN_FIRMWARE[generation];
+            if (min === null) {
+                return `A ${name} cannot transfer SD files over Bluetooth: no LogAndStream_${name} release serves the file-transfer commands`;
+            }
+            let fw;
+            try {
+                fw = await this.readFwVersion();
+            }
+            catch {
+                return 'SD file transfer was refused: the sensor did not report its firmware version';
+            }
+            const code = (v) => v.major * 1000000 + v.minor * 1000 + v.patch;
+            if (code(fw) >= code(min))
+                return null;
+            // LogAndStream_Shimmer3R v1.01.009 first served the commands, corrupting them
+            const servesButCorrupts = generation === 'shimmer3r' && code(fw) >= 1001009;
+            return (`SD file transfer requires LogAndStream_${name} ${firmwareTag(min.major, min.minor, min.patch)} or later, ` +
+                `and this sensor runs ${firmwareTag(fw.major, fw.minor, fw.patch)}` +
+                (servesButCorrupts
+                    ? ': v1.01.009 and v1.01.010 serve it but corrupt every block they send'
+                    : ', which does not serve it'));
         }
         /**
          * Measure raw link throughput with the firmware's data-rate test
@@ -25485,16 +25555,18 @@
         }
         /**
          * Enforce the {@link supportsSdTransfer} gate on every SD entry point, so a
-         * caller that skips the advisory check cannot pull silently-corrupted data
-         * off a v1.01.009/.010 device. Must complete BEFORE the synchronous
-         * single-slot checks (`_sdExpect`, `_sdFrameListener`): those are
-         * check-then-set atomically only while no await sits between them.
-         * (The first call costs one GET_FW_VERSION round trip; readFwVersion
-         * caches it for the rest of the connection.)
+         * caller that skips the advisory check can neither pull silently-corrupted
+         * data off a Shimmer3R at v1.01.009/.010 nor send SD commands to a Shimmer3,
+         * which would read their arguments as commands of its own. Must complete
+         * BEFORE the synchronous single-slot checks (`_sdExpect`,
+         * `_sdFrameListener`): those are check-then-set atomically only while no
+         * await sits between them. (The first call costs a GET_DEVICE_VERSION and a
+         * GET_FW_VERSION round trip; both are cached for the rest of the connection.)
          */
         async _ensureSdTransferSupported() {
-            if (!(await this.supportsSdTransfer())) {
-                throw new SdTransferError('SD file transfer requires firmware v1.01.011 or later — v1.01.009/.010 corrupt transferred data', SD_STATUS.UNSUPPORTED_FW);
+            const refusal = await this._sdTransferRefusal();
+            if (refusal !== null) {
+                throw new SdTransferError(refusal, SD_STATUS.UNSUPPORTED_FW);
             }
         }
         /** Send an SD command and await its reassembled one-shot response. */
@@ -36286,6 +36358,11 @@
             this._sync = null;
             this._testReportMode = false; // Flag to capture raw streaming bytes for test reports
             this._throughputTestMode = false; // Flag to count raw bytes during a throughput test
+            // Ends the running test report or throughput test with an error. Set while
+            // one runs, so a disconnect or link drop can end it rather than leave its
+            // capture refusing every request on the next connection (DEV-1513).
+            // `linkGone`: nothing can be sent, so a report sends the device no stop.
+            this._endCapture = null;
             this._bootstrapRequestTimeoutOverrideMs = null;
             // Set by disconnect() so an in-flight connectWithRetry() loop stops instead
             // of treating the resulting GATT teardown as a transient link drop.
@@ -36393,6 +36470,14 @@
         }
         /** Subscribe to a transport's notify/disconnect streams. */
         _wireTransport(transport) {
+            // A new link starts with nothing using it. A stream, sync or capture left
+            // over from the last one, never told its link went, would otherwise refuse
+            // every request on this one, the bootstrap's included (DEV-1513).
+            const replaced = new Error('The link was replaced by a new connection');
+            this._endCapture?.(replaced, true);
+            if (this._sync)
+                this._abortSync(replaced);
+            this._mode = 'idle';
             this._transport = transport;
             /* Arm the base class's `onDisconnect` for this connection as well as this
                client's own `disconnected` event. Both exist for a reason: the event is
@@ -36424,6 +36509,9 @@
         _handleTransportDisconnect(reason) {
             const kind = this._transportKind === 'serial' ? 'serial' : 'ble';
             this._mode = 'idle';
+            // A running test report or throughput test ends with the link. A pending
+            // request is left to time out: connectWithRetry() retries on that.
+            this._endCapture?.(reason ?? new Error('Disconnected'), true);
             this._transportKind = null;
             if (this._suppressDisconnectedEvent) {
                 // Application-initiated teardown is not a fault for either channel.
@@ -36693,6 +36781,12 @@
                     /* ignore */
                 }
             }
+            // A test report or throughput test cannot go on without the link, and a
+            // request still waiting for its reply will not get one: end them now
+            // rather than leave their callers to wait out their timeouts. The report
+            // sends its best-effort stop first, while the link is still open.
+            this._endCapture?.(new Error(opts.reason ?? 'Disconnected'), false);
+            this._rejectPending(new Error(opts.reason ?? 'Disconnected'));
             if (this._transportKind !== 'serial') {
                 // Best-effort courtesy notification; swallow the rejection when the BLE
                 // transport is not up (e.g. disconnect clicked mid-connect, tx not set).
@@ -36767,6 +36861,13 @@
                 throw new Error('Stop streaming before TransferLoggedData');
             if (this._mode === 'logged')
                 throw new Error('Already syncing logged data');
+            // The sync takes over how incoming bytes are routed, so it must not start
+            // under a request waiting for its reply or a running capture (DEV-1513).
+            if (this._pending)
+                throw new Error('A request is pending: wait for it before TransferLoggedData');
+            const busy = this._linkBusyReason();
+            if (busy)
+                throw new Error(`Cannot start TransferLoggedData while ${busy}`);
             let writable = null;
             const chunks = [];
             if (fileHandle)
@@ -36883,35 +36984,108 @@
                 await this.tx.writeValue(toArrayBuffer(u8));
             }
         }
+        /**
+         * What is using the link right now, as a phrase for an error message, or
+         * null when nothing is. A request sent then would take over how incoming
+         * bytes are routed: stream frames would be read as its reply and decoding
+         * would stop, a sync would lose its frames, and a test report's or throughput
+         * test's raw capture would be parsed as frames and lost (DEV-1513).
+         */
+        _linkBusyReason() {
+            if (this._mode === 'streaming')
+                return 'streaming (call stopStreaming() first)';
+            if (this._mode === 'logged')
+                return 'logged data is being transferred';
+            if (this._testReportMode)
+                return 'a hardware test report is running';
+            if (this._throughputTestMode)
+                return 'a throughput test is running';
+            return null;
+        }
+        /**
+         * Refuse a request that would corrupt what is using the link. During a test
+         * report the only request allowed is a TEST_MODE write: the report's own
+         * start, or the exit that stops it ({@link stopTestMode}). During a
+         * throughput test the only one is the data-transfer loop that starts it.
+         */
+        _assertRequestAllowed(command, property, payloadBytes) {
+            const isWrite = command === ASM_COMMAND.WRITE;
+            if (this._testReportMode && isWrite && property === ASM_PROPERTY.TEST_MODE)
+                return;
+            if (this._throughputTestMode &&
+                isWrite &&
+                property === ASM_PROPERTY.DEBUG_COMMAND &&
+                payloadBytes[0] === DEBUG_COMMAND_ID.TEST_DATA_TRANSFER_LOOP) {
+                return;
+            }
+            const busy = this._linkBusyReason();
+            if (busy)
+                throw new Error(`Cannot send a request while ${busy}`);
+        }
+        /** Reject the pending request now rather than leaving it to time out. */
+        _rejectPending(err) {
+            const pending = this._pending;
+            if (!pending)
+                return;
+            if (this._mode === 'command')
+                this._mode = 'idle';
+            pending.reject(err);
+        }
         async _requestByCommand(command, property, payloadBytes = [], timeoutMs = 3000, acceptedCommands, acceptedProperties) {
             if (this._pending)
                 throw new Error('A request is already pending');
+            // Before anything changes: a refused request must leave the stream, sync or
+            // capture that is using the link exactly as it was.
+            this._assertRequestAllowed(command, property, payloadBytes);
             this._mode = 'command';
             this._resetAssembler();
             const req = buildMessage(command, property, payloadBytes);
             const accepted = acceptedCommands ?? defaultAcceptedCommands(command);
+            let pending;
             const pendingPromise = new Promise((resolve, reject) => {
+                // Clear _pending only while it is still this request: a stale timer must
+                // not clear a newer request (the bootstrap retry drops _pending and sends
+                // again while the old request's timer is still running).
+                const settle = () => {
+                    clearTimeout(t);
+                    if (this._pending === pending)
+                        this._pending = null;
+                };
                 const t = setTimeout(() => {
-                    this._pending = null;
+                    settle();
                     reject(new Error('Request timeout'));
                 }, timeoutMs);
-                this._pending = {
+                pending = {
                     expectedProperty: property,
                     acceptedCommands: accepted,
                     acceptedProperties,
                     resolve: (resp) => {
-                        clearTimeout(t);
-                        this._pending = null;
+                        settle();
                         resolve(resp);
                     },
                     reject: (e) => {
-                        clearTimeout(t);
-                        this._pending = null;
+                        settle();
                         reject(e);
                     },
                 };
             });
-            await this.writeBytes(req);
+            this._pending = pending;
+            // A reply that arrives during the write below can settle the request
+            // before the caller holds the promise (DEV-1086), and a failed write
+            // rejects it here. Neither is an unhandled rejection: the caller still
+            // receives the outcome from the promise returned below.
+            pendingPromise.catch(() => { });
+            try {
+                await this.writeBytes(req);
+            }
+            catch (e) {
+                // Nothing was sent, so nothing will answer: free the link now, rather than
+                // leaving every other request refused as "already pending" until the
+                // timeout (DEV-1513).
+                if (this._pending === pending && this._mode === 'command')
+                    this._mode = 'idle';
+                pending.reject(e instanceof Error ? e : new Error(String(e)));
+            }
             return pendingPromise;
         }
         async readProperty(property, timeoutMs = 3000) {
@@ -37208,6 +37382,14 @@
             const factoryTestType = Math.max(0, Math.min(0xff, Math.trunc(opts.factoryTestType ?? 0)));
             const abortSignal = opts.signal ?? null;
             const onChunk = typeof opts.onChunk === 'function' ? opts.onChunk : null;
+            // Refuse before arming anything. A report refused later, from its start
+            // request, would clear the capture flag of whatever holds the link and
+            // send the device a stop on its behalf (DEV-1513).
+            if (this._pending)
+                throw new Error('A request is already pending');
+            const busy = this._linkBusyReason();
+            if (busy)
+                throw new Error(`Cannot start a hardware test report while ${busy}`);
             const TEST_REPORT_MODE_ID = 0xfe;
             const payload = new Uint8Array([
                 TEST_REPORT_MODE_ID,
@@ -37241,6 +37423,7 @@
                 };
                 const cleanup = () => {
                     this._testReportMode = false;
+                    this._endCapture = null;
                     if (off) {
                         try {
                             off();
@@ -37268,7 +37451,7 @@
                         onAbort = null;
                     }
                 };
-                const finish = (err) => {
+                const finish = (err, sendStop = true) => {
                     if (done)
                         return;
                     done = true;
@@ -37277,8 +37460,10 @@
                         // Best-effort: tell the device to stop the in-progress test/report so it
                         // doesn't keep running a blocking suite against a connection no one is
                         // reading (dialog closed / aborted / timed out). The firmware acts on
-                        // this from interrupt context, so the report aborts promptly.
-                        void this.stopTestMode(hwMajor, hwMinor, hwInternal).catch(() => { });
+                        // this from interrupt context, so the report aborts promptly. Not when
+                        // the link has gone: the firmware ends the report itself then.
+                        if (sendStop)
+                            void this.stopTestMode(hwMajor, hwMinor, hwInternal).catch(() => { });
                         reject(err);
                         return;
                     }
@@ -37344,6 +37529,7 @@
                     abortSignal.addEventListener('abort', onAbort, { once: true });
                 }
                 // Enable test report mode before sending command
+                this._endCapture = (err, linkGone) => finish(err, !linkGone);
                 this._testReportMode = true;
                 void this.runTestMode(payload).catch((e) => {
                     const msg = e instanceof Error ? e.message : String(e);
@@ -37627,6 +37813,14 @@
             const overallTimeoutMs = Math.max(durationMs + 1000, Math.trunc(opts.timeoutMs ?? durationMs + 5000));
             const abortSignal = opts.signal ?? null;
             const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+            // Refuse before arming anything, for the same reason as a test report: a
+            // test refused by its start request would clear the capture flag of
+            // whatever holds the link (DEV-1513).
+            if (this._pending)
+                throw new Error('A request is already pending');
+            const busy = this._linkBusyReason();
+            if (busy)
+                throw new Error(`Cannot start a throughput test while ${busy}`);
             return new Promise((resolve, reject) => {
                 let done = false;
                 let bytes = 0;
@@ -37652,6 +37846,7 @@
                 };
                 const cleanup = () => {
                     this._throughputTestMode = false;
+                    this._endCapture = null;
                     if (off) {
                         try {
                             off();
@@ -37731,6 +37926,7 @@
                 // Enable raw-count mode before sending so no blast bytes are missed. The
                 // ACK is consumed by the normal command path (while _pending is set); the
                 // dummy blast that follows is counted by the _feedStreamBytes branch.
+                this._endCapture = (err) => finish(err);
                 this._throughputTestMode = true;
                 void this.testDataTransferLoop(durationMs).catch((e) => {
                     const msg = e instanceof Error ? e.message : String(e);
@@ -40613,6 +40809,7 @@
     exports.SD_DATA_ROOT = SD_DATA_ROOT;
     exports.SD_MAX_PATH_LEN = SD_MAX_PATH_LEN;
     exports.SD_STATUS = SD_STATUS;
+    exports.SD_TRANSFER_MIN_FIRMWARE = SD_TRANSFER_MIN_FIRMWARE;
     exports.SD_TRANSFER_OPCODES = SD_TRANSFER_OPCODES;
     exports.SD_XFER = SD_XFER;
     exports.SENSOR_RULE_CONFLICTS = SENSOR_RULE_CONFLICTS;
