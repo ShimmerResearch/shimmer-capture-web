@@ -18,20 +18,34 @@
  * factories — so the same code drives Shimmer3RClient, Shimmer3Client,
  * WiredShimmerClient and, later, Verisense.
  *
+ * The link's look follows one design shared with the Verisense device
+ * console (DEV-1520), so a user who knows one app reads the other:
+ *   - every connect button carries the same weight at rest — none is styled
+ *     as the preferred one, because a highlight that never moves reads as
+ *     "connected over this link" when the sensor may be on another;
+ *   - the button of the link actually in use is marked instead
+ *     (`data-link-state`: "connecting", then "connected");
+ *   - one pill says the state and the link in the same words in both apps:
+ *     "disconnected", "connecting via BLE…", "connected via USB",
+ *     "reconnecting via BLE…";
+ *   - Disconnect reads "Cancel" while a connect is in progress, and is one.
+ *
  * No DOM access at import time.
  *
  *   import { createConnectController } from "./common/connect-ui.js";
  */
 
 /**
- * Human label per connect mode, used in log lines and hint text.
- * `rfcomm` rather than `btclassic` because that is what the link actually is
- * (a Bluetooth serial port), and it distinguishes it from BLE at a glance.
+ * Human label per connect mode, used in the link pill, log lines and hint
+ * text. `rfcomm` rather than `btclassic` because that is what the link
+ * actually is (a Bluetooth serial port), and it distinguishes it from BLE at a
+ * glance. Each label is the one on its connect button, so the pill's
+ * "connected via USB" names the button that was pressed.
  */
 const MODE_LABELS = Object.freeze({
   ble: "BLE",
   rfcomm: "Classic Bluetooth",
-  usb: "wired serial",
+  usb: "USB",
 });
 
 /** Which `TransportNeed` each mode rides, for transportAdvice(). */
@@ -52,6 +66,9 @@ export const SDK_DISCONNECT_STATUS = "Device disconnected";
 /** Oldest vendored SDK whose BLE record reads are not truncated. */
 const MIN_USEFUL_SDK = "0.1.12";
 
+/** The message a cancelled connect rejects with, so the catch can tell it. */
+const CANCELLED = "connect cancelled";
+
 /**
  * Create the connect controller.
  *
@@ -61,8 +78,11 @@ const MIN_USEFUL_SDK = "0.1.12";
  * @param {HTMLButtonElement} [cfg.els.ble]     "Connect BLE"
  * @param {HTMLButtonElement} [cfg.els.usb]     "Connect USB / dock"
  * @param {HTMLButtonElement} [cfg.els.bt]      "Connect Classic Bluetooth"
- * @param {HTMLButtonElement} [cfg.els.disconnect]
- * @param {HTMLElement} [cfg.els.pill]    connection pill (`.pill`, gets `.on`)
+ * @param {HTMLButtonElement} [cfg.els.disconnect] reads "Cancel" while a
+ *   connect is in progress; the page routes that click to `cancelConnect()`
+ * @param {HTMLElement} [cfg.els.pill]    connection pill (`.pill`): `.on`
+ *   while connected, `.warn` while connecting or reconnecting, and its
+ *   `data-link-state` says which
  * @param {HTMLElement} [cfg.els.info]    free-text status line
  * @param {HTMLElement} [cfg.els.banner]  `.banner` for platform advice
  * @param {{log: Function, warn?: Function, error?: Function}|Function} cfg.log
@@ -79,13 +99,23 @@ const MIN_USEFUL_SDK = "0.1.12";
  * @param {(session: object) => unknown} [cfg.afterConnect] post-connect hook;
  *   its failure is logged and never tears down the connection it reports on
  * @param {(reason?: Error|string) => void} [cfg.onDisconnected]
+ * @param {(label: string) => void} [cfg.onConnected] called once a connect
+ *   the user started is live, with the link's label; not for one made while
+ *   `setReconnecting` is set, since the reconnect reports its own outcome
+ * @param {(msg: string) => boolean} [cfg.echoStatus] whether one SDK status
+ *   line goes to the log; omitted, every line does. For a page's background
+ *   reads, whose two lines a minute would bury the log. The disconnect line
+ *   is echoed whatever this says, since it explains what happens next.
  * @param {boolean} [cfg.announceStartup=true] log the SDK version and the
  *   per-transport platform advice on creation
  * @returns {{
  *   connectVia: (mode: "ble"|"rfcomm"|"usb") => Promise<boolean>,
+ *   cancelConnect: () => Promise<boolean>,
  *   disconnect: () => Promise<void>,
  *   readonly session: object|null,
+ *   readonly connecting: boolean,
  *   setConnected: (on: boolean, label?: string) => void,
+ *   setReconnecting: (label: string|null) => void,
  *   setLocked: (reason: string|null) => void,
  *   support: object,
  *   connectFailureHints: (mode: string, err: unknown) => string[],
@@ -130,6 +160,19 @@ export function createConnectController(cfg) {
   /** @type {string|undefined} */
   let shownLabel;
   let connecting = false;
+  /** The mode of the connect in progress, for its button and the pill. */
+  let pendingMode = null;
+  /** The client and transport of the connect in progress, for Cancel. */
+  let pending = null;
+  /** Rejects the connect in progress; set only while one runs. */
+  let rejectPending = null;
+  /**
+   * The page's automatic reconnect, while one runs: the label of the link it
+   * is bringing back. Between its tries the link is down, but the pill says
+   * "reconnecting", not "disconnected", because the page has not given up.
+   * @type {string|null}
+   */
+  let reconnectLabel = null;
   /** Guards the disconnect path against firing twice for one drop. */
   let disconnectReported = false;
   /** Detach the SDK disconnect subscription, when it returned one. */
@@ -139,8 +182,28 @@ export function createConnectController(cfg) {
   // Button state
   // -------------------------------------------------------------------------
 
+  /** The connect button for each mode, and whether this browser can use it. */
+  const linkButtons = () => [
+    { mode: "ble", el: els.ble, capable: !!support.webBluetooth },
+    { mode: "rfcomm", el: els.bt, capable: !!support.webSerial },
+    { mode: "usb", el: els.usb, capable: !!support.webSerial },
+  ];
+
   /**
-   * Apply the connected/disconnected state to the chrome.
+   * Why a button this browser cannot use is disabled, for its tooltip: the
+   * SDK's own advice where it has some, else the missing API by name.
+   */
+  function incapableNote(mode) {
+    const advice = sdkNs.transportAdvice?.(support, MODE_NEEDS[mode]);
+    if (advice) return advice;
+    return mode === "ble"
+      ? "This browser has no Web Bluetooth. Use Chrome or Edge."
+      : "This browser has no Web Serial. Use Chrome or Edge on a computer.";
+  }
+
+  /**
+   * Apply the link state to the chrome: the buttons, which one is in use,
+   * and the pill.
    *
    * Capability is a floor the connected-state cannot lift. Assigning
    * `disabled = on` alone re-enabled every button on each disconnect, so on a
@@ -151,30 +214,75 @@ export function createConnectController(cfg) {
    * The wired/dock button is the exception that proves the rule: it gates on
    * webSerial only, because on Android that is true while a wired port is
    * merely "unlikely" — advised about below, deliberately not disabled.
+   */
+  function render() {
+    const on = shownConnected;
+    const activeMode = on ? (session?.mode ?? null) : null;
+    for (const { mode, el, capable } of linkButtons()) {
+      if (!el) continue;
+      el.disabled = on || connecting || !!lockReason || !capable;
+      el.title = lockReason ?? (capable ? "" : incapableNote(mode));
+      /* The link in use is the one button marked; at rest none is. */
+      const linkState =
+        activeMode === mode
+          ? "connected"
+          : connecting && pendingMode === mode
+            ? "connecting"
+            : null;
+      if (linkState) {
+        el.dataset.linkState = linkState;
+        el.setAttribute("aria-current", "true");
+      } else {
+        delete el.dataset.linkState;
+        el.removeAttribute("aria-current");
+      }
+    }
+    if (els.disconnect) {
+      /* A connect in progress can be stopped from the same place a live link
+       * is: a BLE connect can stay pending for ever on Windows (DEV-845), and
+       * the only other way out was to reload the page. Not while the link is
+       * locked: the lock's owner is the one connecting. */
+      const canCancel = connecting && !lockReason;
+      els.disconnect.textContent = canCancel ? "Cancel" : "Disconnect";
+      els.disconnect.disabled = canCancel ? false : !on || !!lockReason;
+      els.disconnect.title =
+        lockReason ?? (canCancel ? "Stop this connection attempt" : "");
+    }
+    if (els.pill) {
+      let state = "disconnected";
+      let text = "disconnected";
+      if (on) {
+        state = "connected";
+        const label = shownLabel ?? session?.label;
+        text = label ? `connected via ${label}` : "connected";
+      } else if (reconnectLabel) {
+        state = "reconnecting";
+        text = `reconnecting via ${reconnectLabel}…`;
+      } else if (connecting) {
+        state = "connecting";
+        text = `connecting via ${MODE_LABELS[pendingMode] ?? pendingMode}…`;
+      }
+      els.pill.textContent = text;
+      els.pill.dataset.linkState = state;
+      els.pill.classList.toggle("on", state === "connected");
+      els.pill.classList.toggle(
+        "warn",
+        state === "connecting" || state === "reconnecting",
+      );
+    }
+  }
+
+  /**
+   * Show the link as up or down.
    *
    * @param {boolean} on
-   * @param {string} [label] pill text while connected
+   * @param {string} [label] the link named in the pill while connected;
+   *   defaults to the session's
    */
   function setConnected(on, label) {
     shownConnected = !!on;
     shownLabel = label;
-    if (els.ble)
-      els.ble.disabled =
-        on || connecting || !!lockReason || !support.webBluetooth;
-    if (els.bt)
-      els.bt.disabled = on || connecting || !!lockReason || !support.webSerial;
-    if (els.usb)
-      els.usb.disabled = on || connecting || !!lockReason || !support.webSerial;
-    if (els.disconnect) els.disconnect.disabled = !on || !!lockReason;
-    for (const b of [els.ble, els.bt, els.usb, els.disconnect]) {
-      if (b) b.title = lockReason ?? "";
-    }
-    if (els.pill) {
-      els.pill.textContent = on
-        ? (label ?? session?.label ?? "connected")
-        : "disconnected";
-      els.pill.classList.toggle("on", !!on);
-    }
+    render();
   }
 
   // -------------------------------------------------------------------------
@@ -344,7 +452,12 @@ export function createConnectController(cfg) {
     }
 
     client.onStatus = (msg) => {
-      log(msg);
+      if (
+        String(msg) === SDK_DISCONNECT_STATUS ||
+        cfg.echoStatus?.(String(msg)) !== false
+      ) {
+        log(msg);
+      }
       pageStatus?.call(client, msg);
       if (!hasHook && String(msg) === SDK_DISCONNECT_STATUS) {
         handleDropped(new Error(SDK_DISCONNECT_STATUS));
@@ -367,6 +480,10 @@ export function createConnectController(cfg) {
       warn("already connected — disconnect first");
       return false;
     }
+    if (connecting) {
+      warn("a connect is already in progress — wait for it, or Cancel it");
+      return false;
+    }
     const factory = makeClients[mode === "rfcomm" ? "bt" : mode];
     if (!factory) {
       error(`no client factory for ${MODE_LABELS[mode] ?? mode}`);
@@ -382,6 +499,13 @@ export function createConnectController(cfg) {
     let client = null;
     let transport = null;
     connecting = true;
+    pendingMode = mode;
+    /* Cancel rejects this, so the page is released at once even when the
+     * link underneath never answers the disconnect that Cancel also sends. */
+    const cancelled = new Promise((_, reject) => {
+      rejectPending = reject;
+    });
+    cancelled.catch(() => {});
     setConnected(false);
     try {
       const built = factory();
@@ -394,15 +518,31 @@ export function createConnectController(cfg) {
         client = built;
       }
       if (!client) throw new Error("client factory returned nothing");
+      pending = { client, transport };
 
       disconnectReported = false;
       wireClient(client);
       log(`connecting over ${linkName}…`);
-      await client.connect();
+      const linkUp = client.connect();
+      /* A connect overtaken by Cancel can still finish later; its link is
+       * then nobody's, so it is closed rather than left open. */
+      linkUp.then(
+        () => {
+          if (pending?.client !== client && session?.client !== client) {
+            client.disconnect?.()?.catch?.(() => {});
+          }
+        },
+        () => {},
+      );
+      await Promise.race([linkUp, cancelled]);
 
       connecting = false;
+      pendingMode = null;
+      pending = null;
+      rejectPending = null;
       session = { client, mode, transport, label: linkName };
       setConnected(true, linkName);
+      if (!reconnectLabel) cfg.onConnected?.(linkName);
 
       if (mode === "rfcomm" && transport) logPortIdentity(transport);
 
@@ -419,19 +559,57 @@ export function createConnectController(cfg) {
       }
       return true;
     } catch (e) {
+      pending = null;
+      rejectPending = null;
       /* Release the link before dropping the reference (see the comment on
-       * `client` above). */
+       * `client` above). Set first, so the SDK's own disconnect status from
+       * this cleanup is not taken for a dropped link. */
+      disconnectReported = true;
       try {
         await client?.disconnect();
       } catch {
         /* already down */
       }
-      error(`Connect failed over ${linkName}: ${e?.message ?? e}`);
-      for (const hint of connectFailureHints(mode, e)) warn(hint);
+      if (String(e?.message ?? e) === CANCELLED) {
+        warn(`connect over ${linkName} cancelled`);
+      } else {
+        error(`Connect failed over ${linkName}: ${e?.message ?? e}`);
+        for (const hint of connectFailureHints(mode, e)) warn(hint);
+      }
       connecting = false;
+      pendingMode = null;
       teardown();
       return false;
     }
+  }
+
+  /**
+   * Stop the connect in progress. The page wires Disconnect to this while
+   * `connecting` is true, which is when that button reads "Cancel".
+   *
+   * The connect is rejected at once, so the page never waits on a link that
+   * does not answer, and the link is released as well: a BLE connect stuck
+   * pending only ends with `gatt.disconnect()` (DEV-845), which the
+   * transport's own disconnect skips while the GATT server is not yet
+   * connected.
+   *
+   * @returns {Promise<boolean>} false when no connect was in progress
+   */
+  async function cancelConnect() {
+    if (!connecting || !rejectPending) return false;
+    const { client, transport } = pending ?? {};
+    /* The link this releases is going because the user asked: its drop must
+     * not reach the page as one it should report, or reconnect. */
+    disconnectReported = true;
+    rejectPending(new Error(CANCELLED));
+    rejectPending = null;
+    try {
+      const device = transport?.device ?? client?.device;
+      device?.gatt?.disconnect?.();
+    } catch {
+      /* nothing to release */
+    }
+    return true;
   }
 
   /**
@@ -510,18 +688,33 @@ export function createConnectController(cfg) {
 
   return {
     connectVia,
+    cancelConnect,
     disconnect,
     get session() {
       return session;
     },
+    /** True while a connect is in progress, which is when Disconnect reads "Cancel". */
+    get connecting() {
+      return connecting;
+    },
     setConnected,
+    /**
+     * Say an automatic reconnect is under way over the link `label` names,
+     * or, with `null`, that it has ended. While set, a link that is down reads
+     * "reconnecting via …" rather than "disconnected", and a connect it makes
+     * does not call `onConnected`.
+     */
+    setReconnecting(label) {
+      reconnectLabel = label || null;
+      render();
+    },
     /**
      * Hold every connect button and Disconnect while `reason` is set (shown
      * as their tooltip); `null` releases them to the connected state.
      */
     setLocked(reason) {
       lockReason = reason || null;
-      setConnected(shownConnected, shownLabel);
+      render();
     },
     support,
     connectFailureHints,

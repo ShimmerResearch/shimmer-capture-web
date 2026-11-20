@@ -350,6 +350,29 @@ kbd {
   color: var(--warn);
 }
 
+/* The link pill (DEV-1520): a dot in the state's colour ahead of the words,
+   as on the Verisense console's badge, so the state reads at a glance even
+   in the connection strip. It pulses while a connect or reconnect is under
+   way — the one state that is waiting on something. */
+.pill.link-pill::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  flex: none;
+}
+
+.pill.link-pill.warn::before {
+  animation: link-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes link-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
 .banner {
   border: 1px solid var(--line);
   border-left: 3px solid var(--line-strong);
@@ -499,6 +522,52 @@ button.warn:hover:not(:disabled) {
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Connect buttons (DEV-1520), the same in the Verisense console. Equal weight
+   at rest: no link is the preferred one, and a highlight that never moved
+   read as "connected over this link" when the sensor was on another. The
+   button of the link actually in use is marked instead — amber while it
+   connects, green while connected — and drawn at full strength although it
+   is disabled, because it is the one button in the row whose state matters.
+   connect-ui.js sets `data-link-state`. */
+button.link-btn[data-link-state] {
+  opacity: 1;
+  cursor: default;
+}
+
+button.link-btn[data-link-state="connecting"] {
+  color: var(--warn);
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+}
+
+button.link-btn[data-link-state="connected"] {
+  color: var(--ok);
+  border-color: var(--ok-border);
+  background: var(--ok-bg);
+}
+
+button.link-btn[data-link-state]::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  vertical-align: 1px;
+}
+
+button.link-btn[data-link-state="connecting"]::before {
+  animation: link-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill.link-pill.warn::before,
+  button.link-btn[data-link-state="connecting"]::before {
+    animation: none;
+  }
 }
 
 /* Light/dark switch (initThemeToggle in common/theme.js sets the glyph). */

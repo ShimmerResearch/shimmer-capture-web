@@ -186,6 +186,15 @@
         padding: 12px;
       }
 
+      /* DEV-1520: "Sensor link" and the link pill on one line. The pill is no
+         taller than the title's own line, so the line costs nothing. */
+      .link-title {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 4px 10px;
+      }
+
       .device-panel-title {
         display: flex;
         align-items: center;
@@ -213,13 +222,52 @@
          two columns above the tab strip, so a line of its own would push the
          tabs 18px further down — below where they sat before the panel
          existed, which is the budget the harness holds it to. The title row
-         has the Refresh button's height to spare. */
+         has the Refresh button's height to spare.
+
+         It may wrap, right-aligned, within that height. Since the battery
+         auto-refresh's list joined the row (DEV-1512), its longest form
+         ("inferred 15:07:40, unconfirmed") no longer fits on one line, and
+         kept on one line it pushed Refresh out of the panel. So it gives way
+         instead: at most three lines, which at this size are shorter than the
+         button, broken mid-word and cut with an ellipsis only when even that
+         is too narrow, as it is on CI's wider Linux fonts. Its tooltip says
+         the whole of it anyway. `display` is set for the line clamp, so
+         `hidden` has to be restated. */
       .device-panel-title .status-fresh {
         margin-left: auto;
+        min-width: 0;
         font-size: 11px;
         font-weight: 400;
+        line-height: 1.15;
+        text-align: right;
         color: var(--faint);
-        white-space: nowrap;
+        overflow-wrap: anywhere;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 3;
+        line-clamp: 3;
+        overflow: hidden;
+      }
+
+      .device-panel-title .status-fresh[hidden] {
+        display: none;
+      }
+
+      /* The battery auto-refresh's interval (DEV-1512), as compact as the
+         Refresh button beside it: "↻ 1 min" rather than "Auto: 1 min", which
+         left the freshness note too little room. Its tooltip says what it is.
+         It takes the free space when the freshness note is hidden, so it stays
+         at the right with Refresh rather than floating in the middle of the
+         row. */
+      .device-panel-title .batt-refresh {
+        flex: 0 0 auto;
+        margin-left: auto;
+        padding: 2px 4px;
+        font-size: 11px;
+      }
+
+      .device-panel-title .status-fresh:not([hidden]) + .batt-refresh {
+        margin-left: 0;
       }
 
       /* Not the sensor's word: either a value this page inferred from the
@@ -555,24 +603,47 @@
            right before a long download. Stacks below 800px. -->
       <div class="link-row">
         <div class="card">
-          <div class="card-title">Sensor link</div>
+          <!-- DEV-1520: the link pill sits in the title line, as the Device
+               card's freshness note does, and as the Verisense console's
+               Connection card has it. On the button row its longer words
+               ("connected via Classic Bluetooth") wrapped that row onto a
+               second line under Linux font metrics and pushed the tab strip
+               past its budget (verify.mjs, TAB_STRIP_BUDGET_PX). -->
+          <div class="card-title link-title">
+            <span>Sensor link</span>
+            <span class="pill link-pill" id="connPill" role="status"
+              >disconnected</span
+            >
+          </div>
           <!-- BLE and Classic Bluetooth first and adjacent: both are radio
                links that need the sensor paired with this host first, so they
                share a story and a failure mode. The wired link is last and
                separated — it needs no pairing, and it speaks a different
-               protocol with no stream and no card access at all. -->
+               protocol with no stream and no card access at all.
+
+               DEV-1520: every connect button carries the same weight. None
+               is styled as the preferred one, because a highlight that never
+               moves reads as "connected over this link" when the sensor may be
+               on another. common/connect-ui.js marks the button of the link
+               actually in use instead, and the pill says it in words — the
+               same design, in the same words, as the Verisense device
+               console. -->
           <div class="row">
-            <button id="btnBle" class="primary" type="button">
+            <button id="btnBle" class="link-btn" type="button">
               Connect BLE
             </button>
-            <button id="btnBt" type="button">Connect Classic Bluetooth</button>
-            <span class="link-sep" aria-hidden="true"></span>
-            <button id="btnUsb" type="button">Connect USB</button>
-            <button id="btnMock" type="button" hidden>Connect (mock)</button>
-            <button id="btnDisconnect" class="secondary" type="button">
-              Disconnect
+            <button id="btnBt" class="link-btn" type="button">
+              Connect Classic Bluetooth
             </button>
-            <span class="pill" id="connPill">disconnected</span>
+            <span class="link-sep" aria-hidden="true"></span>
+            <button id="btnUsb" class="link-btn" type="button">
+              Connect USB
+            </button>
+            <button id="btnMock" class="link-btn" type="button" hidden>
+              Connect (mock)
+            </button>
+            <!-- Reads "Cancel" while a connect is in progress. -->
+            <button id="btnDisconnect" type="button">Disconnect</button>
           </div>
           <!-- Chosen BEFORE connecting, and applied as part of the connect
                sequence, because the CRC width changes the size of every packet
@@ -641,6 +712,22 @@
                  last command — and a reader cannot act on a flag without
                  knowing which. -->
             <span class="status-fresh" id="statusFresh" hidden></span>
+            <!-- DEV-1512. In the title row beside Refresh, for the same
+                 reason the freshness note is: a row of its own here would push
+                 the tab strip past its budget (verify.mjs,
+                 TAB_STRIP_BUDGET_PX). No data-requires: it is a setting, not a
+                 command, so it stays usable while the link is busy or down. -->
+            <select
+              id="selBatteryRefresh"
+              class="batt-refresh"
+              aria-label="Re-read the battery automatically"
+              title="Re-read the battery on its own while connected, at this interval. It waits while the sensor streams or logs, while anything else is using the link and while the link reconnects, and carries on afterwards. Remembered in this browser."
+            >
+              <option value="off">↻ off</option>
+              <option value="30000">↻ 30 s</option>
+              <option value="60000" selected>↻ 1 min</option>
+              <option value="300000">↻ 5 min</option>
+            </select>
             <button
               id="btnRefreshDevice"
               type="button"
@@ -1679,7 +1766,8 @@
       let brandBusy = false;
       /**
        * Why this sensor cannot transfer SD files, when it cannot. Set from
-       * the firmware version at connect time; null when it can.
+       * the hardware and firmware versions at connect time, by
+       * `sdTransferRefusal`; null when it can.
        */
       let sdFirmwareNote = null;
 
@@ -2350,12 +2438,17 @@
        *
        * @param {string} what user-facing name of the operation
        * @param {() => Promise<unknown>} fn
-       * @param {{quiet?: boolean, tolerate?: boolean}} [opts]
+       * @param {{quiet?: boolean, tolerate?: boolean,
+       *   onFailure?: (message: string) => void}} [opts]
        *   `quiet` skips the success log line; `tolerate` downgrades a failure to
-       *   a warning and resolves with undefined instead of rejecting
+       *   a warning and resolves with undefined instead of rejecting; with
+       *   `tolerate`, `onFailure` takes the failure's message in place of that
+       *   warning, for a caller that decides itself what to log
        * @returns {Promise<unknown>}
        */
       async function withDevice(what, fn, opts = {}) {
+        const tolerated = (message) =>
+          opts.onFailure ? opts.onFailure(message) : log.warn(message);
         if (!client) {
           /* A tolerated read is a diagnostic, and the connect hook runs them
              across many awaits - so reaching here usually means the link went
@@ -2363,7 +2456,7 @@
              sensor first" would be untrue, and one toast per remaining read
              buries the real event. Say what happened, in the log, once each. */
           if (opts.tolerate) {
-            log.warn(`${what}: the link dropped before this could run`);
+            tolerated(`${what}: the link dropped before this could run`);
           } else {
             showToast("Connect a sensor first", "warn");
           }
@@ -2382,7 +2475,7 @@
         } catch (err) {
           const message = humanError(what, err);
           if (opts.tolerate) {
-            log.warn(message);
+            tolerated(message);
             return undefined;
           }
           log.error(message);
@@ -2394,9 +2487,13 @@
         }
       }
 
-      /** withDevice for a best-effort read: never rejects, never toasts. */
-      function tryDevice(what, fn) {
-        return withDevice(what, fn, { tolerate: true, quiet: true });
+      /**
+       * withDevice for a best-effort read: never rejects, never toasts.
+       *
+       * @param {{onFailure?: (message: string) => void}} [opts] see withDevice
+       */
+      function tryDevice(what, fn, opts = {}) {
+        return withDevice(what, fn, { ...opts, tolerate: true, quiet: true });
       }
 
       // =====================================================================
@@ -2420,6 +2517,8 @@
           idBatt: "–",
           idLink: "–",
         });
+        // The read time belongs to the reading that has just been cleared.
+        $("idBatt").removeAttribute("title");
         resetStatus();
         $("rwcValue").textContent = "–";
       }
@@ -2714,14 +2813,77 @@
         );
       }
 
+      /**
+       * The last battery reading shown, as the auto-refresh compares it:
+       * whole percent and charger state. null until a read succeeds.
+       */
+      let lastBattery = null;
+
+      /**
+       * Read the battery into the Device panel, and stamp the time on it.
+       *
+       * The battery alone, so the auto-refresh (DEV-1512) costs one round
+       * trip rather than Refresh's three. On the radio link that is GET_VBATT;
+       * on the wired link `getStatus()` is the battery read, since only the
+       * radio protocol carries status bits.
+       *
+       * The time goes in the row's tooltip ("Read at HH:MM:SS") rather than
+       * beside the value: the row is as wide as the panel already, and the
+       * connection strip copies the value's text, which should stay the
+       * reading. A failed read leaves the last value and its time, which is
+       * then the honest description of what is on screen.
+       *
+       * @param {{fromPoll?: boolean,
+       *   onFailure?: (message: string) => void}} [opts] `fromPoll` logs the
+       *   reading when it differs from the last one shown, or is the first
+       *   since the poll's reads started failing, since the poll's own SDK
+       *   status lines are kept out of the log. `onFailure` takes a failure's
+       *   message in place of the usual warning (withDevice).
+       * @returns {Promise<object|undefined>} the reading, or undefined when
+       *   the read failed or the link was not free
+       */
+      async function readBatteryIntoPanel({
+        fromPoll = false,
+        onFailure,
+      } = {}) {
+        const batt = await tryDevice(
+          "read the battery",
+          () =>
+            typeof client.getBattery === "function"
+              ? client.getBattery()
+              : client.getStatus(),
+          { onFailure },
+        );
+        if (!batt) return undefined;
+        /* Any read that succeeds, Refresh's included, ends a run of failed
+           polls: the next failure is news again (batteryRefreshTick). */
+        const recovered = batteryRefresh.failed !== null;
+        batteryRefresh.failed = null;
+        const label = batteryLabel(batt);
+        setIdentity({ idBatt: label });
+        $("idBatt").title = `Read at ${clockTime(Date.now())}`;
+        const reading = {
+          pct: Number.isFinite(batt.percentage)
+            ? Math.round(batt.percentage)
+            : null,
+          charger: batt.chargingStatus ?? null,
+        };
+        if (
+          fromPoll &&
+          (recovered ||
+            !lastBattery ||
+            reading.pct !== lastBattery.pct ||
+            reading.charger !== lastBattery.charger)
+        ) {
+          log.log(`battery now ${label ?? "unreadable"}`);
+        }
+        lastBattery = reading;
+        return batt;
+      }
+
       /** Battery, status flags and the real-world clock. */
       async function refreshDeviceState() {
-        const batt = await tryDevice("read the battery", () =>
-          typeof client.getBattery === "function"
-            ? client.getBattery()
-            : client.getStatus(),
-        );
-        if (batt) setIdentity({ idBatt: batteryLabel(batt) });
+        await readBatteryIntoPanel();
 
         // getStatus() on the wired client reports the battery, not the status
         // bits: only the radio protocol carries a STATUS_RESPONSE.
@@ -4723,6 +4885,43 @@
       });
 
       /**
+       * Why this sensor cannot transfer SD files, from what it reported at
+       * connect time. Only a Shimmer3R on LogAndStream_Shimmer3R v1.01.011 or
+       * later can, and each other case has its own fix, so each gets its own
+       * sentence: telling a Shimmer3 to update to Shimmer3R firmware, as one
+       * shared message used to, sends its owner after a release that cannot
+       * be installed on it.
+       *
+       * @param {number|null} hardwareVersion as the sensor reported it, or
+       *   null when it did not
+       * @param {{major: number, minor: number, patch: number}|undefined} fw
+       */
+      function sdTransferRefusal(hardwareVersion, fw) {
+        if (hardwareVersion === 3) {
+          return "Wireless transfer of SD-logged files is only supported on Shimmer3R. Dock this Shimmer3 and import the card with Consensys instead.";
+        }
+        if (hardwareVersion == null) {
+          return "The sensor did not report its hardware version, so this page cannot tell whether it serves SD file transfer. Only a Shimmer3R does, on LogAndStream_Shimmer3R v1.01.011 or later. Reconnect to ask again.";
+        }
+        if (hardwareVersion !== 10) {
+          return `This sensor reports hardware version ${hardwareVersion}, and only a Shimmer3R serves SD file transfer.`;
+        }
+        const label = firmwareLabel(fw);
+        if (label === null) {
+          return "The sensor did not report its firmware version, so this page cannot tell whether it transfers SD files intact. That needs LogAndStream_Shimmer3R v1.01.011 or later. Reconnect to ask again.";
+        }
+        const code =
+          fw.major * 1_000_000 + (fw.minor ?? 0) * 1_000 + (fw.patch ?? 0);
+        if (code < 1_001_009) {
+          return `${label} does not serve SD file transfer. It needs LogAndStream_Shimmer3R v1.01.011 or later.`;
+        }
+        if (code < 1_001_011) {
+          return `${label} cannot transfer SD files intact. It needs LogAndStream_Shimmer3R v1.01.011 or later — v1.01.009 and v1.01.010 corrupt every block they send.`;
+        }
+        return `${label} serves SD file transfer, but this sensor did not pass the check for it. Reconnect to try again.`;
+      }
+
+      /**
        * Why the card cannot be browsed right now, in plain language, or null.
        *
        * Same shape as the stream tab's USB refusal: a reason on screen beats
@@ -4739,7 +4938,7 @@
         if (!caps.sdTransfer) {
           return (
             sdFirmwareNote ??
-            "This sensor cannot transfer files from its SD card over Bluetooth. Update it to LogAndStream_Shimmer3R v1.01.011 or later."
+            "This connection cannot transfer files from the sensor's SD card. Only a Shimmer3R serves SD file transfer over Bluetooth, on LogAndStream_Shimmer3R v1.01.011 or later."
           );
         }
         if (streaming || sdLogging) {
@@ -5850,6 +6049,11 @@
         },
         afterConnect: (session) => afterConnect(session),
         onDisconnected: (reason) => onDisconnected(reason),
+        /* DEV-1520: confirmed in the same words as the Verisense console. A
+                 connect can take several seconds, mostly spent looking at the
+                 browser's picker or the sensor, not at this pill. */
+        onConnected: (label) => showToast(`Connected via ${label}`, "ok"),
+        echoStatus: () => echoSdkStatus(),
       });
 
       /**
@@ -5926,6 +6130,15 @@
 
         applyModeGating();
         regate();
+
+        /* The battery auto-refresh (DEV-1512), last, with its first read one
+                 interval from now: the sequence above has just read the battery.
+                 It also keeps the poll off the link while an automatic reconnect
+                 puts a stream back, which comes straight after this — a read
+                 holding the link then would make that start a silent no-op,
+                 since withDevice refuses while busy. Not if the link went during
+                 the sequence: the teardown has already run. */
+        if (client) startBatteryRefresh();
       }
 
       /** The Bluetooth path: BLE, Classic Bluetooth, or the mock. */
@@ -6058,19 +6271,32 @@
           );
         }
 
-        /* The firmware gate on top of the method-and-link check
-                 `describeShimmer3Caps` did: v1.01.009 and v1.01.010 serve the
-                 SD-transfer protocol and ship every 512-byte block shifted three
-                 bytes, so the corruption arrives as valid frames nothing on the
-                 host can detect. The version is the only reliable probe, and
-                 `supportsSdTransfer` owns the threshold — it reuses the version
-                 just read, so this costs no extra round trip. */
+        /* The device gate on top of the method-and-link check
+                 `describeShimmer3Caps` did. Two rules, and the hardware one
+                 comes first:
+                 - Only a Shimmer3R serves SD file transfer. log-and-stream-common
+                   builds the file-transfer module and every one of its opcodes
+                   for SHIMMER3R alone, so no LogAndStream_Shimmer3 release has
+                   them, whatever its version — and a Shimmer3 reads the bytes
+                   after an opcode it does not know as commands of its own.
+                 - On a Shimmer3R, v1.01.009 and v1.01.010 serve the protocol and
+                   ship every 512-byte block shifted three bytes, so the
+                   corruption arrives as valid frames nothing on the host can
+                   detect. The version is the only reliable probe, and
+                   `supportsSdTransfer` owns that threshold.
+                 The SDK checks the generation itself from 0.5.22 (DEV-1517).
+                 The page checks it too, because the SDK vendored before that
+                 judged by the firmware version alone, against the Shimmer3R's
+                 numbering, and would pass a Shimmer3 on v1.01.011. Both reads
+                 are the ones just made, so this costs no extra round trip. */
         if (caps.sdTransfer) {
-          const ok = await client.supportsSdTransfer().catch(() => false);
-          caps.sdTransfer = ok === true;
+          const ok =
+            identifiedHardwareVersion === 10 &&
+            (await client.supportsSdTransfer().catch(() => false)) === true;
+          caps.sdTransfer = ok;
           sdFirmwareNote = ok
             ? null
-            : `${firmwareLabel(fw) ?? "This firmware"} cannot transfer SD files intact. It needs LogAndStream_Shimmer3R v1.01.011 or later — v1.01.009 and v1.01.010 corrupt every block they send.`;
+            : sdTransferRefusal(identifiedHardwareVersion, fw);
           log.log(
             caps.sdTransfer
               ? "SD file transfer supported by this firmware"
@@ -6300,9 +6526,9 @@
         if (id?.mac) deviceMac = id.mac;
         // The raw answer, deliberately NOT defaulted — see the declaration.
         identifiedHardwareVersion = id?.hardwareVersion ?? null;
-        const batt = await tryDevice("read the battery", () =>
-          client.getStatus(),
-        );
+        /* Through the same read the auto-refresh uses (DEV-1512), so the
+                 row carries its read time from the first reading. */
+        await readBatteryIntoPanel();
         const version = id?.firmwareVersion;
 
         /* `identify()` already read the ID page over this link, so there is
@@ -6330,7 +6556,6 @@
                 }
               : null,
           ),
-          idBatt: batteryLabel(batt),
           idBtModule: btModule?.label ?? "(not read)",
         });
         /* Offers the module update when this module is older than the image
@@ -6458,6 +6683,8 @@
                  here in case the drop happened mid-report. */
         selfTest.cancel("disconnect");
         drift.stop();
+        stopBatteryRefresh();
+        lastBattery = null;
         testBusy = false;
         /* Report whatever the tap was still holding back before the transport
                  it wrapped goes away — a count that never lands reads as bytes that
@@ -6508,6 +6735,10 @@
           );
           return;
         }
+        /* Now rather than at the reset below, which waits for a recording
+                 to close first: a read sent meanwhile would go to a link that has
+                 gone. */
+        stopBatteryRefresh();
         /* What was running, for the automatic reconnect to put back. Read
                  before anything below clears it. */
         const before = {
@@ -6611,6 +6842,9 @@
         connect.setLocked(
           "Reconnecting to the sensor — press Cancel on the banner first",
         );
+        /* The pill reads "reconnecting via …" until this ends, rather than
+                 "disconnected" between tries: the page has not given up. */
+        connect.setReconnecting(link.mock ? "mock" : linkLabel(link));
         showReconnect(
           `The link dropped. Reconnecting over ${linkLabel(link)}…`,
         );
@@ -6726,6 +6960,7 @@
 
       async function onReconnectDone(result, before) {
         reconnect = null;
+        connect.setReconnecting(null);
         connect.setLocked(null);
         hideReconnect();
         regate();
@@ -6746,7 +6981,14 @@
         log.log(
           `reconnected after ${result.attempts} ${result.attempts === 1 ? "try" : "tries"}, ${(result.elapsedMs / 1000).toFixed(1)} s after the drop`,
         );
-        await resumeAfterReconnect(before);
+        /* `reconnect` is clear from here, so this is what keeps the battery
+                 auto-refresh off the link until the stream is back. */
+        reconnectResuming = true;
+        try {
+          await resumeAfterReconnect(before);
+        } finally {
+          reconnectResuming = false;
+        }
       }
 
       /**
@@ -6794,6 +7036,153 @@
       }
 
       // =====================================================================
+      // Battery auto-refresh (DEV-1512)
+      // =====================================================================
+
+      /* The battery used to be read at connect and on Refresh only, so a
+               sensor left connected — one on charge above all — showed a value
+               that went stale with nothing to say so. This re-reads it on a
+               timer while the link is free, and the row's tooltip says when.
+
+               It waits, rather than reads, while the sensor streams or logs:
+               over a byte-stream link the SDK loses a GET_VBATT reply sent
+               mid-stream, and a Shimmer3 drops a sample for one (DEV-1297). And
+               while any other panel holds the link, or an automatic reconnect
+               runs, for the same reason the drift monitor does. */
+
+      const BATTERY_REFRESH_KEY = "shimmerCaptureBatteryRefresh";
+
+      /**
+       * Mock link only: `&battMs=` replaces the chosen interval (Off stays
+       * off), so the verification pass need not wait a minute for a read.
+       */
+      const batteryRefreshOverrideMs = (() => {
+        if (!mockEnabledFromUrl()) return null;
+        const ms = Number(new URLSearchParams(location.search).get("battMs"));
+        return Number.isFinite(ms) && ms > 0 ? ms : null;
+      })();
+
+      const batteryRefresh = {
+        /** From the end of the connect sequence until the link goes. */
+        armed: false,
+        /** The setInterval id, or null while off or disconnected. */
+        timer: null,
+        /** The skip reason last logged, so a long stream logs one line. */
+        skipLogged: null,
+        /** True while a poll's own read runs: its SDK status lines are dropped. */
+        muted: false,
+        /**
+         * While the poll's reads have failed since the last read that
+         * succeeded, the latest failure's message; null otherwise. Only the
+         * first failure of such a run is logged.
+         */
+        failed: null,
+      };
+
+      /**
+       * Set while the automatic reconnect puts a stream back: `reconnect` is
+       * cleared by then, and the stream start has not taken the link yet.
+       */
+      let reconnectResuming = false;
+
+      /** The chosen interval in ms, or null when it is off. */
+      function batteryRefreshMs() {
+        const value = $("selBatteryRefresh").value;
+        const ms = Number(value);
+        if (value === "off" || !Number.isFinite(ms) || ms <= 0) return null;
+        return batteryRefreshOverrideMs ?? ms;
+      }
+
+      /** (Re)start the timer at the chosen interval, if it is armed and on. */
+      function scheduleBatteryRefresh() {
+        if (batteryRefresh.timer !== null) clearInterval(batteryRefresh.timer);
+        batteryRefresh.timer = null;
+        batteryRefresh.skipLogged = null;
+        const ms = batteryRefreshMs();
+        if (!batteryRefresh.armed || ms === null) return;
+        batteryRefresh.timer = setInterval(batteryRefreshTick, ms);
+      }
+
+      /** Called at the end of the connect sequence. */
+      function startBatteryRefresh() {
+        batteryRefresh.armed = true;
+        batteryRefresh.failed = null;
+        scheduleBatteryRefresh();
+      }
+
+      /** Called when the link goes, whichever way. */
+      function stopBatteryRefresh() {
+        batteryRefresh.armed = false;
+        scheduleBatteryRefresh();
+      }
+
+      /**
+       * Why the auto-refresh skips THIS tick, or null.
+       *
+       * Everything the drift monitor waits for — it reads over the same link
+       * on a timer too — plus an automatic reconnect, which the drift monitor
+       * does not see because it is stopped by the drop and started by hand.
+       */
+      function batteryRefreshSkipReason() {
+        if (reconnect || reconnectResuming) return "the link is reconnecting";
+        return driftSampleSkipReason();
+      }
+
+      async function batteryRefreshTick() {
+        /* Checked synchronously, right before withDevice takes `busy`, so a
+                 skipped tick sends nothing and a taken one cannot meet a "busy"
+                 refusal. */
+        const why = batteryRefreshSkipReason();
+        if (why) {
+          if (why !== batteryRefresh.skipLogged) {
+            batteryRefresh.skipLogged = why;
+            log.log(
+              `battery auto-refresh paused (${why}); it reads again once the link is free`,
+            );
+          }
+          return;
+        }
+        batteryRefresh.skipLogged = null;
+        batteryRefresh.muted = true;
+        try {
+          await readBatteryIntoPanel({
+            fromPoll: true,
+            onFailure: noteBatteryRefreshFailure,
+          });
+        } finally {
+          batteryRefresh.muted = false;
+        }
+      }
+
+      /**
+       * A poll's read failed. Logged the first time only, until a read
+       * succeeds: a link that keeps failing (a Shimmer3 whose replies fail
+       * their CRC, one streaming behind the page's back) would otherwise add a
+       * warning every interval for as long as it stays connected. The
+       * recovery is logged as the reading (readBatteryIntoPanel). Connect's
+       * and Refresh's reads still warn every time: someone asked for those.
+       */
+      function noteBatteryRefreshFailure(message) {
+        if (batteryRefresh.failed === null) {
+          const said = /\.$/.test(message) ? message : `${message}.`;
+          log.warn(
+            `${said} The battery auto-refresh keeps trying, and logs nothing more until a read succeeds.`,
+          );
+        }
+        batteryRefresh.failed = message;
+      }
+
+      /**
+       * Whether an SDK status line goes to the log. The poll's own read
+       * would otherwise add two lines a minute ("GET_VBATT → waiting…",
+       * "Battery: …") for the life of the connection; it logs a change
+       * itself instead (readBatteryIntoPanel).
+       */
+      function echoSdkStatus() {
+        return !batteryRefresh.muted;
+      }
+
+      // =====================================================================
       // Mock link (?mock=1)
       // =====================================================================
 
@@ -6825,6 +7214,8 @@
        *                        the audio status command and audio/ files on
        *                        the card; reports v1.01.025 unless fw= says
        *   ?mock=1&debug=1      log every command and reply to the console
+       *   ?mock=1&battMs=500   re-read the battery every 500 ms instead of
+       *                        at the chosen interval (DEV-1512); Off stays off
        */
       function setUpMock() {
         if (!mockEnabledFromUrl()) return;
@@ -7012,10 +7403,14 @@
           };
           btn.disabled = true;
           try {
-            mockClient.onStatus = (m) => log.log(m);
+            mockClient.onStatus = (m) => {
+              if (echoSdkStatus()) log.log(m);
+            };
             mockClient.onDisconnect = (r) => onDisconnected(r);
             await mockClient.connect();
             connect.setConnected(true, "mock");
+            // As a real link's onConnected does (DEV-1520).
+            if (!reconnect) showToast("Connected via mock", "ok");
             await afterConnect({
               client: mockClient,
               mode: framed ? "ble" : "rfcomm",
@@ -7084,6 +7479,30 @@
         } catch {
           /* storage blocked: the setting lasts for this page only */
         }
+      });
+
+      /* The battery auto-refresh's interval (DEV-1512): 1 min unless another
+               choice was made in this browser. A value the select does not
+               offer (an older or hand-edited one) is ignored rather than
+               leaving the select blank. */
+      try {
+        const stored = localStorage.getItem(BATTERY_REFRESH_KEY);
+        const sel = $("selBatteryRefresh");
+        if (stored && [...sel.options].some((o) => o.value === stored)) {
+          sel.value = stored;
+        }
+      } catch {
+        /* storage blocked: the setting starts at 1 min, as the markup has it */
+      }
+      $("selBatteryRefresh").addEventListener("change", (e) => {
+        try {
+          localStorage.setItem(BATTERY_REFRESH_KEY, e.target.value);
+        } catch {
+          /* storage blocked: the setting lasts for this page only */
+        }
+        /* While connected: the timer restarts at the new interval, so the
+                 next read is one new interval from now, or stops for Off. */
+        scheduleBatteryRefresh();
       });
       $("btnReconnectCancel").addEventListener("click", () => {
         if (!reconnect) return;
@@ -7176,6 +7595,9 @@
                  firmware has no abort — so it must not wait for one to finish. */
         selfTest.cancel("disconnect");
         drift.stop();
+        /* Before the awaits below, so no read is sent into a link being put
+                 down; resetAfterDisconnect stops it again for a drop. */
+        stopBatteryRefresh();
         if (streaming) await stopStream(sdLogging);
         if (recorder.active) await stopRecording();
         if (connect.session) {
@@ -7198,6 +7620,12 @@
                worth seeing, and the page's unhandledrejection handler puts it in
                the downloadable log. */
       $("btnDisconnect").addEventListener("click", () => {
+        /* While a connect is in progress this button reads "Cancel", and
+                 there is nothing yet to put down (DEV-1520). */
+        if (connect.connecting) {
+          void connect.cancelConnect();
+          return;
+        }
         void disconnectFromSensor();
       });
 

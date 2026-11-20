@@ -1090,6 +1090,8 @@ export function mockEnabledFromUrl() {
  * @param {{major: number, minor: number, patch: number}} [opts.firmware]
  *   version reported by GET_FW_VERSION. Defaults to v1.01.012, which is above
  *   the SD-transfer gate; pass v1.01.010 to exercise a page's refusal path.
+ *   With `hardwareVersion: 3` no version serves SD transfer, as on a real
+ *   Shimmer3.
  * @param {number|null} [opts.hardwareVersion=10] what GET_DEVICE_VERSION
  *   reports. Pass `null` to NACK it instead, which is how a page's
  *   "hardware not positively identified" path gets exercised — the one a
@@ -2923,8 +2925,16 @@ export function createMockShimmer3RTransport(opts = {}) {
     }
 
     /* SD file transfer and the link-speed test, both dispatched as blocks of
-       their own — see the SD card section above. */
-    if (handleSdCommand(cmd)) return;
+       their own — see the SD card section above.
+
+       A Shimmer3 has no SD file transfer: log-and-stream-common compiles the
+       module and every one of its opcodes for SHIMMER3R only. So on hardware
+       version 3 the opcodes fall through to the unknown-command NACK below.
+       The real firmware does not even NACK them — it reads the argument
+       bytes as commands of its own — so a page that sends one to a Shimmer3
+       is wrong whatever comes back, and `transport.writes` is how a check
+       sees it. */
+    if (hardwareVersion !== 3 && handleSdCommand(cmd)) return;
     if (handleDataRateTest(cmd)) return;
     if (handleFactoryTest(cmd)) return;
 

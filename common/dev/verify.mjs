@@ -188,6 +188,11 @@ await evaluate(
       below sees the session end as it did before it existed. Its own section
       near the end turns it back on. */
    try { localStorage.setItem('shimmerCaptureAutoReconnect', 'off'); } catch {}
+   /* The battery auto-refresh (DEV-1512) is on by default, every minute. Off,
+      no check below can find a GET_VBATT in a write count it did not expect,
+      or a button held for the read. Its own section near the end turns it
+      back on, at a test interval. */
+   try { localStorage.setItem('shimmerCaptureBatteryRefresh', 'off'); } catch {}
    return 1;`,
 );
 await goto(`${BASE}?mock=1`);
@@ -212,6 +217,182 @@ check(
     linkOrder.ids[3] === "btnMock" &&
     linkOrder.sepAfterBt === "link-sep",
   linkOrder.ids.join(" → "),
+);
+
+// --- DEV-1520: one connect / disconnect / status design with the Verisense
+// console. At rest no connect button outweighs another; once a link is in use
+// its button alone is marked, the pill says the state and the link in words,
+// and Disconnect is Cancel while a connect is in progress. The controller is
+// driven directly with a client whose connect() waits to be told, because the
+// mock link connects without going through it and a real one needs a picker.
+const linkRest = await evaluate(`
+  const ids = ['btnBle', 'btnBt', 'btnUsb'];
+  const els = ids.map((id) => document.getElementById(id));
+  const pill = document.getElementById('connPill');
+  return {
+    classes: els.map((b) => b.className),
+    primary: els.filter((b) => b.classList.contains('primary')).map((b) => b.id),
+    marked: els.filter((b) => b.dataset.linkState).map((b) => b.id),
+    disconnectClass: document.getElementById('btnDisconnect').className,
+    pill: pill.textContent, pillState: pill.dataset.linkState,
+    pillOn: pill.classList.contains('on'), role: pill.getAttribute('role'),
+  };
+`);
+check(
+  "at rest every connect button carries the same weight and none is marked",
+  linkRest.classes.every((c) => c === "link-btn") &&
+    linkRest.primary.length === 0 &&
+    linkRest.marked.length === 0 &&
+    linkRest.disconnectClass === "" &&
+    linkRest.pill === "disconnected" &&
+    linkRest.pillState === "disconnected" &&
+    !linkRest.pillOn &&
+    linkRest.role === "status",
+  JSON.stringify(linkRest),
+);
+
+const linkCtl = await evaluate(`
+  const { createConnectController } = await import('/common/connect-ui.js');
+  const mk = (tag, text) => { const e = document.createElement(tag); e.textContent = text ?? ''; return e; };
+  const make = (support) => {
+    const els = { ble: mk('button', 'Connect BLE'), bt: mk('button', 'Connect Classic Bluetooth'),
+      usb: mk('button', 'Connect USB'), disconnect: mk('button', 'Disconnect'), pill: mk('span') };
+    const lines = [];
+    const events = { connected: [], dropped: 0 };
+    const clients = [];
+    const fake = () => {
+      const c = { onStatus: null, onDisconnect: null, closed: 0,
+        device: { gatt: { released: 0, disconnect() { this.released++; } } },
+        connect() { return new Promise((res, rej) => { c.finish = res; c.fail = rej; }); },
+        async disconnect() { c.closed++; } };
+      clients.push(c);
+      return c;
+    };
+    const ctl = createConnectController({
+      els, log: (m) => lines.push(String(m)), announceStartup: false,
+      sdkNs: { describePlatformSupport: () => support },
+      makeClients: { ble: fake, bt: fake, usb: fake },
+      onConnected: (label) => events.connected.push(label),
+      onDisconnected: () => { events.dropped++; },
+    });
+    return { els, ctl, lines, events, clients };
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const view = (h) => ({
+    pill: h.els.pill.textContent, pillState: h.els.pill.dataset.linkState,
+    pillOn: h.els.pill.classList.contains('on'), pillWarn: h.els.pill.classList.contains('warn'),
+    marks: ['ble', 'bt', 'usb'].map((k) => h.els[k].dataset.linkState ?? null),
+    current: ['ble', 'bt', 'usb'].map((k) => h.els[k].getAttribute('aria-current')),
+    connectOff: ['ble', 'bt', 'usb'].map((k) => h.els[k].disabled),
+    disc: h.els.disconnect.textContent, discOff: h.els.disconnect.disabled,
+  });
+  const all = { webBluetooth: true, webSerial: true };
+
+  // Connect over Classic Bluetooth, and see it marked while it connects and once up.
+  const a = make(all);
+  const going = a.ctl.connectVia('rfcomm');
+  await tick();
+  const connecting = { ...view(a), flag: a.ctl.connecting };
+  a.clients[0].finish();
+  const ok = await going;
+  const connected = { ...view(a), ok, toastLabels: [...a.events.connected] };
+  await a.ctl.disconnect();
+  const after = view(a);
+
+  // Cancel a BLE connect that never answers.
+  const b = make(all);
+  const stuck = b.ctl.connectVia('ble');
+  await tick();
+  const cancelled = await b.ctl.cancelConnect();
+  const result = await stuck;
+  const cancel = { ...view(b), cancelled, result, flag: b.ctl.connecting,
+    released: b.clients[0].device.gatt.released, closed: b.clients[0].closed,
+    logged: b.lines.some((l) => /connect over BLE cancelled/.test(l)),
+    failLine: b.lines.some((l) => /Connect failed/.test(l)),
+    dropped: b.events.dropped, again: await b.ctl.cancelConnect() };
+
+  // An automatic reconnect: "reconnecting" between tries, no connect toast.
+  const c = make(all);
+  c.ctl.setReconnecting('BLE');
+  const waiting = view(c);
+  const retry = c.ctl.connectVia('ble');
+  await tick();
+  const trying = view(c);
+  c.clients[0].finish();
+  await retry;
+  const back = { ...view(c), toasts: c.events.connected.length };
+  c.ctl.setReconnecting(null);
+
+  // A browser with no Web Bluetooth: that button stays off, and says why.
+  const d = make({ webBluetooth: false, webSerial: true });
+  const noBle = { off: d.els.ble.disabled, title: d.els.ble.title,
+    btOff: d.els.bt.disabled };
+
+  return { connecting, connected, after, cancel, waiting, trying, back, noBle };
+`);
+check(
+  "a connect in progress marks its own button, reads 'connecting via', and offers Cancel",
+  linkCtl.connecting.flag &&
+    linkCtl.connecting.pill === "connecting via Classic Bluetooth…" &&
+    linkCtl.connecting.pillWarn &&
+    !linkCtl.connecting.pillOn &&
+    linkCtl.connecting.marks.join() === ",connecting," &&
+    linkCtl.connecting.connectOff.every(Boolean) &&
+    linkCtl.connecting.disc === "Cancel" &&
+    !linkCtl.connecting.discOff,
+  JSON.stringify(linkCtl.connecting),
+);
+check(
+  "once connected only the link in use is marked, the pill names it, and the connect is announced",
+  linkCtl.connected.ok &&
+    linkCtl.connected.pill === "connected via Classic Bluetooth" &&
+    linkCtl.connected.pillOn &&
+    linkCtl.connected.pillState === "connected" &&
+    linkCtl.connected.marks.join() === ",connected," &&
+    linkCtl.connected.current.join() === ",true," &&
+    linkCtl.connected.disc === "Disconnect" &&
+    !linkCtl.connected.discOff &&
+    linkCtl.connected.toastLabels.join() === "Classic Bluetooth",
+  JSON.stringify(linkCtl.connected),
+);
+check(
+  "after Disconnect no button is marked and the pill reads disconnected",
+  linkCtl.after.pill === "disconnected" &&
+    linkCtl.after.marks.every((m) => m === null) &&
+    linkCtl.after.connectOff.every((off) => !off) &&
+    linkCtl.after.discOff,
+  JSON.stringify(linkCtl.after),
+);
+check(
+  "Cancel ends a connect that never answers, releases the BLE link, and is not reported as a drop",
+  linkCtl.cancel.cancelled &&
+    linkCtl.cancel.result === false &&
+    !linkCtl.cancel.flag &&
+    linkCtl.cancel.released === 1 &&
+    linkCtl.cancel.closed >= 1 &&
+    linkCtl.cancel.logged &&
+    !linkCtl.cancel.failLine &&
+    linkCtl.cancel.dropped === 0 &&
+    linkCtl.cancel.again === false &&
+    linkCtl.cancel.pill === "disconnected" &&
+    linkCtl.cancel.marks.every((m) => m === null) &&
+    linkCtl.cancel.disc === "Disconnect",
+  JSON.stringify(linkCtl.cancel),
+);
+check(
+  "an automatic reconnect reads 'reconnecting via' between and during tries, and its connect is not toasted",
+  linkCtl.waiting.pill === "reconnecting via BLE…" &&
+    linkCtl.waiting.pillWarn &&
+    linkCtl.trying.pill === "reconnecting via BLE…" &&
+    linkCtl.trying.marks.join() === "connecting,," &&
+    linkCtl.back.pill === "connected via BLE" &&
+    linkCtl.back.toasts === 0,
+  JSON.stringify({ waiting: linkCtl.waiting, trying: linkCtl.trying, back: linkCtl.back }),
+);
+check(
+  "a connect button this browser cannot use stays disabled and its tooltip says why",
+  linkCtl.noBle.off && linkCtl.noBle.title.length > 0 && !linkCtl.noBle.btOff,
+  JSON.stringify(linkCtl.noBle),
 );
 
 // --- 4. the throughput button's new home, before anything is connected ----
@@ -359,7 +540,7 @@ check(
   `instanceof=${bleT.tapKeepsInstanceof} getters=${bleT.tapForwardsGetters}`,
 );
 
-check("connect pill after mock connect", (await evaluate(CONNECT)) === "mock");
+check("connect pill after mock connect", (await evaluate(CONNECT)) === "connected via mock");
 
 const ident = await evaluate(`
   const t = id => document.getElementById(id).textContent;
@@ -1213,7 +1394,7 @@ console.log("\n--- unframed (Classic-Bluetooth-like, 3-byte dribble) ---");
 await goto(`${BASE}?mock=1&framed=0&rate=102.4`);
 check(
   "connect over the unframed transport",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const un = await evaluate(`
   const t = id => document.getElementById(id).textContent;
@@ -1372,7 +1553,7 @@ console.log("\n--- device naming ---");
 await goto(`${BASE}?mock=1`);
 check(
   "connect for the device-naming pass",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 
 /* Shared helpers for this section. MEMFS comes along because it carries
@@ -1800,7 +1981,7 @@ console.log("\n--- device naming: a sensor that will not identify itself ---");
 await goto(`${BASE}?mock=1&hw=none`);
 check(
   "connect to a sensor that refuses GET_DEVICE_VERSION",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const brandUnknown = await evaluate(
   BRAND +
@@ -1822,8 +2003,11 @@ const brandUnknown = await evaluate(
     stats: window.__brandStats(),
     derived: window.brandEditor.fields().ble,
     preview: window.__brandPreview('btClassic'),
+    /* The identification warning itself. The SD tab's refusal on this
+       sensor also says it "did not report its hardware version", so a bare
+       match on that phrase counts both. */
     warned: [...document.querySelectorAll('#log .log-line')]
-      .filter(l => /did not report its hardware version/.test(l.textContent)).length };
+      .filter(l => /did not report its hardware version, so this page assumes/.test(l.textContent)).length };
 `,
 );
 check(
@@ -1956,7 +2140,7 @@ check(
 // ===========================================================================
 console.log("\n--- calibration ---");
 await goto(`${BASE}?mock=1`);
-check("connect for the calibration pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the calibration pass", (await evaluate(CONNECT)) === "connected via mock");
 
 /* Shared helpers for this section: the panel plants `data-cal-*` roles rather
    than ids, exactly as the SD and device-naming panels do, so a page can
@@ -2485,7 +2669,7 @@ console.log("\n--- calibration: a Shimmer3 ---");
    the page was reading the wrong EEPROM page and inferring the generation
    from unrelated bytes. */
 await goto(`${BASE}?mock=1&hw=3&srBoard=48-2-0`);
-check("connect to a Shimmer3", (await evaluate(CONNECT)) === "mock");
+check("connect to a Shimmer3", (await evaluate(CONNECT)) === "connected via mock");
 const calS3 = await evaluate(`
   ${CAL}
   document.querySelector('.tabs [data-tab=tabCal]').click();
@@ -2551,7 +2735,7 @@ const calUnknownBefore = await evaluate(`
 `);
 check(
   "connect to a sensor that refuses GET_DEVICE_VERSION",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const calUnknown = await evaluate(`
   ${CAL}
@@ -2619,7 +2803,7 @@ check(
 // ===========================================================================
 console.log("\n--- calibration: the InfoMem fallback ---");
 await goto(`${BASE}?mock=1`);
-check("connect for the fallback pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the fallback pass", (await evaluate(CONNECT)) === "connected via mock");
 const calFallback = await evaluate(`
   ${CAL}
   /* Shadow the dump commands on the connected client — prototype methods, so
@@ -2861,7 +3045,7 @@ await send("Emulation.setDeviceMetricsOverride", laptop);
 // testMs shortens the mock's per-step dwell so the narrow-screen half of this
 // section can print a whole self-test report in a couple of seconds.
 await goto(`${BASE}?mock=1&testMs=20`);
-check("connect on a laptop viewport", (await evaluate(CONNECT)) === "mock");
+check("connect on a laptop viewport", (await evaluate(CONNECT)) === "connected via mock");
 
 const panel = await evaluate(`
   const r = el => el.getBoundingClientRect();
@@ -3031,7 +3215,7 @@ await send("Emulation.setDeviceMetricsOverride", {
 console.log("\n--- device status flags ---");
 await send("Emulation.setDeviceMetricsOverride", laptop);
 await goto(`${BASE}?mock=1`);
-check("connect for the status-flag pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the status-flag pass", (await evaluate(CONNECT)) === "connected via mock");
 
 /* One reader for the whole section: the flags with their state and whether
    each is marked as inferred, plus the freshness badge and where the tab strip
@@ -3438,7 +3622,7 @@ check(
 await goto(`${BASE}?mock=1&framed=0`);
 check(
   "connect over the unframed transport for the push",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const dribbled = await evaluate(`
   ${FLAGS}
@@ -3463,7 +3647,7 @@ check(
 await goto(`${BASE}?mock=1`);
 check(
   "reconnect framed for the teardown check",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 
 // ---- and a sensor the page has let go cannot paint the panel any more
@@ -3534,7 +3718,7 @@ check(
 
 check(
   "connect with the drawer collapsed",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const collapsed = await evaluate(`
   const alerts = () => document.querySelectorAll(
@@ -3711,7 +3895,7 @@ await send("Emulation.setDeviceMetricsOverride", {
 // ===========================================================================
 console.log("\n--- firmware below the SD-transfer gate ---");
 await goto(`${BASE}?mock=1&fw=1.01.010`);
-check("connect to a sensor on v1.01.010", (await evaluate(CONNECT)) === "mock");
+check("connect to a sensor on v1.01.010", (await evaluate(CONNECT)) === "connected via mock");
 const oldFw = await evaluate(`
   const btn = document.getElementById('tabBtnSd');
   return { fw: document.getElementById('idFw').textContent,
@@ -3735,6 +3919,72 @@ check(
     oldFw.streamTab &&
     oldFw.logs.length === 1,
   oldFw.banner.slice(0, 90) + "…",
+);
+
+// ===========================================================================
+// The gate is per generation (DEV-1517). Only a Shimmer3R serves SD file
+// transfer: log-and-stream-common builds the module and its opcodes for
+// SHIMMER3R alone, and the Shimmer3 numbers its LogAndStream releases on a
+// line of its own, so the Shimmer3R's v1.01.011 says nothing about it. The
+// page used to tell a Shimmer3 on v1.01.009 to update to Shimmer3R firmware,
+// and would have opened the tab for one on v1.01.011. Each refusal names its
+// own reason, and none of them sends an SD command.
+// ===========================================================================
+console.log("\n--- SD transfer refused per generation ---");
+const SD_REFUSAL = `
+  const btn = document.getElementById('tabBtnSd');
+  const sdOps = new Set([0xcc, 0xc2, 0xc4, 0xc7, 0xc8, 0xca]);
+  return { tabDisabled: btn.disabled, title: btn.title,
+    banner: document.getElementById('sdBanner').textContent,
+    bannerKind: document.getElementById('sdBanner').className,
+    streamTab: !document.getElementById('tabBtnStream').disabled,
+    sdWrites: (window.mockTransport.writes ?? [])
+      .filter(w => sdOps.has((w.bytes ?? w.data)[0])).length,
+    logs: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+      .filter(l => /SD file transfer/.test(l)) };
+`;
+const refusedSd = (r) =>
+  r.tabDisabled &&
+  r.bannerKind === "banner warn" &&
+  r.title === r.banner &&
+  r.streamTab &&
+  r.sdWrites === 0 &&
+  r.logs.length === 1;
+
+for (const fw of ["1.01.009", "1.01.022"]) {
+  await goto(`${BASE}?mock=1&hw=3&fw=${fw}`);
+  check(`connect to a Shimmer3 on v${fw}`, (await evaluate(CONNECT)) === "connected via mock");
+  const s3 = await evaluate(SD_REFUSAL);
+  check(
+    `a Shimmer3 on v${fw} closes the SD tab as a Shimmer3, not as old Shimmer3R firmware`,
+    refusedSd(s3) &&
+      /^Wireless transfer of SD-logged files is only supported on Shimmer3R\./.test(s3.banner) &&
+      /Dock this Shimmer3/.test(s3.banner) &&
+      !/LogAndStream_Shimmer3R|v1\.01\.011|corrupt/.test(s3.banner),
+    s3.banner.slice(0, 90) + "…",
+  );
+}
+
+await goto(`${BASE}?mock=1&fw=1.01.008`);
+check("connect to a Shimmer3R on v1.01.008", (await evaluate(CONNECT)) === "connected via mock");
+const s3rOld = await evaluate(SD_REFUSAL);
+check(
+  "a Shimmer3R before v1.01.009 is told it does not serve SD transfer, not that it corrupts",
+  refusedSd(s3rOld) &&
+    /v1\.01\.008 does not serve SD file transfer/.test(s3rOld.banner) &&
+    /LogAndStream_Shimmer3R v1\.01\.011 or later/.test(s3rOld.banner) &&
+    !/corrupt/.test(s3rOld.banner),
+  s3rOld.banner.slice(0, 90) + "…",
+);
+
+await goto(`${BASE}?mock=1&hw=none`);
+check("connect to a sensor that will not say its hardware", (await evaluate(CONNECT)) === "connected via mock");
+const unknownHw = await evaluate(SD_REFUSAL);
+check(
+  "a sensor that does not report its hardware version gets no SD tab, and is told why",
+  refusedSd(unknownHw) &&
+    /did not report its hardware version/.test(unknownHw.banner),
+  unknownHw.banner.slice(0, 90) + "…",
 );
 
 // ===========================================================================
@@ -3829,7 +4079,7 @@ check(
 console.log("\n--- device time is not shifted twice ---");
 await send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
 await goto(`${BASE}?mock=1`);
-check("connect under an emulated +09:00", (await evaluate(CONNECT)) === "mock");
+check("connect under an emulated +09:00", (await evaluate(CONNECT)) === "connected via mock");
 
 const clocks = await evaluate(`
   document.getElementById('btnSetClock').click();
@@ -3936,7 +4186,7 @@ await send("Emulation.setTimezoneOverride", { timezoneId: "" });
 // ===========================================================================
 console.log("\n--- ExG presets ---");
 await goto(`${BASE}?mock=1`);
-check("connect for the ExG pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the ExG pass", (await evaluate(CONNECT)) === "connected via mock");
 
 const exg = await evaluate(`
   const t = window.mockTransport;
@@ -4041,7 +4291,7 @@ check(
   tabInfo.banner.slice(0, 60),
 );
 
-check("connect for the Test-tab pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the Test-tab pass", (await evaluate(CONNECT)) === "connected via mock");
 
 const testOpts = await evaluate(`
   ${TEST}
@@ -4214,7 +4464,7 @@ console.log("\n--- a failing unit ---");
 await goto(`${BASE}?mock=1&testMs=20&testFail=1`);
 check(
   "connect to a sensor that fails its self-test",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const failRun = await evaluate(`
   ${TEST}
@@ -4264,7 +4514,7 @@ check(
 // ===========================================================================
 console.log("\n--- cancel, and the sensor that keeps printing ---");
 await goto(`${BASE}?mock=1&testMs=120`);
-check("connect for the cancel pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the cancel pass", (await evaluate(CONNECT)) === "connected via mock");
 const cancelled = await evaluate(`
   ${TEST}
   document.querySelector('.tabs [data-tab=tabTest]').click();
@@ -4320,7 +4570,7 @@ check(
 // ===========================================================================
 console.log("\n--- the firmware's own refusal ---");
 await goto(`${BASE}?mock=1&testMs=20`);
-check("connect for the refusal pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the refusal pass", (await evaluate(CONNECT)) === "connected via mock");
 const refused = await evaluate(`
   document.getElementById('btnStreamStart').click();
   await new Promise(r => setTimeout(r, 700));
@@ -4408,7 +4658,7 @@ await send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
 await goto(`${BASE}?mock=1&ppm=20000&clockBase=local`);
 check(
   "connect to a sensor with a fast clock, under +09:00",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const drift = await evaluate(`
   ${TEST}
@@ -4591,10 +4841,45 @@ const MUST_EXPLAIN = {
     "testBusy",
     "busy",
   ],
+  /* The battery auto-refresh (DEV-1512) waits like the drift monitor, on a
+     timer and unseen, so it has to name every holder too -- and the automatic
+     reconnect, which takes the link back and restarts a stream right after
+     the connect sequence that starts the poll. */
+  batteryRefreshSkipReason: [
+    "streaming",
+    "sdLogging",
+    "linkTesting",
+    "sdBusy",
+    "brandBusy",
+    "calibBusy",
+    "testBusy",
+    "otaBusy",
+    "busy",
+    "reconnect",
+  ],
 };
 
+/**
+ * A reason function's body, together with the body of any other function in
+ * MUST_EXPLAIN that it hands on to: batteryRefreshSkipReason starts from
+ * driftSampleSkipReason rather than repeating it, and a flag that the function
+ * it calls names is a flag it explains.
+ */
+function explainingBody(src, name, seen = new Set()) {
+  const body = fnBody(src, name);
+  if (!body || seen.has(name)) return body;
+  seen.add(name);
+  let out = body;
+  for (const other of Object.keys(MUST_EXPLAIN)) {
+    if (other !== name && body.includes(`${other}(`)) {
+      out += explainingBody(src, other, seen) ?? "";
+    }
+  }
+  return out;
+}
+
 for (const [fn, flags] of Object.entries(MUST_EXPLAIN)) {
-  const body = fnBody(pageSrc, fn);
+  const body = explainingBody(pageSrc, fn);
   const missing = body ? flags.filter((f) => !body.includes(f)) : flags;
   check(
     `${fn} can explain every other panel holding the link`,
@@ -4754,7 +5039,7 @@ check(
   generalIdle.live.length ? generalIdle.live.join(", ") : "all gated",
 );
 
-check("connect for the General tab", (await evaluate(CONNECT)) === "mock");
+check("connect for the General tab", (await evaluate(CONNECT)) === "connected via mock");
 
 const general = await evaluate(`
   document.querySelector('.tabs [data-tab=tabGeneral]').click();
@@ -5094,7 +5379,7 @@ console.log("\n--- a calibration block follows the range field beside it ---");
 await goto(`${BASE}?mock=1`);
 check(
   "connect for the refresh-hook pass",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 
 const refreshHook = await evaluate(`
@@ -5179,7 +5464,7 @@ const IDENT = `
 await goto(`${BASE}?mock=1&hw=3`);
 check(
   "connect a Shimmer3 for its module banner",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identS3 = await evaluate(`${IDENT}
   return { ...rows(),
@@ -5214,7 +5499,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=none&btVersion=`);
 check(
   "connect a sensor that answers neither",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identBlank = await evaluate(`${IDENT} return rows();`);
 check(
@@ -5234,7 +5519,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=52-1-0`);
 check(
   "connect a sensor on an unlisted board",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identNew = await evaluate(`${IDENT} return rows();`);
 check(
@@ -5250,7 +5535,7 @@ await goto(
 );
 check(
   "connect a sensor whose module reply is longer than the protocol allows",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identLong = await evaluate(`${IDENT}
   return { ...rows(), rawLen: window.mockTransport.identity.btVersion.length };
@@ -5268,7 +5553,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=0-0-0`);
 check(
   "connect a sensor whose id page was never written",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identZero = await evaluate(`${IDENT}
   const page = await window.mockClient.readSrBoard();
@@ -5323,7 +5608,7 @@ check(
 await goto(`${BASE}?mock=1&factory=1&srBoard=232-8-1`);
 check(
   "connect a Shimmer3R whose SR number is wrong, with ?factory=1",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const srOpen = await evaluate(`${SR}
   document.querySelector('[data-tab="tabTest"]').click();
@@ -5505,7 +5790,7 @@ check(
 await goto(`${BASE}?mock=1&factory=1&srBoard=none`);
 check(
   "connect the next sensor of the run, an unprogrammed one",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const srNext = await evaluate(`${SR}
   return { current: r('current').textContent, picked: r('board').value,
@@ -5570,7 +5855,7 @@ check(
 await goto(`${BASE}?mock=1&factory=1&hw=3&srBoard=48-2-0`);
 check(
   "connect a Shimmer3 with ?factory=1",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const srS3 = await evaluate(`${SR}
   return [...r('board').options].map(o => o.textContent);
@@ -5649,7 +5934,7 @@ const RULES = `
     .map(l => l.textContent).filter(t => /sensor rule/.test(t));
 `;
 await goto(`${BASE}?mock=1`);
-check("connect for the sensor-rule pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the sensor-rule pass", (await evaluate(CONNECT)) === "connected via mock");
 const toggles = await evaluate(`${RULES}
   /* Which image bytes differ from the sensor's, right now. Sampled after
      every toggle rather than once at the end: the sequence below is
@@ -5760,7 +6045,7 @@ check(
 await goto(`${BASE}?mock=1&sensors=0x000404`);
 check(
   "connect a sensor whose stored image already breaks a rule",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const broken = await evaluate(`${RULES}
   const before = banner();
@@ -5820,7 +6105,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=37-1-0`);
 check(
   "connect an ECG/EMG board for the gating pass",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const gated = await evaluate(`${RULES}
   const b = (bit) => { const x = box(bit); return { disabled: x.disabled,
@@ -5854,7 +6139,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=none`);
 check(
   "connect a sensor with no board id",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const ungated = await evaluate(`${RULES}
   return { disabled: [...document.querySelectorAll('[data-sensor-bit]')]
@@ -5879,7 +6164,7 @@ console.log("\n--- calibrated channels and the clock axis ---");
 await goto(`${BASE}?mock=1&sensors=0x2422e4&pressure=390&rate=51.2`);
 check(
   "connect a sensor with pressure, GSR, battery, ADC and both magnetometers",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const calStream = await evaluate(`
   const log = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
@@ -6118,7 +6403,7 @@ check(
 await goto(`${BASE}?mock=1&sensors=0x0400e0&pressure=nack`);
 check(
   "connect a sensor whose firmware will not serve 0xA7",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const rawOnly = await evaluate(`
   const log = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
@@ -6160,7 +6445,7 @@ check(
 await goto(`${BASE}?mock=1&rtcWrapIn=6&rate=204.8`);
 check(
   "connect a sensor about to roll its counter over",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const wrap = await evaluate(`
   const client = window.mockClient;
@@ -6258,7 +6543,7 @@ const BT_PANEL = `
 await goto(`${BASE}?mock=1`);
 check(
   "connect with a current Bluetooth module",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btCurrent = await evaluate(`
   ${BT_PANEL}
@@ -6277,7 +6562,7 @@ check(
 await goto(`${BASE}?mock=1&fw=1.01.021&btVersion=${btLine("01.04.16.16")}`);
 check(
   "connect an older module on a Shimmer3R with v1.01.021",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btOldFw = await evaluate(`
   ${BT_PANEL}
@@ -6300,7 +6585,7 @@ await goto(
 );
 check(
   "connect a Shimmer3 reporting an older IF820",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btShimmer3 = await evaluate(`
   ${BT_PANEL}
@@ -6318,7 +6603,7 @@ await goto(
 );
 check(
   "connect an older module over a serial-like link",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btSerial = await evaluate(`
   ${BT_PANEL}
@@ -6334,7 +6619,7 @@ check(
 );
 
 await goto(`${BASE}?mock=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`);
-check("connect an older module over BLE", (await evaluate(CONNECT)) === "mock");
+check("connect an older module over BLE", (await evaluate(CONNECT)) === "connected via mock");
 const btRun = await evaluate(`
   ${BT_PANEL}
   await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
@@ -6456,7 +6741,7 @@ await goto(
 );
 check(
   "connect an older module on a slow-airtime link",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btStall = await evaluate(`
   ${BT_PANEL}
@@ -6502,7 +6787,7 @@ await goto(
 );
 check(
   "connect an older module whose sensor restarts late",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btLate = await evaluate(`
   ${BT_PANEL}
@@ -6532,7 +6817,7 @@ await goto(
 );
 check(
   "connect an older module for a cancelled update",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btCancel = await evaluate(`
   ${BT_PANEL}
@@ -6589,7 +6874,7 @@ await goto(
 );
 check(
   "connect an older module whose update will fail",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btFail = await evaluate(`
   ${BT_PANEL}
@@ -6658,7 +6943,7 @@ check(
 await goto(`${BASE}?mock=1&events=1`);
 check(
   "connect to a sensor whose firmware has the event channel",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const evtUp = await evaluate(
   LAYOUT +
@@ -7118,7 +7403,7 @@ check(
 await goto(`${BASE}?mock=1&audio=1`);
 check(
   "connect to a sensor whose firmware records audio",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const audUp = await evaluate(
   AUDIO_OPS +
@@ -7469,7 +7754,7 @@ const APPLY_AND_READ_233 = `
 await goto(`${BASE}?mock=1&audio=1&soundlevel=1&sensors=0x2084`);
 check(
   "connect to a sensor whose firmware has the sound-level channel",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const slSet = await evaluate(
   `
@@ -7604,7 +7889,7 @@ check(
 await goto(`${BASE}?mock=1&audio=1`);
 check(
   "connect to a sensor whose firmware records audio but has no sound-level channel",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const slAbsent = await evaluate(
   `
@@ -7712,7 +7997,8 @@ check(
     /Reconnecting over the mock sensor/.test(arResume.during.text) &&
     arResume.during.bleLocked &&
     arResume.during.disconnectLocked &&
-    arResume.during.pill === "disconnected",
+    // DEV-1520: not "disconnected" while the page is still trying.
+    arResume.during.pill === "reconnecting via mock…",
   JSON.stringify(arResume.during),
 );
 check(
@@ -7955,7 +8241,7 @@ check(
 check(
   "a drop shows the automatic reconnect's line in the strip",
   strip.dropped.shown &&
-    strip.dropped.link === "disconnected" &&
+    strip.dropped.link === "reconnecting via mock…" &&
     !strip.dropped.linkOn &&
     strip.dropped.activity === null &&
     /Try 1 failed; trying again in 2 s/.test(strip.dropped.note ?? ""),
@@ -7973,6 +8259,367 @@ check(
   "scrolled back up, the strip hides again",
   !strip.upAgain.shown,
   JSON.stringify(strip.upAgain),
+);
+
+// ===========================================================================
+// Battery auto-refresh (DEV-1512). `&battMs=` stands in for the chosen
+// interval, so a check waits a second or two rather than a minute; Off stays
+// off. GET_VBATT is 0x95, counted on the wire. The setInterval spy tells a
+// stopped timer from one that is still running and skipping every tick, which
+// a write count alone cannot.
+// ===========================================================================
+console.log("\n--- battery auto-refresh (DEV-1512) ---");
+const BATT_KEY = "shimmerCaptureBatteryRefresh";
+const BATT_MS = 1500;
+const BR = `${AR}
+  const vbatt = () => (window.mockTransport?.writes ?? [])
+    .filter(w => (w.bytes ?? w.data)[0] === 0x95).length;
+  const logCount = (re) => [...document.querySelectorAll('#log .log-line')]
+    .filter(l => re.test(l.textContent)).length;
+  const setRefresh = (v) => {
+    const s = $('selBatteryRefresh');
+    s.value = v;
+    s.dispatchEvent(new Event('change'));
+  };
+  const READ_AT = /^Read at \\d\\d:\\d\\d:\\d\\d$/;
+`;
+
+/* A first visit: nothing stored, so the setting is at its default. */
+await evaluate(
+  `try { localStorage.removeItem('${BATT_KEY}'); } catch {} return 1;`,
+);
+await goto(`${BASE}?mock=1&battMs=${BATT_MS}`);
+const brIdle = await evaluate(`${BR}
+  window.__battTimers = new Set();
+  const realSI = window.setInterval.bind(window);
+  const realCI = window.clearInterval.bind(window);
+  window.setInterval = (fn, ms, ...rest) => {
+    const id = realSI(fn, ms, ...rest);
+    if (ms === ${BATT_MS}) window.__battTimers.add(id);
+    return id;
+  };
+  window.clearInterval = (id) => { window.__battTimers.delete(id); return realCI(id); };
+  const sel = $('selBatteryRefresh');
+  const row = sel.closest('.device-panel-title');
+  const refresh = $('btnRefreshDevice').getBoundingClientRect();
+  const at = sel.getBoundingClientRect();
+  const before = {
+    value: sel.value,
+    inTitleRow: !!row && row.contains($('btnRefreshDevice')),
+    sameLine: Math.abs((at.top + at.bottom) / 2 - (refresh.top + refresh.bottom) / 2) < 4,
+    leftOfRefresh: at.right <= refresh.left,
+    requiresNothing: !sel.dataset.requires,
+  };
+  $('btnMock').click();
+  await until(() => logHas(/mock sensor connected/), 8000);
+  const t0 = performance.now();
+  const atConnect = vbatt();
+  const connectTitle = $('idBatt').title;
+  const echoedAtConnect = logCount(/GET_VBATT/);
+  $('idBatt').title = 'cleared by the test';
+  /* The freshness note's longest form, which the list beside it left no room
+     for on one line: it wraps inside the row rather than pushing Refresh out
+     of the panel or making the row taller. */
+  const fresh = $('statusFresh');
+  const titleRow = fresh.closest('.device-panel-title');
+  const freshWas = fresh.textContent;
+  fresh.textContent = 'inferred 23:59:59, unconfirmed';
+  /* Measured as laid out, and again with the row 40px narrower, which stands
+     in for fonts wider than this machine's: CI's Linux fonts set this row
+     about 17% wider than Windows does, and a check that only passes on the
+     fonts it was written on is how it first failed there. */
+  const measure = () => ({
+    overflow: titleRow.scrollWidth - titleRow.clientWidth,
+    rowH: Math.round(titleRow.getBoundingClientRect().height),
+    noteH: Math.round(fresh.getBoundingClientRect().height),
+    buttonH: Math.round($('btnRefreshDevice').getBoundingClientRect().height),
+    shown: fresh.offsetParent !== null,
+  });
+  const crowded = { asLaidOut: measure() };
+  titleRow.style.boxSizing = 'border-box';
+  titleRow.style.width = (titleRow.getBoundingClientRect().width - 40) + 'px';
+  crowded.narrower = measure();
+  titleRow.style.width = '';
+  titleRow.style.boxSizing = '';
+  fresh.textContent = freshWas;
+  await sleep(${BATT_MS} - 600);
+  const early = vbatt() - atConnect;
+  await until(() => vbatt() > atConnect, 4000);
+  const elapsed = Math.round(performance.now() - t0);
+  await until(() => READ_AT.test($('idBatt').title), 2000);
+  await sleep(200);
+  return {
+    before,
+    crowded,
+    atConnect, connectTitle, early, elapsed,
+    polled: vbatt() - atConnect,
+    title: $('idBatt').title,
+    timers: window.__battTimers.size,
+    echoedAtConnect,
+    echoedAfterPoll: logCount(/GET_VBATT/),
+    changeLines: logCount(/battery now/),
+  };
+`);
+check(
+  "the battery auto-refresh defaults to every minute, in the Device title row beside Refresh",
+  brIdle.before.value === "60000" &&
+    brIdle.before.inTitleRow &&
+    brIdle.before.sameLine &&
+    brIdle.before.leftOfRefresh &&
+    brIdle.before.requiresNothing,
+  JSON.stringify(brIdle.before),
+);
+check(
+  "and the freshness note at its longest wraps in that row instead of pushing Refresh out",
+  [brIdle.crowded.asLaidOut, brIdle.crowded.narrower].every(
+    (m) =>
+      m.shown &&
+      m.overflow === 0 &&
+      m.rowH <= m.buttonH + 1 &&
+      m.noteH <= m.rowH,
+  ),
+  JSON.stringify(brIdle.crowded),
+);
+check(
+  "the connect read stamps the battery row with its time",
+  brIdle.atConnect === 1 &&
+    /^Read at \d\d:\d\d:\d\d$/.test(brIdle.connectTitle),
+  `${brIdle.atConnect} read(s), title "${brIdle.connectTitle}"`,
+);
+check(
+  "idle and connected, a read follows one interval after connect and updates the read time",
+  brIdle.early === 0 &&
+    brIdle.polled === 1 &&
+    brIdle.elapsed >= BATT_MS - 300 &&
+    /^Read at \d\d:\d\d:\d\d$/.test(brIdle.title) &&
+    brIdle.timers === 1,
+  `early ${brIdle.early}, read at +${brIdle.elapsed} ms, title "${brIdle.title}", ${brIdle.timers} timer(s)`,
+);
+check(
+  "the poll's read keeps the SDK's status lines out of the log, and an unchanged reading adds none",
+  brIdle.echoedAtConnect >= 1 &&
+    brIdle.echoedAfterPoll === brIdle.echoedAtConnect &&
+    brIdle.changeLines === 0,
+  `GET_VBATT lines ${brIdle.echoedAtConnect} → ${brIdle.echoedAfterPoll}, "battery now" lines ${brIdle.changeLines}`,
+);
+
+const brStream = await evaluate(`${BR}
+  await until(() => !$('btnStreamStart').disabled, 3000);
+  $('btnStreamStart').click();
+  await until(() => !$('btnStreamStop').disabled, 4000);
+  const s0 = vbatt();
+  await sleep(${BATT_MS * 3});
+  const during = vbatt() - s0;
+  const timers = window.__battTimers.size;
+  const paused = logCount(/battery auto-refresh paused \\(the sensor is sensing\\)/);
+  $('btnStreamStop').click();
+  await until(() => !$('btnStreamStart').disabled, 4000);
+  const s1 = vbatt();
+  await until(() => vbatt() > s1, ${BATT_MS * 2 + 1000});
+  return { during, timers, paused, resumed: vbatt() - s1 };
+`);
+check(
+  "while streaming, no battery read is sent, and the pause is logged once",
+  brStream.during === 0 && brStream.timers === 1 && brStream.paused === 1,
+  JSON.stringify(brStream),
+);
+check(
+  "once the stream stops, the reads resume",
+  brStream.resumed >= 1,
+  JSON.stringify(brStream),
+);
+
+const brOff = await evaluate(`${BR}
+  await until(() => !$('btnStreamStart').disabled, 3000);
+  setRefresh('off');
+  const storedOff = localStorage.getItem('${BATT_KEY}');
+  const o0 = vbatt();
+  const timersOff = window.__battTimers.size;
+  await sleep(${BATT_MS * 3});
+  const whileOff = vbatt() - o0;
+  setRefresh('300000');
+  const o1 = vbatt();
+  await until(() => vbatt() > o1, ${BATT_MS * 2 + 1000});
+  return {
+    storedOff, timersOff, whileOff,
+    storedOn: localStorage.getItem('${BATT_KEY}'),
+    timersOn: window.__battTimers.size,
+    resumed: vbatt() - o1,
+  };
+`);
+check(
+  "set to Off while connected, the timer stops and no read is sent",
+  brOff.storedOff === "off" && brOff.timersOff === 0 && brOff.whileOff === 0,
+  JSON.stringify(brOff),
+);
+check(
+  "set back on, it restarts at the new interval, which is remembered",
+  brOff.storedOn === "300000" && brOff.timersOn === 1 && brOff.resumed >= 1,
+  JSON.stringify(brOff),
+);
+
+const brDisconnect = await evaluate(`${BR}
+  await until(() => !$('btnDisconnect').disabled, 3000);
+  const link = window.mockTransport;
+  $('btnDisconnect').click();
+  await until(() => $('connPill').textContent === 'disconnected', 4000);
+  const d0 = link.writes.filter(w => (w.bytes ?? w.data)[0] === 0x95).length;
+  await sleep(${BATT_MS * 3});
+  return {
+    timers: window.__battTimers.size,
+    after: link.writes.filter(w => (w.bytes ?? w.data)[0] === 0x95).length - d0,
+    title: $('idBatt').hasAttribute('title'),
+    skippedDisconnected: logHas(/battery auto-refresh paused \\(disconnected\\)/),
+  };
+`);
+check(
+  "Disconnect stops the timer, and the read time goes with the reading",
+  brDisconnect.timers === 0 &&
+    brDisconnect.after === 0 &&
+    !brDisconnect.title &&
+    !brDisconnect.skippedDisconnected,
+  JSON.stringify(brDisconnect),
+);
+
+await goto(`${BASE}?mock=1&battMs=${BATT_MS}`);
+const brRemembered = await evaluate(
+  `return document.getElementById('selBatteryRefresh').value;`,
+);
+check(
+  "the chosen interval is there again after a reload",
+  brRemembered === "300000",
+  brRemembered,
+);
+
+/* The reason the poll starts last in the connect sequence, and skips while a
+   reconnect runs: the automatic reconnect restarts the stream straight after
+   that sequence, through withDevice, which refuses while a read holds the link.
+   A short interval, so a tick has every chance to land in that window. */
+await goto(`${BASE}?mock=1&battMs=300`);
+const brResume = await evaluate(`${BR}
+  const chk = $('chkAutoReconnect');
+  chk.checked = true; chk.dispatchEvent(new Event('change'));
+  $('btnMock').click();
+  await until(() => logHas(/mock sensor connected/), 8000);
+  await until(() => vbatt() >= 2, 3000);
+  const polled = vbatt();
+  await until(() => !$('btnStreamStart').disabled, 2000);
+  $('btnStreamStart').click();
+  await until(() => !$('btnStreamStop').disabled, 4000);
+  await sleep(500);
+  const first = window.mockTransport;
+  first.emitDisconnect(new Error('walked out of range (mock)'));
+  await until(() => window.mockTransport !== first && starts() > 0
+    && !$('btnStreamStop').disabled, 15000);
+  await sleep(1500);
+  const out = {
+    polled,
+    newLink: window.mockTransport !== first,
+    starts: starts(),
+    streaming: !$('btnStreamStop').disabled,
+    vbattOnNewLink: vbatt(),
+    restarted: toasts().some(t => /Reconnected and streaming again/.test(t)),
+    busyToast: toasts().some(t => /busy with another request/.test(t)),
+  };
+  $('btnDisconnect').click();
+  await sleep(800);
+  try { localStorage.removeItem('shimmerCaptureAutoReconnect'); } catch {}
+  try { localStorage.removeItem('${BATT_KEY}'); } catch {}
+  return out;
+`);
+check(
+  "with the poll on, an automatic reconnect still restarts the stream",
+  brResume.polled >= 2 &&
+    brResume.newLink &&
+    brResume.starts === 1 &&
+    brResume.streaming &&
+    brResume.restarted &&
+    !brResume.busyToast,
+  JSON.stringify(brResume),
+);
+check(
+  "and the new link carries only its connect read, none mid-stream",
+  brResume.vbattOnNewLink === 1,
+  JSON.stringify(brResume),
+);
+
+/* A link where every read fails: on the bench a Shimmer3 whose replies failed
+   their link CRC gave one warning per poll for as long as it stayed
+   connected. The poll logs the first failure only, until a read succeeds.
+   The client's getBattery is shadowed to refuse, as the mock's own comment
+   suggests for a link that cannot do something. */
+await goto(`${BASE}?mock=1&battMs=400`);
+const brFail = await evaluate(`${BR}
+  $('btnMock').click();
+  await until(() => logHas(/mock sensor connected/), 8000);
+  await until(() => !$('btnRefreshDevice').disabled, 3000);
+  const c = window.mockClient;
+  const own = Object.prototype.hasOwnProperty.call(c, 'getBattery');
+  const real = c.getBattery;
+  let calls = 0;
+  const fail = () => {
+    c.getBattery = async () => { calls++; throw new Error('NACK (mock)'); };
+  };
+  const heal = () => { if (own) c.getBattery = real; else delete c.getBattery; };
+  const refused = () => logCount(/refused "read the battery"/);
+  const notes = () => logCount(/logs nothing more until a read succeeds/);
+  const now = () => logCount(/battery now/);
+  const snap = () => ({ calls, refused: refused(), notes: notes(), now: now() });
+
+  fail();
+  await until(() => calls >= 3, 4000);
+  await sleep(100);
+  const failing = snap();
+
+  /* Refresh's read was asked for, so it warns every time, and its failure
+     does not end the run: the polls stay quiet after it. */
+  await until(() => !$('btnRefreshDevice').disabled, 2000);
+  const r0 = calls;
+  $('btnRefreshDevice').click();
+  await until(() => calls > r0 && !$('btnRefreshDevice').disabled, 3000);
+  const r1 = calls;
+  await until(() => calls >= r1 + 2, 3000);
+  await sleep(100);
+  const afterRefresh = snap();
+
+  heal();
+  const v0 = vbatt();
+  await until(() => vbatt() > v0, 3000);
+  await sleep(100);
+  const healed = snap();
+
+  fail();
+  const f0 = calls;
+  await until(() => calls >= f0 + 2, 3000);
+  await sleep(100);
+  const again = snap();
+
+  heal();
+  $('btnDisconnect').click();
+  await sleep(800);
+  try { localStorage.removeItem('${BATT_KEY}'); } catch {}
+  return { failing, afterRefresh, healed, again };
+`);
+check(
+  "a poll's read that keeps failing is logged once, not once per poll",
+  brFail.failing.calls >= 3 &&
+    brFail.failing.refused === 1 &&
+    brFail.failing.notes === 1,
+  JSON.stringify(brFail.failing),
+);
+check(
+  "Refresh's own failed read still warns, and the polls after it stay quiet",
+  brFail.afterRefresh.refused === 2 && brFail.afterRefresh.notes === 1,
+  JSON.stringify(brFail.afterRefresh),
+);
+check(
+  "a read that succeeds logs the reading, and the next failure is logged again",
+  brFail.healed.now === brFail.afterRefresh.now + 1 &&
+    brFail.healed.notes === 1 &&
+    brFail.again.calls >= brFail.healed.calls + 2 &&
+    brFail.again.refused === 3 &&
+    brFail.again.notes === 2,
+  `${JSON.stringify(brFail.healed)} → ${JSON.stringify(brFail.again)}`,
 );
 
 // ===========================================================================
