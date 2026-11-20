@@ -3704,9 +3704,9 @@ for (const fw of ["1.01.009", "1.01.022"]) {
   check(
     `a Shimmer3 on v${fw} closes the SD tab as a Shimmer3, not as old Shimmer3R firmware`,
     refusedSd(s3) &&
-      /^A Shimmer3 cannot transfer files/.test(s3.banner) &&
-      /no LogAndStream_Shimmer3 release/.test(s3.banner) &&
-      !/Shimmer3R/.test(s3.banner),
+      /^Wireless transfer of SD-logged files is only supported on Shimmer3R\./.test(s3.banner) &&
+      /Dock this Shimmer3/.test(s3.banner) &&
+      !/LogAndStream_Shimmer3R|v1\.01\.011|corrupt/.test(s3.banner),
     s3.banner.slice(0, 90) + "…",
   );
 }

@@ -4737,7 +4737,7 @@
        */
       function sdTransferRefusal(hardwareVersion, fw) {
         if (hardwareVersion === 3) {
-          return "A Shimmer3 cannot transfer files from its SD card over Bluetooth: no LogAndStream_Shimmer3 release serves the file-transfer commands, whatever its version. Dock it and import the card with Consensys instead.";
+          return "Wireless transfer of SD-logged files is only supported on Shimmer3R. Dock this Shimmer3 and import the card with Consensys instead.";
         }
         if (hardwareVersion == null) {
           return "The sensor did not report its hardware version, so this page cannot tell whether it serves SD file transfer. Only a Shimmer3R does, on LogAndStream_Shimmer3R v1.01.011 or later. Reconnect to ask again.";
