@@ -219,6 +219,182 @@ check(
   linkOrder.ids.join(" → "),
 );
 
+// --- DEV-1520: one connect / disconnect / status design with the Verisense
+// console. At rest no connect button outweighs another; once a link is in use
+// its button alone is marked, the pill says the state and the link in words,
+// and Disconnect is Cancel while a connect is in progress. The controller is
+// driven directly with a client whose connect() waits to be told, because the
+// mock link connects without going through it and a real one needs a picker.
+const linkRest = await evaluate(`
+  const ids = ['btnBle', 'btnBt', 'btnUsb'];
+  const els = ids.map((id) => document.getElementById(id));
+  const pill = document.getElementById('connPill');
+  return {
+    classes: els.map((b) => b.className),
+    primary: els.filter((b) => b.classList.contains('primary')).map((b) => b.id),
+    marked: els.filter((b) => b.dataset.linkState).map((b) => b.id),
+    disconnectClass: document.getElementById('btnDisconnect').className,
+    pill: pill.textContent, pillState: pill.dataset.linkState,
+    pillOn: pill.classList.contains('on'), role: pill.getAttribute('role'),
+  };
+`);
+check(
+  "at rest every connect button carries the same weight and none is marked",
+  linkRest.classes.every((c) => c === "link-btn") &&
+    linkRest.primary.length === 0 &&
+    linkRest.marked.length === 0 &&
+    linkRest.disconnectClass === "" &&
+    linkRest.pill === "disconnected" &&
+    linkRest.pillState === "disconnected" &&
+    !linkRest.pillOn &&
+    linkRest.role === "status",
+  JSON.stringify(linkRest),
+);
+
+const linkCtl = await evaluate(`
+  const { createConnectController } = await import('/common/connect-ui.js');
+  const mk = (tag, text) => { const e = document.createElement(tag); e.textContent = text ?? ''; return e; };
+  const make = (support) => {
+    const els = { ble: mk('button', 'Connect BLE'), bt: mk('button', 'Connect Classic Bluetooth'),
+      usb: mk('button', 'Connect USB'), disconnect: mk('button', 'Disconnect'), pill: mk('span') };
+    const lines = [];
+    const events = { connected: [], dropped: 0 };
+    const clients = [];
+    const fake = () => {
+      const c = { onStatus: null, onDisconnect: null, closed: 0,
+        device: { gatt: { released: 0, disconnect() { this.released++; } } },
+        connect() { return new Promise((res, rej) => { c.finish = res; c.fail = rej; }); },
+        async disconnect() { c.closed++; } };
+      clients.push(c);
+      return c;
+    };
+    const ctl = createConnectController({
+      els, log: (m) => lines.push(String(m)), announceStartup: false,
+      sdkNs: { describePlatformSupport: () => support },
+      makeClients: { ble: fake, bt: fake, usb: fake },
+      onConnected: (label) => events.connected.push(label),
+      onDisconnected: () => { events.dropped++; },
+    });
+    return { els, ctl, lines, events, clients };
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const view = (h) => ({
+    pill: h.els.pill.textContent, pillState: h.els.pill.dataset.linkState,
+    pillOn: h.els.pill.classList.contains('on'), pillWarn: h.els.pill.classList.contains('warn'),
+    marks: ['ble', 'bt', 'usb'].map((k) => h.els[k].dataset.linkState ?? null),
+    current: ['ble', 'bt', 'usb'].map((k) => h.els[k].getAttribute('aria-current')),
+    connectOff: ['ble', 'bt', 'usb'].map((k) => h.els[k].disabled),
+    disc: h.els.disconnect.textContent, discOff: h.els.disconnect.disabled,
+  });
+  const all = { webBluetooth: true, webSerial: true };
+
+  // Connect over Classic Bluetooth, and see it marked while it connects and once up.
+  const a = make(all);
+  const going = a.ctl.connectVia('rfcomm');
+  await tick();
+  const connecting = { ...view(a), flag: a.ctl.connecting };
+  a.clients[0].finish();
+  const ok = await going;
+  const connected = { ...view(a), ok, toastLabels: [...a.events.connected] };
+  await a.ctl.disconnect();
+  const after = view(a);
+
+  // Cancel a BLE connect that never answers.
+  const b = make(all);
+  const stuck = b.ctl.connectVia('ble');
+  await tick();
+  const cancelled = await b.ctl.cancelConnect();
+  const result = await stuck;
+  const cancel = { ...view(b), cancelled, result, flag: b.ctl.connecting,
+    released: b.clients[0].device.gatt.released, closed: b.clients[0].closed,
+    logged: b.lines.some((l) => /connect over BLE cancelled/.test(l)),
+    failLine: b.lines.some((l) => /Connect failed/.test(l)),
+    dropped: b.events.dropped, again: await b.ctl.cancelConnect() };
+
+  // An automatic reconnect: "reconnecting" between tries, no connect toast.
+  const c = make(all);
+  c.ctl.setReconnecting('BLE');
+  const waiting = view(c);
+  const retry = c.ctl.connectVia('ble');
+  await tick();
+  const trying = view(c);
+  c.clients[0].finish();
+  await retry;
+  const back = { ...view(c), toasts: c.events.connected.length };
+  c.ctl.setReconnecting(null);
+
+  // A browser with no Web Bluetooth: that button stays off, and says why.
+  const d = make({ webBluetooth: false, webSerial: true });
+  const noBle = { off: d.els.ble.disabled, title: d.els.ble.title,
+    btOff: d.els.bt.disabled };
+
+  return { connecting, connected, after, cancel, waiting, trying, back, noBle };
+`);
+check(
+  "a connect in progress marks its own button, reads 'connecting via', and offers Cancel",
+  linkCtl.connecting.flag &&
+    linkCtl.connecting.pill === "connecting via Classic Bluetooth…" &&
+    linkCtl.connecting.pillWarn &&
+    !linkCtl.connecting.pillOn &&
+    linkCtl.connecting.marks.join() === ",connecting," &&
+    linkCtl.connecting.connectOff.every(Boolean) &&
+    linkCtl.connecting.disc === "Cancel" &&
+    !linkCtl.connecting.discOff,
+  JSON.stringify(linkCtl.connecting),
+);
+check(
+  "once connected only the link in use is marked, the pill names it, and the connect is announced",
+  linkCtl.connected.ok &&
+    linkCtl.connected.pill === "connected via Classic Bluetooth" &&
+    linkCtl.connected.pillOn &&
+    linkCtl.connected.pillState === "connected" &&
+    linkCtl.connected.marks.join() === ",connected," &&
+    linkCtl.connected.current.join() === ",true," &&
+    linkCtl.connected.disc === "Disconnect" &&
+    !linkCtl.connected.discOff &&
+    linkCtl.connected.toastLabels.join() === "Classic Bluetooth",
+  JSON.stringify(linkCtl.connected),
+);
+check(
+  "after Disconnect no button is marked and the pill reads disconnected",
+  linkCtl.after.pill === "disconnected" &&
+    linkCtl.after.marks.every((m) => m === null) &&
+    linkCtl.after.connectOff.every((off) => !off) &&
+    linkCtl.after.discOff,
+  JSON.stringify(linkCtl.after),
+);
+check(
+  "Cancel ends a connect that never answers, releases the BLE link, and is not reported as a drop",
+  linkCtl.cancel.cancelled &&
+    linkCtl.cancel.result === false &&
+    !linkCtl.cancel.flag &&
+    linkCtl.cancel.released === 1 &&
+    linkCtl.cancel.closed >= 1 &&
+    linkCtl.cancel.logged &&
+    !linkCtl.cancel.failLine &&
+    linkCtl.cancel.dropped === 0 &&
+    linkCtl.cancel.again === false &&
+    linkCtl.cancel.pill === "disconnected" &&
+    linkCtl.cancel.marks.every((m) => m === null) &&
+    linkCtl.cancel.disc === "Disconnect",
+  JSON.stringify(linkCtl.cancel),
+);
+check(
+  "an automatic reconnect reads 'reconnecting via' between and during tries, and its connect is not toasted",
+  linkCtl.waiting.pill === "reconnecting via BLE…" &&
+    linkCtl.waiting.pillWarn &&
+    linkCtl.trying.pill === "reconnecting via BLE…" &&
+    linkCtl.trying.marks.join() === "connecting,," &&
+    linkCtl.back.pill === "connected via BLE" &&
+    linkCtl.back.toasts === 0,
+  JSON.stringify({ waiting: linkCtl.waiting, trying: linkCtl.trying, back: linkCtl.back }),
+);
+check(
+  "a connect button this browser cannot use stays disabled and its tooltip says why",
+  linkCtl.noBle.off && linkCtl.noBle.title.length > 0 && !linkCtl.noBle.btOff,
+  JSON.stringify(linkCtl.noBle),
+);
+
 // --- 4. the throughput button's new home, before anything is connected ----
 const linkIdle = await evaluate(`
   const sdk = await import('/vendor/shimmer-web-sdk.esm.js');
@@ -364,7 +540,7 @@ check(
   `instanceof=${bleT.tapKeepsInstanceof} getters=${bleT.tapForwardsGetters}`,
 );
 
-check("connect pill after mock connect", (await evaluate(CONNECT)) === "mock");
+check("connect pill after mock connect", (await evaluate(CONNECT)) === "connected via mock");
 
 const ident = await evaluate(`
   const t = id => document.getElementById(id).textContent;
@@ -1218,7 +1394,7 @@ console.log("\n--- unframed (Classic-Bluetooth-like, 3-byte dribble) ---");
 await goto(`${BASE}?mock=1&framed=0&rate=102.4`);
 check(
   "connect over the unframed transport",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const un = await evaluate(`
   const t = id => document.getElementById(id).textContent;
@@ -1377,7 +1553,7 @@ console.log("\n--- device naming ---");
 await goto(`${BASE}?mock=1`);
 check(
   "connect for the device-naming pass",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 
 /* Shared helpers for this section. MEMFS comes along because it carries
@@ -1805,7 +1981,7 @@ console.log("\n--- device naming: a sensor that will not identify itself ---");
 await goto(`${BASE}?mock=1&hw=none`);
 check(
   "connect to a sensor that refuses GET_DEVICE_VERSION",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const brandUnknown = await evaluate(
   BRAND +
@@ -1964,7 +2140,7 @@ check(
 // ===========================================================================
 console.log("\n--- calibration ---");
 await goto(`${BASE}?mock=1`);
-check("connect for the calibration pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the calibration pass", (await evaluate(CONNECT)) === "connected via mock");
 
 /* Shared helpers for this section: the panel plants `data-cal-*` roles rather
    than ids, exactly as the SD and device-naming panels do, so a page can
@@ -2493,7 +2669,7 @@ console.log("\n--- calibration: a Shimmer3 ---");
    the page was reading the wrong EEPROM page and inferring the generation
    from unrelated bytes. */
 await goto(`${BASE}?mock=1&hw=3&srBoard=48-2-0`);
-check("connect to a Shimmer3", (await evaluate(CONNECT)) === "mock");
+check("connect to a Shimmer3", (await evaluate(CONNECT)) === "connected via mock");
 const calS3 = await evaluate(`
   ${CAL}
   document.querySelector('.tabs [data-tab=tabCal]').click();
@@ -2559,7 +2735,7 @@ const calUnknownBefore = await evaluate(`
 `);
 check(
   "connect to a sensor that refuses GET_DEVICE_VERSION",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const calUnknown = await evaluate(`
   ${CAL}
@@ -2627,7 +2803,7 @@ check(
 // ===========================================================================
 console.log("\n--- calibration: the InfoMem fallback ---");
 await goto(`${BASE}?mock=1`);
-check("connect for the fallback pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the fallback pass", (await evaluate(CONNECT)) === "connected via mock");
 const calFallback = await evaluate(`
   ${CAL}
   /* Shadow the dump commands on the connected client — prototype methods, so
@@ -2796,7 +2972,7 @@ await send("Emulation.setDeviceMetricsOverride", laptop);
 // testMs shortens the mock's per-step dwell so the narrow-screen half of this
 // section can print a whole self-test report in a couple of seconds.
 await goto(`${BASE}?mock=1&testMs=20`);
-check("connect on a laptop viewport", (await evaluate(CONNECT)) === "mock");
+check("connect on a laptop viewport", (await evaluate(CONNECT)) === "connected via mock");
 
 const panel = await evaluate(`
   const r = el => el.getBoundingClientRect();
@@ -2966,7 +3142,7 @@ await send("Emulation.setDeviceMetricsOverride", {
 console.log("\n--- device status flags ---");
 await send("Emulation.setDeviceMetricsOverride", laptop);
 await goto(`${BASE}?mock=1`);
-check("connect for the status-flag pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the status-flag pass", (await evaluate(CONNECT)) === "connected via mock");
 
 /* One reader for the whole section: the flags with their state and whether
    each is marked as inferred, plus the freshness badge and where the tab strip
@@ -3373,7 +3549,7 @@ check(
 await goto(`${BASE}?mock=1&framed=0`);
 check(
   "connect over the unframed transport for the push",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const dribbled = await evaluate(`
   ${FLAGS}
@@ -3398,7 +3574,7 @@ check(
 await goto(`${BASE}?mock=1`);
 check(
   "reconnect framed for the teardown check",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 
 // ---- and a sensor the page has let go cannot paint the panel any more
@@ -3469,7 +3645,7 @@ check(
 
 check(
   "connect with the drawer collapsed",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const collapsed = await evaluate(`
   const alerts = () => document.querySelectorAll(
@@ -3646,7 +3822,7 @@ await send("Emulation.setDeviceMetricsOverride", {
 // ===========================================================================
 console.log("\n--- firmware below the SD-transfer gate ---");
 await goto(`${BASE}?mock=1&fw=1.01.010`);
-check("connect to a sensor on v1.01.010", (await evaluate(CONNECT)) === "mock");
+check("connect to a sensor on v1.01.010", (await evaluate(CONNECT)) === "connected via mock");
 const oldFw = await evaluate(`
   const btn = document.getElementById('tabBtnSd');
   return { fw: document.getElementById('idFw').textContent,
@@ -3704,7 +3880,7 @@ const refusedSd = (r) =>
 
 for (const fw of ["1.01.009", "1.01.022"]) {
   await goto(`${BASE}?mock=1&hw=3&fw=${fw}`);
-  check(`connect to a Shimmer3 on v${fw}`, (await evaluate(CONNECT)) === "mock");
+  check(`connect to a Shimmer3 on v${fw}`, (await evaluate(CONNECT)) === "connected via mock");
   const s3 = await evaluate(SD_REFUSAL);
   check(
     `a Shimmer3 on v${fw} closes the SD tab as a Shimmer3, not as old Shimmer3R firmware`,
@@ -3717,7 +3893,7 @@ for (const fw of ["1.01.009", "1.01.022"]) {
 }
 
 await goto(`${BASE}?mock=1&fw=1.01.008`);
-check("connect to a Shimmer3R on v1.01.008", (await evaluate(CONNECT)) === "mock");
+check("connect to a Shimmer3R on v1.01.008", (await evaluate(CONNECT)) === "connected via mock");
 const s3rOld = await evaluate(SD_REFUSAL);
 check(
   "a Shimmer3R before v1.01.009 is told it does not serve SD transfer, not that it corrupts",
@@ -3729,7 +3905,7 @@ check(
 );
 
 await goto(`${BASE}?mock=1&hw=none`);
-check("connect to a sensor that will not say its hardware", (await evaluate(CONNECT)) === "mock");
+check("connect to a sensor that will not say its hardware", (await evaluate(CONNECT)) === "connected via mock");
 const unknownHw = await evaluate(SD_REFUSAL);
 check(
   "a sensor that does not report its hardware version gets no SD tab, and is told why",
@@ -3830,7 +4006,7 @@ check(
 console.log("\n--- device time is not shifted twice ---");
 await send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
 await goto(`${BASE}?mock=1`);
-check("connect under an emulated +09:00", (await evaluate(CONNECT)) === "mock");
+check("connect under an emulated +09:00", (await evaluate(CONNECT)) === "connected via mock");
 
 const clocks = await evaluate(`
   document.getElementById('btnSetClock').click();
@@ -3937,7 +4113,7 @@ await send("Emulation.setTimezoneOverride", { timezoneId: "" });
 // ===========================================================================
 console.log("\n--- ExG presets ---");
 await goto(`${BASE}?mock=1`);
-check("connect for the ExG pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the ExG pass", (await evaluate(CONNECT)) === "connected via mock");
 
 const exg = await evaluate(`
   const t = window.mockTransport;
@@ -4042,7 +4218,7 @@ check(
   tabInfo.banner.slice(0, 60),
 );
 
-check("connect for the Test-tab pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the Test-tab pass", (await evaluate(CONNECT)) === "connected via mock");
 
 const testOpts = await evaluate(`
   ${TEST}
@@ -4215,7 +4391,7 @@ console.log("\n--- a failing unit ---");
 await goto(`${BASE}?mock=1&testMs=20&testFail=1`);
 check(
   "connect to a sensor that fails its self-test",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const failRun = await evaluate(`
   ${TEST}
@@ -4265,7 +4441,7 @@ check(
 // ===========================================================================
 console.log("\n--- cancel, and the sensor that keeps printing ---");
 await goto(`${BASE}?mock=1&testMs=120`);
-check("connect for the cancel pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the cancel pass", (await evaluate(CONNECT)) === "connected via mock");
 const cancelled = await evaluate(`
   ${TEST}
   document.querySelector('.tabs [data-tab=tabTest]').click();
@@ -4321,7 +4497,7 @@ check(
 // ===========================================================================
 console.log("\n--- the firmware's own refusal ---");
 await goto(`${BASE}?mock=1&testMs=20`);
-check("connect for the refusal pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the refusal pass", (await evaluate(CONNECT)) === "connected via mock");
 const refused = await evaluate(`
   document.getElementById('btnStreamStart').click();
   await new Promise(r => setTimeout(r, 700));
@@ -4409,7 +4585,7 @@ await send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
 await goto(`${BASE}?mock=1&ppm=20000&clockBase=local`);
 check(
   "connect to a sensor with a fast clock, under +09:00",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const drift = await evaluate(`
   ${TEST}
@@ -4790,7 +4966,7 @@ check(
   generalIdle.live.length ? generalIdle.live.join(", ") : "all gated",
 );
 
-check("connect for the General tab", (await evaluate(CONNECT)) === "mock");
+check("connect for the General tab", (await evaluate(CONNECT)) === "connected via mock");
 
 const general = await evaluate(`
   document.querySelector('.tabs [data-tab=tabGeneral]').click();
@@ -5130,7 +5306,7 @@ console.log("\n--- a calibration block follows the range field beside it ---");
 await goto(`${BASE}?mock=1`);
 check(
   "connect for the refresh-hook pass",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 
 const refreshHook = await evaluate(`
@@ -5215,7 +5391,7 @@ const IDENT = `
 await goto(`${BASE}?mock=1&hw=3`);
 check(
   "connect a Shimmer3 for its module banner",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identS3 = await evaluate(`${IDENT}
   return { ...rows(),
@@ -5250,7 +5426,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=none&btVersion=`);
 check(
   "connect a sensor that answers neither",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identBlank = await evaluate(`${IDENT} return rows();`);
 check(
@@ -5270,7 +5446,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=52-1-0`);
 check(
   "connect a sensor on an unlisted board",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identNew = await evaluate(`${IDENT} return rows();`);
 check(
@@ -5286,7 +5462,7 @@ await goto(
 );
 check(
   "connect a sensor whose module reply is longer than the protocol allows",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identLong = await evaluate(`${IDENT}
   return { ...rows(), rawLen: window.mockTransport.identity.btVersion.length };
@@ -5304,7 +5480,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=0-0-0`);
 check(
   "connect a sensor whose id page was never written",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const identZero = await evaluate(`${IDENT}
   const page = await window.mockClient.readSrBoard();
@@ -5359,7 +5535,7 @@ check(
 await goto(`${BASE}?mock=1&factory=1&srBoard=232-8-1`);
 check(
   "connect a Shimmer3R whose SR number is wrong, with ?factory=1",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const srOpen = await evaluate(`${SR}
   document.querySelector('[data-tab="tabTest"]').click();
@@ -5541,7 +5717,7 @@ check(
 await goto(`${BASE}?mock=1&factory=1&srBoard=none`);
 check(
   "connect the next sensor of the run, an unprogrammed one",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const srNext = await evaluate(`${SR}
   return { current: r('current').textContent, picked: r('board').value,
@@ -5606,7 +5782,7 @@ check(
 await goto(`${BASE}?mock=1&factory=1&hw=3&srBoard=48-2-0`);
 check(
   "connect a Shimmer3 with ?factory=1",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const srS3 = await evaluate(`${SR}
   return [...r('board').options].map(o => o.textContent);
@@ -5685,7 +5861,7 @@ const RULES = `
     .map(l => l.textContent).filter(t => /sensor rule/.test(t));
 `;
 await goto(`${BASE}?mock=1`);
-check("connect for the sensor-rule pass", (await evaluate(CONNECT)) === "mock");
+check("connect for the sensor-rule pass", (await evaluate(CONNECT)) === "connected via mock");
 const toggles = await evaluate(`${RULES}
   /* Which image bytes differ from the sensor's, right now. Sampled after
      every toggle rather than once at the end: the sequence below is
@@ -5796,7 +5972,7 @@ check(
 await goto(`${BASE}?mock=1&sensors=0x000404`);
 check(
   "connect a sensor whose stored image already breaks a rule",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const broken = await evaluate(`${RULES}
   const before = banner();
@@ -5856,7 +6032,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=37-1-0`);
 check(
   "connect an ECG/EMG board for the gating pass",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const gated = await evaluate(`${RULES}
   const b = (bit) => { const x = box(bit); return { disabled: x.disabled,
@@ -5890,7 +6066,7 @@ check(
 await goto(`${BASE}?mock=1&srBoard=none`);
 check(
   "connect a sensor with no board id",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const ungated = await evaluate(`${RULES}
   return { disabled: [...document.querySelectorAll('[data-sensor-bit]')]
@@ -5915,7 +6091,7 @@ console.log("\n--- calibrated channels and the clock axis ---");
 await goto(`${BASE}?mock=1&sensors=0x2422e4&pressure=390&rate=51.2`);
 check(
   "connect a sensor with pressure, GSR, battery, ADC and both magnetometers",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const calStream = await evaluate(`
   const log = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
@@ -6154,7 +6330,7 @@ check(
 await goto(`${BASE}?mock=1&sensors=0x0400e0&pressure=nack`);
 check(
   "connect a sensor whose firmware will not serve 0xA7",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const rawOnly = await evaluate(`
   const log = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
@@ -6196,7 +6372,7 @@ check(
 await goto(`${BASE}?mock=1&rtcWrapIn=6&rate=204.8`);
 check(
   "connect a sensor about to roll its counter over",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const wrap = await evaluate(`
   const client = window.mockClient;
@@ -6294,7 +6470,7 @@ const BT_PANEL = `
 await goto(`${BASE}?mock=1`);
 check(
   "connect with a current Bluetooth module",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btCurrent = await evaluate(`
   ${BT_PANEL}
@@ -6313,7 +6489,7 @@ check(
 await goto(`${BASE}?mock=1&fw=1.01.021&btVersion=${btLine("01.04.16.16")}`);
 check(
   "connect an older module on a Shimmer3R with v1.01.021",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btOldFw = await evaluate(`
   ${BT_PANEL}
@@ -6336,7 +6512,7 @@ await goto(
 );
 check(
   "connect a Shimmer3 reporting an older IF820",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btShimmer3 = await evaluate(`
   ${BT_PANEL}
@@ -6354,7 +6530,7 @@ await goto(
 );
 check(
   "connect an older module over a serial-like link",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btSerial = await evaluate(`
   ${BT_PANEL}
@@ -6370,7 +6546,7 @@ check(
 );
 
 await goto(`${BASE}?mock=1&fw=1.01.022&btVersion=${btLine("01.04.16.16")}`);
-check("connect an older module over BLE", (await evaluate(CONNECT)) === "mock");
+check("connect an older module over BLE", (await evaluate(CONNECT)) === "connected via mock");
 const btRun = await evaluate(`
   ${BT_PANEL}
   await waitFor(() => P().querySelector('button.primary:not([disabled])'), 5000);
@@ -6492,7 +6668,7 @@ await goto(
 );
 check(
   "connect an older module on a slow-airtime link",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btStall = await evaluate(`
   ${BT_PANEL}
@@ -6538,7 +6714,7 @@ await goto(
 );
 check(
   "connect an older module whose sensor restarts late",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btLate = await evaluate(`
   ${BT_PANEL}
@@ -6568,7 +6744,7 @@ await goto(
 );
 check(
   "connect an older module for a cancelled update",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btCancel = await evaluate(`
   ${BT_PANEL}
@@ -6625,7 +6801,7 @@ await goto(
 );
 check(
   "connect an older module whose update will fail",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const btFail = await evaluate(`
   ${BT_PANEL}
@@ -6694,7 +6870,7 @@ check(
 await goto(`${BASE}?mock=1&events=1`);
 check(
   "connect to a sensor whose firmware has the event channel",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const evtUp = await evaluate(
   LAYOUT +
@@ -7154,7 +7330,7 @@ check(
 await goto(`${BASE}?mock=1&audio=1`);
 check(
   "connect to a sensor whose firmware records audio",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const audUp = await evaluate(
   AUDIO_OPS +
@@ -7505,7 +7681,7 @@ const APPLY_AND_READ_233 = `
 await goto(`${BASE}?mock=1&audio=1&soundlevel=1&sensors=0x2084`);
 check(
   "connect to a sensor whose firmware has the sound-level channel",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const slSet = await evaluate(
   `
@@ -7640,7 +7816,7 @@ check(
 await goto(`${BASE}?mock=1&audio=1`);
 check(
   "connect to a sensor whose firmware records audio but has no sound-level channel",
-  (await evaluate(CONNECT)) === "mock",
+  (await evaluate(CONNECT)) === "connected via mock",
 );
 const slAbsent = await evaluate(
   `
@@ -7748,7 +7924,8 @@ check(
     /Reconnecting over the mock sensor/.test(arResume.during.text) &&
     arResume.during.bleLocked &&
     arResume.during.disconnectLocked &&
-    arResume.during.pill === "disconnected",
+    // DEV-1520: not "disconnected" while the page is still trying.
+    arResume.during.pill === "reconnecting via mock…",
   JSON.stringify(arResume.during),
 );
 check(
@@ -7991,7 +8168,7 @@ check(
 check(
   "a drop shows the automatic reconnect's line in the strip",
   strip.dropped.shown &&
-    strip.dropped.link === "disconnected" &&
+    strip.dropped.link === "reconnecting via mock…" &&
     !strip.dropped.linkOn &&
     strip.dropped.activity === null &&
     /Try 1 failed; trying again in 2 s/.test(strip.dropped.note ?? ""),
