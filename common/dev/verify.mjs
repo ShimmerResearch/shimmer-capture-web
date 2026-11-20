@@ -311,9 +311,12 @@ const linkCtl = await evaluate(`
     failLine: b.lines.some((l) => /Connect failed/.test(l)),
     dropped: b.events.dropped, again: await b.ctl.cancelConnect() };
 
-  // An automatic reconnect: "reconnecting" between tries, no connect toast.
+  // An automatic reconnect: "reconnecting" between tries, the link's button
+  // marked and Disconnect reading Cancel throughout, even through the page's
+  // lock, and no connect toast.
   const c = make(all);
-  c.ctl.setReconnecting('BLE');
+  c.ctl.setLocked('Reconnecting to the sensor — Cancel stops it');
+  c.ctl.setReconnecting('BLE', 'ble');
   const waiting = view(c);
   const retry = c.ctl.connectVia('ble');
   await tick();
@@ -322,6 +325,7 @@ const linkCtl = await evaluate(`
   await retry;
   const back = { ...view(c), toasts: c.events.connected.length };
   c.ctl.setReconnecting(null);
+  c.ctl.setLocked(null);
 
   // A browser with no Web Bluetooth: that button stays off, and says why.
   const d = make({ webBluetooth: false, webSerial: true });
@@ -380,12 +384,18 @@ check(
   JSON.stringify(linkCtl.cancel),
 );
 check(
-  "an automatic reconnect reads 'reconnecting via' between and during tries, and its connect is not toasted",
+  "an automatic reconnect reads 'reconnecting via', keeps its link marked and offers Cancel between and during tries, and its connect is not toasted",
   linkCtl.waiting.pill === "reconnecting via BLE…" &&
     linkCtl.waiting.pillWarn &&
+    linkCtl.waiting.marks.join() === "connecting,," &&
+    linkCtl.waiting.disc === "Cancel" &&
+    !linkCtl.waiting.discOff &&
     linkCtl.trying.pill === "reconnecting via BLE…" &&
     linkCtl.trying.marks.join() === "connecting,," &&
+    linkCtl.trying.disc === "Cancel" &&
+    !linkCtl.trying.discOff &&
     linkCtl.back.pill === "connected via BLE" &&
+    linkCtl.back.marks.join() === "connected,," &&
     linkCtl.back.toasts === 0,
   JSON.stringify({ waiting: linkCtl.waiting, trying: linkCtl.trying, back: linkCtl.back }),
 );
@@ -7899,6 +7909,7 @@ const arResume = await evaluate(`${AR}
     bannerShown: !$('reconnectBanner').hidden,
     text: $('reconnectText').textContent,
     bleLocked: $('btnBle').disabled,
+    disconnectText: $('btnDisconnect').textContent.trim(),
     disconnectLocked: $('btnDisconnect').disabled,
     pill: $('connPill').textContent,
   };
@@ -7919,12 +7930,14 @@ const arResume = await evaluate(`${AR}
   };
 `);
 check(
-  "a drop mid-stream shows the reconnect banner and holds the connect buttons",
+  "a drop mid-stream shows the reconnect banner, holds the connect buttons and offers Cancel",
   arResume.during.bannerShown &&
     /Reconnecting over the mock sensor/.test(arResume.during.text) &&
     arResume.during.bleLocked &&
-    arResume.during.disconnectLocked &&
-    // DEV-1520: not "disconnected" while the page is still trying.
+    // DEV-1520: Disconnect is Cancel for the whole reconnect, as in the
+    // Verisense console, and the pill is not "disconnected" while it tries.
+    arResume.during.disconnectText === "Cancel" &&
+    !arResume.during.disconnectLocked &&
     arResume.during.pill === "reconnecting via mock…",
   JSON.stringify(arResume.during),
 );
@@ -8005,6 +8018,58 @@ check(
   "and no try follows it",
   arCancel.later.refusedLeft === 98 && arCancel.later.sameLink,
   JSON.stringify(arCancel.later),
+);
+
+/* DEV-1520: Disconnect reads Cancel for the whole reconnect, between tries as
+   well as during one, and stops it as the banner's Cancel does. */
+const arDiscCancel = await evaluate(`${AR}
+  $('btnMock').click();
+  await until(connected, 8000);
+  await sleep(400);
+  const first = window.mockTransport;
+  window.mockRefuseConnects = 99;
+  first.emitDisconnect(new Error('switched off (mock)'));
+  await until(() => window.mockRefuseConnects === 98, 4000);
+  await sleep(200);
+  const cancelLines = () => [...document.querySelectorAll('#log .log-line')]
+    .filter(l => /automatic reconnect cancelled/.test(l.textContent)).length;
+  const cancelsBefore = cancelLines();
+  const between = { text: $('btnDisconnect').textContent.trim(), off: $('btnDisconnect').disabled,
+    title: $('btnDisconnect').title, pill: $('connPill').textContent,
+    banner: $('reconnectText').textContent };
+  $('btnDisconnect').click();
+  await sleep(300);
+  const right = {
+    bannerHidden: $('reconnectBanner').hidden,
+    pill: $('connPill').textContent,
+    disc: $('btnDisconnect').textContent.trim(),
+    disconnectOff: $('btnDisconnect').disabled,
+    logged: cancelLines() === cancelsBefore + 1,
+  };
+  await sleep(5000);
+  const later = { refusedLeft: window.mockRefuseConnects, sameLink: window.mockTransport === first };
+  window.mockRefuseConnects = 0;
+  return { between, right, later };
+`);
+check(
+  "between reconnect tries Disconnect reads Cancel, is live, and says what it does",
+  arDiscCancel.between.text === "Cancel" &&
+    !arDiscCancel.between.off &&
+    arDiscCancel.between.title === "Stop reconnecting" &&
+    arDiscCancel.between.pill === "reconnecting via mock…" &&
+    /trying again/.test(arDiscCancel.between.banner),
+  JSON.stringify(arDiscCancel.between),
+);
+check(
+  "and pressing it stops the reconnect like the banner's Cancel, with no try after",
+  arDiscCancel.right.bannerHidden &&
+    arDiscCancel.right.pill === "disconnected" &&
+    arDiscCancel.right.disc === "Disconnect" &&
+    arDiscCancel.right.disconnectOff &&
+    arDiscCancel.right.logged &&
+    arDiscCancel.later.refusedLeft === 98 &&
+    arDiscCancel.later.sameLink,
+  JSON.stringify({ ...arDiscCancel.right, ...arDiscCancel.later }),
 );
 
 const arUserDisconnect = await evaluate(`${AR}

@@ -115,7 +115,7 @@ const CANCELLED = "connect cancelled";
  *   readonly session: object|null,
  *   readonly connecting: boolean,
  *   setConnected: (on: boolean, label?: string) => void,
- *   setReconnecting: (label: string|null) => void,
+ *   setReconnecting: (label: string|null, mode?: string|null) => void,
  *   setLocked: (reason: string|null) => void,
  *   support: object,
  *   connectFailureHints: (mode: string, err: unknown) => string[],
@@ -168,11 +168,14 @@ export function createConnectController(cfg) {
   let rejectPending = null;
   /**
    * The page's automatic reconnect, while one runs: the label of the link it
-   * is bringing back. Between its tries the link is down, but the pill says
-   * "reconnecting", not "disconnected", because the page has not given up.
+   * is bringing back, and its mode. Between its tries the link is down, but
+   * the pill says "reconnecting", not "disconnected", and the link's button
+   * stays marked, because the page has not given up.
    * @type {string|null}
    */
   let reconnectLabel = null;
+  /** @type {string|null} */
+  let reconnectMode = null;
   /** Guards the disconnect path against firing twice for one drop. */
   let disconnectReported = false;
   /** Detach the SDK disconnect subscription, when it returned one. */
@@ -222,11 +225,14 @@ export function createConnectController(cfg) {
       if (!el) continue;
       el.disabled = on || connecting || !!lockReason || !capable;
       el.title = lockReason ?? (capable ? "" : incapableNote(mode));
-      /* The link in use is the one button marked; at rest none is. */
+      /* The link in use is the one button marked; at rest none is. A link
+       * being brought back stays marked between the reconnect's tries too,
+       * rather than flashing with each one. */
       const linkState =
         activeMode === mode
           ? "connected"
-          : connecting && pendingMode === mode
+          : (connecting && pendingMode === mode) ||
+              (!on && reconnectLabel && reconnectMode === mode)
             ? "connecting"
             : null;
       if (linkState) {
@@ -240,13 +246,17 @@ export function createConnectController(cfg) {
     if (els.disconnect) {
       /* A connect in progress can be stopped from the same place a live link
        * is: a BLE connect can stay pending for ever on Windows (DEV-845), and
-       * the only other way out was to reload the page. Not while the link is
-       * locked: the lock's owner is the one connecting. */
-      const canCancel = connecting && !lockReason;
+       * the only other way out was to reload the page. So can the page's
+       * automatic reconnect, for the whole of it, between tries as well as
+       * during one: the same rule as the Verisense console. Not otherwise
+       * while the link is locked: the lock's owner is the one connecting. */
+      const reconnecting = !on && !!reconnectLabel;
+      const canCancel = reconnecting || (connecting && !lockReason);
       els.disconnect.textContent = canCancel ? "Cancel" : "Disconnect";
       els.disconnect.disabled = canCancel ? false : !on || !!lockReason;
-      els.disconnect.title =
-        lockReason ?? (canCancel ? "Stop this connection attempt" : "");
+      els.disconnect.title = reconnecting
+        ? "Stop reconnecting"
+        : (lockReason ?? (canCancel ? "Stop this connection attempt" : ""));
     }
     if (els.pill) {
       let state = "disconnected";
@@ -699,13 +709,17 @@ export function createConnectController(cfg) {
     },
     setConnected,
     /**
-     * Say an automatic reconnect is under way over the link `label` names,
-     * or, with `null`, that it has ended. While set, a link that is down reads
-     * "reconnecting via …" rather than "disconnected", and a connect it makes
-     * does not call `onConnected`.
+     * Say an automatic reconnect is under way over the link `label` names
+     * (`mode` is that link's connect mode, for its button), or, with `null`,
+     * that it has ended. While set and the link is down: the pill reads
+     * "reconnecting via …" rather than "disconnected", the link's button stays
+     * marked, and Disconnect reads "Cancel" and is enabled even through the
+     * page's lock, for the page to route to the reconnect's own cancel. A
+     * connect it makes does not call `onConnected`.
      */
-    setReconnecting(label) {
+    setReconnecting(label, mode = null) {
       reconnectLabel = label || null;
+      reconnectMode = reconnectLabel ? mode : null;
       render();
     },
     /**
