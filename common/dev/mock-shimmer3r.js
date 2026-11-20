@@ -1131,7 +1131,9 @@ export function mockEnabledFromUrl() {
  *   STATUS_RESPONSE, which is how the firmware tells a host about a change
  *   the host did not cause. `transport.factoryTest` is the self-test run
  *   count, whether a report is still printing and the exact text printed;
- *   `transport.rtc` exposes the sensor's own running clock.
+ *   `transport.rtc` exposes the sensor's own running clock; and
+ *   `transport.holdReplies(op)` holds the answers to one opcode until
+ *   released, to catch a page part-way through a read.
  */
 export function createMockShimmer3RTransport(opts = {}) {
   const framed = opts.framed !== false;
@@ -2909,14 +2911,56 @@ export function createMockShimmer3RTransport(opts = {}) {
   }
 
   // -------------------------------------------------------------------------
+  // Held replies
+  // -------------------------------------------------------------------------
+
+  /** Opcode → the commands taken while its answers are held. */
+  const holds = new Map();
+
+  /**
+   * Hold the answer to every command with opcode `op` until `release()`: the
+   * command is taken and nothing comes back yet, as when the reply is still
+   * in the air.
+   *
+   * For catching a page part-way through a read — Disconnect pressed while
+   * the connect sequence's calibration read waits is the case it was added
+   * for (DEV-1524). `held` is how many commands are waiting. `release()`
+   * answers them in order if the link is still up, and drops them if it is
+   * not: a sensor does not answer a host that has gone.
+   *
+   * @param {number} op
+   * @returns {{readonly held: number, release: () => void}}
+   */
+  transport.holdReplies = (op) => {
+    const queue = [];
+    holds.set(op, queue);
+    return {
+      get held() {
+        return queue.length;
+      },
+      release() {
+        if (holds.get(op) === queue) holds.delete(op);
+        const waiting = queue.splice(0);
+        if (transport.connected) for (const c of waiting) onCommand(c);
+      },
+    };
+  };
+
+  // -------------------------------------------------------------------------
   // Command handling
   // -------------------------------------------------------------------------
 
-  transport.setOnWrite((bytes) => {
+  function onCommand(bytes) {
     const cmd = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
     if (!cmd.length) return;
     if (debug) console.log("[mock] <-", hex(cmd));
     const op = cmd[0];
+
+    const held = holds.get(op);
+    if (held) {
+      held.push(cmd);
+      return;
+    }
 
     if (op in REMEMBERED_SETS) {
       state[REMEMBERED_SETS[op]] = cmd[1] ?? 0;
@@ -3517,7 +3561,9 @@ export function createMockShimmer3RTransport(opts = {}) {
         reply([NACK]);
         return;
     }
-  });
+  }
+
+  transport.setOnWrite(onCommand);
 
   return transport;
 }
