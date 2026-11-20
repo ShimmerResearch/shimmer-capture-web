@@ -6830,21 +6830,26 @@
       /**
        * Start the automatic reconnect after a drop the page did not ask for.
        *
-       * The connect buttons are held while it runs, Disconnect included:
-       * Cancel on the banner is the one way out, so a click cannot race a
-       * try for the link.
+       * The connect buttons are held while it runs, so a click cannot race a
+       * try for the link. Two things stop it, and both go through the
+       * reconnect's own cancel: Cancel on the banner, and Disconnect, which
+       * reads "Cancel" for the whole reconnect (DEV-1520, the Verisense
+       * console's rule).
        */
       function startReconnect(link, before, reason) {
         const why = reason?.message ?? reason ?? "link lost";
         log.warn(
           `the link dropped (${why}) — reconnecting over ${linkLabel(link)} automatically; Cancel stops it`,
         );
-        connect.setLocked(
-          "Reconnecting to the sensor — press Cancel on the banner first",
-        );
+        connect.setLocked("Reconnecting to the sensor — Cancel stops it");
         /* The pill reads "reconnecting via …" until this ends, rather than
-                 "disconnected" between tries: the page has not given up. */
-        connect.setReconnecting(link.mock ? "mock" : linkLabel(link));
+                 "disconnected" between tries, and the link's button stays
+                 marked: the page has not given up. The mock link has no
+                 button of its own among the three, so none is marked. */
+        connect.setReconnecting(
+          link.mock ? "mock" : linkLabel(link),
+          link.mock ? null : link.mode,
+        );
         showReconnect(
           `The link dropped. Reconnecting over ${linkLabel(link)}…`,
         );
@@ -7620,8 +7625,15 @@
                worth seeing, and the page's unhandledrejection handler puts it in
                the downloadable log. */
       $("btnDisconnect").addEventListener("click", () => {
-        /* While a connect is in progress this button reads "Cancel", and
-                 there is nothing yet to put down (DEV-1520). */
+        /* While a connect or the automatic reconnect is in progress this
+                 button reads "Cancel", and there is nothing yet to put down
+                 (DEV-1520). A reconnect is stopped the way its banner's
+                 Cancel stops it, so a try in progress is released too. */
+        if (reconnect) {
+          autoReconnectBlocked = true;
+          reconnect.cancel();
+          return;
+        }
         if (connect.connecting) {
           void connect.cancelConnect();
           return;

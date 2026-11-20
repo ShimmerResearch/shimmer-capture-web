@@ -112,9 +112,10 @@ the same way, and say the same words, as in the Verisense console (DEV-1520):
   `connecting via BLE…`, `connected via Classic Bluetooth`,
   `reconnecting via BLE…` (while an automatic reconnect runs, between its tries
   too). The strip at the top repeats it.
-- **Cancel.** While a connect is in progress, Disconnect reads **Cancel** and
-  stops it. On Windows a BLE connect to a sensor that does not answer can
-  otherwise wait forever (DEV-845).
+- **Cancel.** While a connect or an automatic reconnect is in progress,
+  Disconnect reads **Cancel** and stops it. On Windows a BLE connect to a
+  sensor that does not answer can otherwise wait forever (DEV-845). During a
+  reconnect the link's button stays amber between tries, not only during one.
 - **A button the browser cannot use** is greyed out, and its tooltip says why
   (no Web Bluetooth, no Web Serial, not a secure origin).
 - **A toast** confirms a connect, and reports a link the sensor dropped.
@@ -136,9 +137,10 @@ that was running starts again:
   (Classic) it was given and connects to the same one again. Reopening the
   port is what brings the RFCOMM link back.
 - **When.** 1 s after the drop, then after 2, 4, 8 and 15 s, and every 15 s
-  after that, until it connects or you press **Cancel** on the banner. Each
-  try has 30 s; on Windows a BLE connect to a sensor out of range can
-  otherwise wait forever. The connect buttons are held meanwhile.
+  after that, until it connects or you press **Cancel** on the banner, or
+  Disconnect, which reads Cancel meanwhile. Each try has 30 s; on Windows a
+  BLE connect to a sensor out of range can otherwise wait forever. The connect
+  buttons are held meanwhile.
 - **What comes back.** The page runs its usual connect sequence, then restarts
   the stream. The firmware stops the stream when the link drops but keeps an SD
   log going, so a stream with SD logging comes back as a plain stream while the
