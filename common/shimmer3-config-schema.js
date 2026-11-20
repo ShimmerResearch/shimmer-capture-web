@@ -47,14 +47,18 @@
  *
  * ONE KEY HERE IS ONLY HALF THE ANSWER. `sdTransfer` reports that this client
  * and this link CAN carry SD file transfer; it cannot report whether the
- * connected firmware transfers files intact, because that needs a firmware
- * version read and this function is synchronous. A caller that offers a
+ * connected sensor serves it, because that needs the hardware and firmware
+ * version reads and this function is synchronous. A caller that offers a
  * download must narrow it afterwards with the client's own asynchronous gate:
  *
  *   caps.sdTransfer = caps.sdTransfer && (await client.supportsSdTransfer());
  *
- * v1.01.009 and v1.01.010 speak the protocol and corrupt every block, so
- * skipping that step hands the user silently wrong data.
+ * Only a Shimmer3R serves it: no LogAndStream_Shimmer3 release has the
+ * commands. On a Shimmer3R, v1.01.009 and v1.01.010 speak the protocol and
+ * corrupt every block, so skipping that step hands the user silently wrong
+ * data. The SDK's gate checks the generation from 0.5.22; before that it
+ * judged by the firmware version alone, so a caller on an older SDK also
+ * needs the sensor to have reported hardware version 10.
  *
  * @param {object|null} client a Shimmer3Client / Shimmer3RClient / wired client
  * @param {"ble"|"rfcomm"|"usb"|string} [mode] the link the client is on
