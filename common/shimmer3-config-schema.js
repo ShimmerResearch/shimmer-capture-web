@@ -56,7 +56,7 @@
  * Only a Shimmer3R serves it: no LogAndStream_Shimmer3 release has the
  * commands. On a Shimmer3R, v1.01.009 and v1.01.010 speak the protocol and
  * corrupt every block, so skipping that step hands the user silently wrong
- * data. The SDK's gate checks the generation from 0.5.21; before that it
+ * data. The SDK's gate checks the generation from 0.5.22; before that it
  * judged by the firmware version alone, so a caller on an older SDK also
  * needs the sensor to have reported hardware version 10.
  *
