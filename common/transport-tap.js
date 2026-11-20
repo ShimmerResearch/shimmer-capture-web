@@ -34,6 +34,13 @@
  *    the caller opts in, and everything else is capped per second with a
  *    single summary line when the cap bites.
  *
+ * What it does NOT cap is the line itself: every byte of every chunk it
+ * prints is printed. The volume is bounded by the two rules above, in lines,
+ * and a cap in bytes on top of them bought nothing but missing bytes. It used
+ * to stop each line at 32, which cut a 133-byte GET_INFOMEM page to its first
+ * 32 bytes and hid the CRC trailer: the one part of a long reply a reader
+ * comparing it against the wire most needs to see (DEV-1519).
+ *
  * Nothing here touches `document`.
  *
  *   import { createTransportTap } from "./common/transport-tap.js";
@@ -47,8 +54,11 @@
  */
 export const DATA_PACKET_OPCODE = 0x00;
 
-/** Bytes printed per line before the rest is summarised. */
-export const MAX_BYTES_PER_LINE_DEFAULT = 32;
+/**
+ * Bytes printed per line before the rest is summarised: all of them. A caller
+ * that wants a cap passes `maxBytesPerLine`; the page does not.
+ */
+export const MAX_BYTES_PER_LINE_DEFAULT = Infinity;
 
 /** Lines a second the tap will print before it starts coalescing. */
 export const MAX_LINES_PER_SECOND_DEFAULT = 100;
@@ -57,7 +67,8 @@ export const MAX_LINES_PER_SECOND_DEFAULT = 100;
 const WINDOW_MS = 1000;
 
 /**
- * Lowercase hex, space separated, truncated to `max` bytes.
+ * Lowercase hex, space separated: every byte, unless `max` says fewer, in
+ * which case the line ends in `… +N of M`.
  *
  * Lowercase because the whole point is to be scanned quickly for a known
  * opcode, and lowercase hex has more distinct letter shapes than uppercase.
@@ -65,10 +76,10 @@ const WINDOW_MS = 1000;
  * `\bRX\b`, which is what routes these lines to the log's TX/RX filter.
  *
  * @param {Uint8Array} bytes
- * @param {number} max
+ * @param {number} [max=Infinity]
  * @returns {string}
  */
-export function formatHexLine(bytes, max) {
+export function formatHexLine(bytes, max = MAX_BYTES_PER_LINE_DEFAULT) {
   const n = Math.min(bytes.length, max);
   let out = "";
   for (let i = 0; i < n; i++) {
@@ -89,7 +100,8 @@ export function formatHexLine(bytes, max) {
  *   other line on the page is.
  * @param {boolean} [opts.enabled=false] produce lines from the start
  * @param {boolean} [opts.includeDataPackets=false] print streaming frames too
- * @param {number} [opts.maxBytesPerLine=32]
+ * @param {number} [opts.maxBytesPerLine=Infinity] bytes printed per chunk
+ *   before the rest is summarised. Every byte unless a caller sets it.
  * @param {number} [opts.maxLinesPerSecond=100]
  * @param {number} [opts.dataPacketOpcode=0x00] first byte that marks a
  *   streaming frame

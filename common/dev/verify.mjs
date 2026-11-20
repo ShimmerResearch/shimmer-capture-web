@@ -311,9 +311,12 @@ const linkCtl = await evaluate(`
     failLine: b.lines.some((l) => /Connect failed/.test(l)),
     dropped: b.events.dropped, again: await b.ctl.cancelConnect() };
 
-  // An automatic reconnect: "reconnecting" between tries, no connect toast.
+  // An automatic reconnect: "reconnecting" between tries, the link's button
+  // marked and Disconnect reading Cancel throughout, even through the page's
+  // lock, and no connect toast.
   const c = make(all);
-  c.ctl.setReconnecting('BLE');
+  c.ctl.setLocked('Reconnecting to the sensor — Cancel stops it');
+  c.ctl.setReconnecting('BLE', 'ble');
   const waiting = view(c);
   const retry = c.ctl.connectVia('ble');
   await tick();
@@ -322,6 +325,7 @@ const linkCtl = await evaluate(`
   await retry;
   const back = { ...view(c), toasts: c.events.connected.length };
   c.ctl.setReconnecting(null);
+  c.ctl.setLocked(null);
 
   // A browser with no Web Bluetooth: that button stays off, and says why.
   const d = make({ webBluetooth: false, webSerial: true });
@@ -380,12 +384,18 @@ check(
   JSON.stringify(linkCtl.cancel),
 );
 check(
-  "an automatic reconnect reads 'reconnecting via' between and during tries, and its connect is not toasted",
+  "an automatic reconnect reads 'reconnecting via', keeps its link marked and offers Cancel between and during tries, and its connect is not toasted",
   linkCtl.waiting.pill === "reconnecting via BLE…" &&
     linkCtl.waiting.pillWarn &&
+    linkCtl.waiting.marks.join() === "connecting,," &&
+    linkCtl.waiting.disc === "Cancel" &&
+    !linkCtl.waiting.discOff &&
     linkCtl.trying.pill === "reconnecting via BLE…" &&
     linkCtl.trying.marks.join() === "connecting,," &&
+    linkCtl.trying.disc === "Cancel" &&
+    !linkCtl.trying.discOff &&
     linkCtl.back.pill === "connected via BLE" &&
+    linkCtl.back.marks.join() === "connected,," &&
     linkCtl.back.toasts === 0,
   JSON.stringify({ waiting: linkCtl.waiting, trying: linkCtl.trying, back: linkCtl.back }),
 );
@@ -2865,6 +2875,13 @@ await goto(`${BASE}?mock=1&rate=1024`);
 const tapBytes = await evaluate(`
   const chk = document.getElementById('chkRawBytes');
   chk.checked = true; chk.dispatchEvent(new Event('change'));
+  /* The pass's link CRC, as CONNECT sets it: the CRC trailer is part of what
+     the tap has to show, so VERIFY_CRC=0 has to reach this section too. */
+  const crcSel = document.getElementById('crcMode');
+  if (crcSel && !crcSel.disabled) {
+    crcSel.value = '${CRC_MODE}';
+    crcSel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
   document.getElementById('btnMock').click();
   for (let i = 0; i < 80 && !document.getElementById('rateHelper'); i++)
     await new Promise(r => setTimeout(r, 100));
@@ -2894,6 +2911,72 @@ check(
   tapBytes.rxCount >= tapBytes.tx.length - 1 &&
     /^RX ff /.test(tapBytes.firstRx),
   `${tapBytes.rxCount} RX lines, first ${tapBytes.firstRx}`,
+);
+
+/* DEV-1519: the tap used to stop every line at 32 bytes, so a 128-byte
+   InfoMem page -- 131 bytes with its ACK and header, 133 with a 2-byte CRC --
+   was logged as its first 32 and "… +101 of 133", and the CRC trailer never
+   appeared at all. Long traffic in both directions, each line compared with
+   what actually crossed the link: the InfoMem page read, then written back
+   unchanged (132 bytes out), then the calibration dump in 128-byte chunks. */
+const tapLong = await evaluate(`
+  const mt = window.mockTransport;
+  const client = window.mockClient;
+  const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join(' ');
+  const sent = [];
+  const ownNotify = Object.prototype.hasOwnProperty.call(mt, 'notify');
+  const realNotify = mt.notify;
+  mt.notify = function (data) {
+    sent.push('RX ' + hex(data instanceof Uint8Array ? data : new Uint8Array(data)));
+    return realNotify.call(this, data);
+  };
+  const writesBefore = mt.writes.length;
+  document.getElementById('btnLogClear').click();
+  let error = null;
+  try {
+    const page = await client.readInfoMem(0, 128);
+    await client.writeInfoMem(0, page);
+    await client.readCalibDump();
+  } catch (e) {
+    error = String(e?.message ?? e);
+  } finally {
+    if (ownNotify) mt.notify = realNotify;
+    else delete mt.notify;
+  }
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const strip = sel => [...document.querySelectorAll(sel)]
+    .map(l => l.textContent.replace(/^\\S+ \\S+ /, ''));
+  const tx = strip('#log .log-line.sev-tx');
+  const rx = strip('#log .log-line.sev-rx');
+  const width = l => l.split(' ').length - 1;
+  const infoMem = rx.find(l => /^RX ff 8d 80 /.test(l)) ?? '';
+  return {
+    error, crc: client.crcMode,
+    tx, rx,
+    wrote: mt.writes.slice(writesBefore).map(w => 'TX ' + hex(w.bytes)),
+    // Data packets are the tap's to leave out; nothing else is.
+    sent: sent.filter(l => !/^RX 00 /.test(l)),
+    infoMemBytes: width(infoMem), infoMemTail: infoMem.slice(-17),
+    longestTx: Math.max(0, ...tx.map(width)),
+    longestRx: Math.max(0, ...rx.map(width)),
+    elided: tx.concat(rx).filter(l => l.includes('…')).length,
+  };
+`);
+check(
+  "a reply longer than 32 bytes is logged whole, CRC trailer included, and so is a long command",
+  tapLong.error === null &&
+    tapLong.crc === Number(CRC_MODE) &&
+    tapLong.elided === 0 &&
+    tapLong.infoMemBytes === 131 + tapLong.crc &&
+    tapLong.longestRx > 32 &&
+    tapLong.longestTx === 132 &&
+    tapLong.rx.length > 2 &&
+    tapLong.rx.join("|") === tapLong.sent.join("|") &&
+    tapLong.tx.join("|") === tapLong.wrote.join("|"),
+  tapLong.error ??
+    `InfoMem page ${tapLong.infoMemBytes} bytes on CRC ${tapLong.crc} ` +
+      `(ends ${tapLong.infoMemTail}), ${tapLong.rx.length} RX lines up to ` +
+      `${tapLong.longestRx} bytes, ${tapLong.tx.length} TX up to ${tapLong.longestTx}`,
 );
 
 const tapStream = await evaluate(`
@@ -7899,6 +7982,7 @@ const arResume = await evaluate(`${AR}
     bannerShown: !$('reconnectBanner').hidden,
     text: $('reconnectText').textContent,
     bleLocked: $('btnBle').disabled,
+    disconnectText: $('btnDisconnect').textContent.trim(),
     disconnectLocked: $('btnDisconnect').disabled,
     pill: $('connPill').textContent,
   };
@@ -7919,12 +8003,14 @@ const arResume = await evaluate(`${AR}
   };
 `);
 check(
-  "a drop mid-stream shows the reconnect banner and holds the connect buttons",
+  "a drop mid-stream shows the reconnect banner, holds the connect buttons and offers Cancel",
   arResume.during.bannerShown &&
     /Reconnecting over the mock sensor/.test(arResume.during.text) &&
     arResume.during.bleLocked &&
-    arResume.during.disconnectLocked &&
-    // DEV-1520: not "disconnected" while the page is still trying.
+    // DEV-1520: Disconnect is Cancel for the whole reconnect, as in the
+    // Verisense console, and the pill is not "disconnected" while it tries.
+    arResume.during.disconnectText === "Cancel" &&
+    !arResume.during.disconnectLocked &&
     arResume.during.pill === "reconnecting via mock…",
   JSON.stringify(arResume.during),
 );
@@ -8005,6 +8091,58 @@ check(
   "and no try follows it",
   arCancel.later.refusedLeft === 98 && arCancel.later.sameLink,
   JSON.stringify(arCancel.later),
+);
+
+/* DEV-1520: Disconnect reads Cancel for the whole reconnect, between tries as
+   well as during one, and stops it as the banner's Cancel does. */
+const arDiscCancel = await evaluate(`${AR}
+  $('btnMock').click();
+  await until(connected, 8000);
+  await sleep(400);
+  const first = window.mockTransport;
+  window.mockRefuseConnects = 99;
+  first.emitDisconnect(new Error('switched off (mock)'));
+  await until(() => window.mockRefuseConnects === 98, 4000);
+  await sleep(200);
+  const cancelLines = () => [...document.querySelectorAll('#log .log-line')]
+    .filter(l => /automatic reconnect cancelled/.test(l.textContent)).length;
+  const cancelsBefore = cancelLines();
+  const between = { text: $('btnDisconnect').textContent.trim(), off: $('btnDisconnect').disabled,
+    title: $('btnDisconnect').title, pill: $('connPill').textContent,
+    banner: $('reconnectText').textContent };
+  $('btnDisconnect').click();
+  await sleep(300);
+  const right = {
+    bannerHidden: $('reconnectBanner').hidden,
+    pill: $('connPill').textContent,
+    disc: $('btnDisconnect').textContent.trim(),
+    disconnectOff: $('btnDisconnect').disabled,
+    logged: cancelLines() === cancelsBefore + 1,
+  };
+  await sleep(5000);
+  const later = { refusedLeft: window.mockRefuseConnects, sameLink: window.mockTransport === first };
+  window.mockRefuseConnects = 0;
+  return { between, right, later };
+`);
+check(
+  "between reconnect tries Disconnect reads Cancel, is live, and says what it does",
+  arDiscCancel.between.text === "Cancel" &&
+    !arDiscCancel.between.off &&
+    arDiscCancel.between.title === "Stop reconnecting" &&
+    arDiscCancel.between.pill === "reconnecting via mock…" &&
+    /trying again/.test(arDiscCancel.between.banner),
+  JSON.stringify(arDiscCancel.between),
+);
+check(
+  "and pressing it stops the reconnect like the banner's Cancel, with no try after",
+  arDiscCancel.right.bannerHidden &&
+    arDiscCancel.right.pill === "disconnected" &&
+    arDiscCancel.right.disc === "Disconnect" &&
+    arDiscCancel.right.disconnectOff &&
+    arDiscCancel.right.logged &&
+    arDiscCancel.later.refusedLeft === 98 &&
+    arDiscCancel.later.sameLink,
+  JSON.stringify({ ...arDiscCancel.right, ...arDiscCancel.later }),
 );
 
 const arUserDisconnect = await evaluate(`${AR}
