@@ -101,8 +101,8 @@ so if you pick the wrong one.
 
 ### Connecting, disconnecting and the link pill
 
-The connect buttons, Disconnect and the pill beside them work the same way,
-and say the same words, as in the Verisense console (DEV-1520):
+The connect buttons, Disconnect and the link pill beside the card's title work
+the same way, and say the same words, as in the Verisense console (DEV-1520):
 
 - **No preferred link.** The three connect buttons carry the same weight. The
   one for the link in use is marked instead: amber while it connects, green

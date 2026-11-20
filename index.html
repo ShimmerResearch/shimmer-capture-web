@@ -186,6 +186,15 @@
         padding: 12px;
       }
 
+      /* DEV-1520: "Sensor link" and the link pill on one line. The pill is no
+         taller than the title's own line, so the line costs nothing. */
+      .link-title {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 4px 10px;
+      }
+
       .device-panel-title {
         display: flex;
         align-items: center;
@@ -594,7 +603,18 @@
            right before a long download. Stacks below 800px. -->
       <div class="link-row">
         <div class="card">
-          <div class="card-title">Sensor link</div>
+          <!-- DEV-1520: the link pill sits in the title line, as the Device
+               card's freshness note does, and as the Verisense console's
+               Connection card has it. On the button row its longer words
+               ("connected via Classic Bluetooth") wrapped that row onto a
+               second line under Linux font metrics and pushed the tab strip
+               past its budget (verify.mjs, TAB_STRIP_BUDGET_PX). -->
+          <div class="card-title link-title">
+            <span>Sensor link</span>
+            <span class="pill link-pill" id="connPill" role="status"
+              >disconnected</span
+            >
+          </div>
           <!-- BLE and Classic Bluetooth first and adjacent: both are radio
                links that need the sensor paired with this host first, so they
                share a story and a failure mode. The wired link is last and
@@ -624,9 +644,6 @@
             </button>
             <!-- Reads "Cancel" while a connect is in progress. -->
             <button id="btnDisconnect" type="button">Disconnect</button>
-            <span class="pill link-pill" id="connPill" role="status"
-              >disconnected</span
-            >
           </div>
           <!-- Chosen BEFORE connecting, and applied as part of the connect
                sequence, because the CRC width changes the size of every packet
