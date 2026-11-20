@@ -599,19 +599,34 @@
                links that need the sensor paired with this host first, so they
                share a story and a failure mode. The wired link is last and
                separated — it needs no pairing, and it speaks a different
-               protocol with no stream and no card access at all. -->
+               protocol with no stream and no card access at all.
+
+               DEV-1520: every connect button carries the same weight. None
+               is styled as the preferred one, because a highlight that never
+               moves reads as "connected over this link" when the sensor may be
+               on another. common/connect-ui.js marks the button of the link
+               actually in use instead, and the pill says it in words — the
+               same design, in the same words, as the Verisense device
+               console. -->
           <div class="row">
-            <button id="btnBle" class="primary" type="button">
+            <button id="btnBle" class="link-btn" type="button">
               Connect BLE
             </button>
-            <button id="btnBt" type="button">Connect Classic Bluetooth</button>
-            <span class="link-sep" aria-hidden="true"></span>
-            <button id="btnUsb" type="button">Connect USB</button>
-            <button id="btnMock" type="button" hidden>Connect (mock)</button>
-            <button id="btnDisconnect" class="secondary" type="button">
-              Disconnect
+            <button id="btnBt" class="link-btn" type="button">
+              Connect Classic Bluetooth
             </button>
-            <span class="pill" id="connPill">disconnected</span>
+            <span class="link-sep" aria-hidden="true"></span>
+            <button id="btnUsb" class="link-btn" type="button">
+              Connect USB
+            </button>
+            <button id="btnMock" class="link-btn" type="button" hidden>
+              Connect (mock)
+            </button>
+            <!-- Reads "Cancel" while a connect is in progress. -->
+            <button id="btnDisconnect" type="button">Disconnect</button>
+            <span class="pill link-pill" id="connPill" role="status"
+              >disconnected</span
+            >
           </div>
           <!-- Chosen BEFORE connecting, and applied as part of the connect
                sequence, because the CRC width changes the size of every packet
@@ -6017,6 +6032,10 @@
         },
         afterConnect: (session) => afterConnect(session),
         onDisconnected: (reason) => onDisconnected(reason),
+        /* DEV-1520: confirmed in the same words as the Verisense console. A
+                 connect can take several seconds, mostly spent looking at the
+                 browser's picker or the sensor, not at this pill. */
+        onConnected: (label) => showToast(`Connected via ${label}`, "ok"),
         echoStatus: () => echoSdkStatus(),
       });
 
@@ -6806,6 +6825,9 @@
         connect.setLocked(
           "Reconnecting to the sensor — press Cancel on the banner first",
         );
+        /* The pill reads "reconnecting via …" until this ends, rather than
+                 "disconnected" between tries: the page has not given up. */
+        connect.setReconnecting(link.mock ? "mock" : linkLabel(link));
         showReconnect(
           `The link dropped. Reconnecting over ${linkLabel(link)}…`,
         );
@@ -6921,6 +6943,7 @@
 
       async function onReconnectDone(result, before) {
         reconnect = null;
+        connect.setReconnecting(null);
         connect.setLocked(null);
         hideReconnect();
         regate();
@@ -7369,6 +7392,8 @@
             mockClient.onDisconnect = (r) => onDisconnected(r);
             await mockClient.connect();
             connect.setConnected(true, "mock");
+            // As a real link's onConnected does (DEV-1520).
+            if (!reconnect) showToast("Connected via mock", "ok");
             await afterConnect({
               client: mockClient,
               mode: framed ? "ble" : "rfcomm",
@@ -7578,6 +7603,12 @@
                worth seeing, and the page's unhandledrejection handler puts it in
                the downloadable log. */
       $("btnDisconnect").addEventListener("click", () => {
+        /* While a connect is in progress this button reads "Cancel", and
+                 there is nothing yet to put down (DEV-1520). */
+        if (connect.connecting) {
+          void connect.cancelConnect();
+          return;
+        }
         void disconnectFromSensor();
       });
 

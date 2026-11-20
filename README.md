@@ -99,6 +99,31 @@ port rather than the device. A Shimmer3R pairs as two separate entries — one
 classic, one BLE — and only the classic one answers on this path; the page says
 so if you pick the wrong one.
 
+### Connecting, disconnecting and the link pill
+
+The connect buttons, Disconnect and the pill beside them work the same way,
+and say the same words, as in the Verisense console (DEV-1520):
+
+- **No preferred link.** The three connect buttons carry the same weight. The
+  one for the link in use is marked instead: amber while it connects, green
+  while connected. A button that stayed highlighted read as "connected over
+  BLE" when the sensor was on Classic Bluetooth or USB.
+- **The pill says the state and the link**: `disconnected`,
+  `connecting via BLE…`, `connected via Classic Bluetooth`,
+  `reconnecting via BLE…` (while an automatic reconnect runs, between its tries
+  too). The strip at the top repeats it.
+- **Cancel.** While a connect is in progress, Disconnect reads **Cancel** and
+  stops it. On Windows a BLE connect to a sensor that does not answer can
+  otherwise wait forever (DEV-845).
+- **A button the browser cannot use** is greyed out, and its tooltip says why
+  (no Web Bluetooth, no Web Serial, not a secure origin).
+- **A toast** confirms a connect, and reports a link the sensor dropped.
+
+The pill names the link, not the port. A web page is never told the COM port:
+Web Serial gives it a USB vendor/product pair or a Bluetooth service class,
+and the browser's picker keeps the port name to itself. Which sensor it is
+shows in the Device card once the connect sequence has read it.
+
 ### Reconnecting automatically
 
 **Reconnect automatically**, at the end of the Link CRC row (its tooltip says
