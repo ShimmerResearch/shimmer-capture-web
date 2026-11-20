@@ -960,6 +960,25 @@ export function createCalibrationEditor(host, opts = {}) {
     return sdk.getDefaultCalibration(fam, entry.row.group, range);
   }
 
+  /**
+   * Whether a stored block is a Shimmer3's pre-2025 KXTC9-2050 default
+   * (offset 2253, sensitivity 92), which reads about 17 % high (DEV-1528).
+   * The SDK's own rule decides; an SDK too old to have it says no. Only the
+   * Shimmer3's low-noise accel: a Shimmer3R's is another part.
+   */
+  function isStaleLnAccelDefault(entry, block) {
+    const fam = family();
+    if (entry.row.group !== "lnAccel" || !fam || fam === "shimmer3r")
+      return false;
+    if (!block || typeof sdk.isStaleKxtc9DefaultCalibration !== "function")
+      return false;
+    return sdk.isStaleKxtc9DefaultCalibration(
+      sdk.parseKinematicCalibBlock(block, {
+        sensitivityScale: entry.sensitivityScale,
+      }),
+    );
+  }
+
   /** The 21 bytes the SDK defaults encode to for this sensor and range. */
   function defaultBlock(entry, range) {
     const d = defaultsFor(entry, range);
@@ -1151,6 +1170,7 @@ export function createCalibrationEditor(host, opts = {}) {
     const stored = storedBlock(entry, range);
     const def = defaultBlock(entry, range);
     const rec = storedRecord(entry, range);
+    const stale = isStaleLnAccelDefault(entry, stored);
     setPlaceholders(entry, range);
 
     const built = blockFromCells(entry);
@@ -1217,6 +1237,13 @@ export function createCalibrationEditor(host, opts = {}) {
       note =
         "What is stored is byte-for-byte the factory default for this range, " +
         "so this sensor has no calibration of its own here.";
+    } else if (stale) {
+      /* Not "this sensor's own values": older firmware seeded it, and it is
+         wrong for every Shimmer3. It is shown, and used, exactly as stored;
+         the fix is a recalibration, which is the user's to make. */
+      pill = "pre-2025 default";
+      pillClass = "pill warn";
+      note = sdk.STALE_LN_ACCEL_DEFAULT_WARNING;
     } else if (date) {
       pill = `calibrated ${formatStamp(date)}`;
       pillClass = "pill on";
@@ -1286,7 +1313,9 @@ export function createCalibrationEditor(host, opts = {}) {
         ? "never"
         : def && bytesEqual(stored, def)
           ? "defaults"
-          : "device";
+          : stale
+            ? "stale-default"
+            : "device";
   }
 
   /** The first record for a sensor id at any range, for the unmodelled cards. */

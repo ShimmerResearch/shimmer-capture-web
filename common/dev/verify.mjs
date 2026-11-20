@@ -2569,6 +2569,56 @@ check(
   `${calFile.savedLen} bytes saved; reloaded offset ${calFile.offsets}`,
 );
 
+// ---- a Shimmer3 still on the pre-2025 KXTC9 default says so (DEV-1528)
+/* Firmware before Feb 2025 wrote offset 2253 / sensitivity 92 as a Shimmer3's
+   own LN accel record; it reads about 17 % high. The card shows it as stored,
+   with the SDK's warning, never as "this sensor's own values". The mock is a
+   Shimmer3R, so this runs with the sensor let go and a Shimmer3 dump loaded
+   from a file: with nothing connected, the dump's own hardware id decides. */
+const calStale = await evaluate(`
+  ${CAL}
+  const sdk = await import('/vendor/shimmer-web-sdk.esm.js');
+  document.getElementById('btnDisconnect').click();
+  await new Promise(r => setTimeout(r, 900));
+  const ALIGN = [0, -1, 0, -1, 0, 0, 0, 0, -1];
+  const dumpOf = (offset, sens) => {
+    const block = sdk.generateKinematicCalibBlock([offset, offset, offset],
+      [sens, sens, sens], ALIGN);
+    return sdk.generateCalibDump(
+      { hardwareId: 3, firmwareId: 3, firmwareMajor: 1, firmwareMinor: 1, firmwareInternal: 9 },
+      [{ sensorId: sdk.SC_SENSOR.ANALOG_ACCEL, range: 0, calibLen: block.length,
+         timestampTicks: new Uint8Array(8), calibBytes: block, isDefault: false }]);
+  };
+  const look = async (bytes) => {
+    const ok = window.calibrationEditor.load(bytes);
+    await new Promise(r => setTimeout(r, 300));
+    const c = card('lnAccel');
+    return { ok, pill: c ? pill('lnAccel') : null, state: c?.dataset.calState ?? null,
+      note: c?.querySelector('[data-cal-note]')?.textContent ??
+        c?.textContent ?? '',
+      offsets: c ? cells('lnAccel', 'offset') : null };
+  };
+  return { stale: await look(dumpOf(2253, 92)), current: await look(dumpOf(2047, 83)),
+    warning: sdk.STALE_LN_ACCEL_DEFAULT_WARNING };
+`);
+check(
+  "a Shimmer3's pre-2025 LN accel default is shown as stored, with the warning",
+  calStale.stale.ok &&
+    calStale.stale.pill === "pre-2025 default" &&
+    calStale.stale.state === "stale-default" &&
+    calStale.stale.offsets === "2253,2253,2253" &&
+    calStale.stale.note.includes(calStale.warning) &&
+    calStale.current.ok &&
+    calStale.current.pill !== "pre-2025 default" &&
+    calStale.current.state !== "stale-default",
+  `2253/92 → ${calStale.stale.pill} (${calStale.stale.state}); ` +
+    `2047/83 → ${calStale.current.pill} (${calStale.current.state})`,
+);
+check(
+  "reconnect after the stale-default check",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+
 // ---- the link is shared: calibration cannot race a stream or an SD transfer
 const calContend = await evaluate(`
   ${CAL}
