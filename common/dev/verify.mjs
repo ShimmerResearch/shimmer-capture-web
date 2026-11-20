@@ -188,6 +188,11 @@ await evaluate(
       below sees the session end as it did before it existed. Its own section
       near the end turns it back on. */
    try { localStorage.setItem('shimmerCaptureAutoReconnect', 'off'); } catch {}
+   /* The battery auto-refresh (DEV-1512) is on by default, every minute. Off,
+      no check below can find a GET_VBATT in a write count it did not expect,
+      or a button held for the read. Its own section near the end turns it
+      back on, at a test interval. */
+   try { localStorage.setItem('shimmerCaptureBatteryRefresh', 'off'); } catch {}
    return 1;`,
 );
 await goto(`${BASE}?mock=1`);
@@ -4587,10 +4592,45 @@ const MUST_EXPLAIN = {
     "testBusy",
     "busy",
   ],
+  /* The battery auto-refresh (DEV-1512) waits like the drift monitor, on a
+     timer and unseen, so it has to name every holder too -- and the automatic
+     reconnect, which takes the link back and restarts a stream right after
+     the connect sequence that starts the poll. */
+  batteryRefreshSkipReason: [
+    "streaming",
+    "sdLogging",
+    "linkTesting",
+    "sdBusy",
+    "brandBusy",
+    "calibBusy",
+    "testBusy",
+    "otaBusy",
+    "busy",
+    "reconnect",
+  ],
 };
 
+/**
+ * A reason function's body, together with the body of any other function in
+ * MUST_EXPLAIN that it hands on to: batteryRefreshSkipReason starts from
+ * driftSampleSkipReason rather than repeating it, and a flag that the function
+ * it calls names is a flag it explains.
+ */
+function explainingBody(src, name, seen = new Set()) {
+  const body = fnBody(src, name);
+  if (!body || seen.has(name)) return body;
+  seen.add(name);
+  let out = body;
+  for (const other of Object.keys(MUST_EXPLAIN)) {
+    if (other !== name && body.includes(`${other}(`)) {
+      out += explainingBody(src, other, seen) ?? "";
+    }
+  }
+  return out;
+}
+
 for (const [fn, flags] of Object.entries(MUST_EXPLAIN)) {
-  const body = fnBody(pageSrc, fn);
+  const body = explainingBody(pageSrc, fn);
   const missing = body ? flags.filter((f) => !body.includes(f)) : flags;
   check(
     `${fn} can explain every other panel holding the link`,
@@ -7969,6 +8009,367 @@ check(
   "scrolled back up, the strip hides again",
   !strip.upAgain.shown,
   JSON.stringify(strip.upAgain),
+);
+
+// ===========================================================================
+// Battery auto-refresh (DEV-1512). `&battMs=` stands in for the chosen
+// interval, so a check waits a second or two rather than a minute; Off stays
+// off. GET_VBATT is 0x95, counted on the wire. The setInterval spy tells a
+// stopped timer from one that is still running and skipping every tick, which
+// a write count alone cannot.
+// ===========================================================================
+console.log("\n--- battery auto-refresh (DEV-1512) ---");
+const BATT_KEY = "shimmerCaptureBatteryRefresh";
+const BATT_MS = 1500;
+const BR = `${AR}
+  const vbatt = () => (window.mockTransport?.writes ?? [])
+    .filter(w => (w.bytes ?? w.data)[0] === 0x95).length;
+  const logCount = (re) => [...document.querySelectorAll('#log .log-line')]
+    .filter(l => re.test(l.textContent)).length;
+  const setRefresh = (v) => {
+    const s = $('selBatteryRefresh');
+    s.value = v;
+    s.dispatchEvent(new Event('change'));
+  };
+  const READ_AT = /^Read at \\d\\d:\\d\\d:\\d\\d$/;
+`;
+
+/* A first visit: nothing stored, so the setting is at its default. */
+await evaluate(
+  `try { localStorage.removeItem('${BATT_KEY}'); } catch {} return 1;`,
+);
+await goto(`${BASE}?mock=1&battMs=${BATT_MS}`);
+const brIdle = await evaluate(`${BR}
+  window.__battTimers = new Set();
+  const realSI = window.setInterval.bind(window);
+  const realCI = window.clearInterval.bind(window);
+  window.setInterval = (fn, ms, ...rest) => {
+    const id = realSI(fn, ms, ...rest);
+    if (ms === ${BATT_MS}) window.__battTimers.add(id);
+    return id;
+  };
+  window.clearInterval = (id) => { window.__battTimers.delete(id); return realCI(id); };
+  const sel = $('selBatteryRefresh');
+  const row = sel.closest('.device-panel-title');
+  const refresh = $('btnRefreshDevice').getBoundingClientRect();
+  const at = sel.getBoundingClientRect();
+  const before = {
+    value: sel.value,
+    inTitleRow: !!row && row.contains($('btnRefreshDevice')),
+    sameLine: Math.abs((at.top + at.bottom) / 2 - (refresh.top + refresh.bottom) / 2) < 4,
+    leftOfRefresh: at.right <= refresh.left,
+    requiresNothing: !sel.dataset.requires,
+  };
+  $('btnMock').click();
+  await until(() => logHas(/mock sensor connected/), 8000);
+  const t0 = performance.now();
+  const atConnect = vbatt();
+  const connectTitle = $('idBatt').title;
+  const echoedAtConnect = logCount(/GET_VBATT/);
+  $('idBatt').title = 'cleared by the test';
+  /* The freshness note's longest form, which the list beside it left no room
+     for on one line: it wraps inside the row rather than pushing Refresh out
+     of the panel or making the row taller. */
+  const fresh = $('statusFresh');
+  const titleRow = fresh.closest('.device-panel-title');
+  const freshWas = fresh.textContent;
+  fresh.textContent = 'inferred 23:59:59, unconfirmed';
+  /* Measured as laid out, and again with the row 40px narrower, which stands
+     in for fonts wider than this machine's: CI's Linux fonts set this row
+     about 17% wider than Windows does, and a check that only passes on the
+     fonts it was written on is how it first failed there. */
+  const measure = () => ({
+    overflow: titleRow.scrollWidth - titleRow.clientWidth,
+    rowH: Math.round(titleRow.getBoundingClientRect().height),
+    noteH: Math.round(fresh.getBoundingClientRect().height),
+    buttonH: Math.round($('btnRefreshDevice').getBoundingClientRect().height),
+    shown: fresh.offsetParent !== null,
+  });
+  const crowded = { asLaidOut: measure() };
+  titleRow.style.boxSizing = 'border-box';
+  titleRow.style.width = (titleRow.getBoundingClientRect().width - 40) + 'px';
+  crowded.narrower = measure();
+  titleRow.style.width = '';
+  titleRow.style.boxSizing = '';
+  fresh.textContent = freshWas;
+  await sleep(${BATT_MS} - 600);
+  const early = vbatt() - atConnect;
+  await until(() => vbatt() > atConnect, 4000);
+  const elapsed = Math.round(performance.now() - t0);
+  await until(() => READ_AT.test($('idBatt').title), 2000);
+  await sleep(200);
+  return {
+    before,
+    crowded,
+    atConnect, connectTitle, early, elapsed,
+    polled: vbatt() - atConnect,
+    title: $('idBatt').title,
+    timers: window.__battTimers.size,
+    echoedAtConnect,
+    echoedAfterPoll: logCount(/GET_VBATT/),
+    changeLines: logCount(/battery now/),
+  };
+`);
+check(
+  "the battery auto-refresh defaults to every minute, in the Device title row beside Refresh",
+  brIdle.before.value === "60000" &&
+    brIdle.before.inTitleRow &&
+    brIdle.before.sameLine &&
+    brIdle.before.leftOfRefresh &&
+    brIdle.before.requiresNothing,
+  JSON.stringify(brIdle.before),
+);
+check(
+  "and the freshness note at its longest wraps in that row instead of pushing Refresh out",
+  [brIdle.crowded.asLaidOut, brIdle.crowded.narrower].every(
+    (m) =>
+      m.shown &&
+      m.overflow === 0 &&
+      m.rowH <= m.buttonH + 1 &&
+      m.noteH <= m.rowH,
+  ),
+  JSON.stringify(brIdle.crowded),
+);
+check(
+  "the connect read stamps the battery row with its time",
+  brIdle.atConnect === 1 &&
+    /^Read at \d\d:\d\d:\d\d$/.test(brIdle.connectTitle),
+  `${brIdle.atConnect} read(s), title "${brIdle.connectTitle}"`,
+);
+check(
+  "idle and connected, a read follows one interval after connect and updates the read time",
+  brIdle.early === 0 &&
+    brIdle.polled === 1 &&
+    brIdle.elapsed >= BATT_MS - 300 &&
+    /^Read at \d\d:\d\d:\d\d$/.test(brIdle.title) &&
+    brIdle.timers === 1,
+  `early ${brIdle.early}, read at +${brIdle.elapsed} ms, title "${brIdle.title}", ${brIdle.timers} timer(s)`,
+);
+check(
+  "the poll's read keeps the SDK's status lines out of the log, and an unchanged reading adds none",
+  brIdle.echoedAtConnect >= 1 &&
+    brIdle.echoedAfterPoll === brIdle.echoedAtConnect &&
+    brIdle.changeLines === 0,
+  `GET_VBATT lines ${brIdle.echoedAtConnect} → ${brIdle.echoedAfterPoll}, "battery now" lines ${brIdle.changeLines}`,
+);
+
+const brStream = await evaluate(`${BR}
+  await until(() => !$('btnStreamStart').disabled, 3000);
+  $('btnStreamStart').click();
+  await until(() => !$('btnStreamStop').disabled, 4000);
+  const s0 = vbatt();
+  await sleep(${BATT_MS * 3});
+  const during = vbatt() - s0;
+  const timers = window.__battTimers.size;
+  const paused = logCount(/battery auto-refresh paused \\(the sensor is sensing\\)/);
+  $('btnStreamStop').click();
+  await until(() => !$('btnStreamStart').disabled, 4000);
+  const s1 = vbatt();
+  await until(() => vbatt() > s1, ${BATT_MS * 2 + 1000});
+  return { during, timers, paused, resumed: vbatt() - s1 };
+`);
+check(
+  "while streaming, no battery read is sent, and the pause is logged once",
+  brStream.during === 0 && brStream.timers === 1 && brStream.paused === 1,
+  JSON.stringify(brStream),
+);
+check(
+  "once the stream stops, the reads resume",
+  brStream.resumed >= 1,
+  JSON.stringify(brStream),
+);
+
+const brOff = await evaluate(`${BR}
+  await until(() => !$('btnStreamStart').disabled, 3000);
+  setRefresh('off');
+  const storedOff = localStorage.getItem('${BATT_KEY}');
+  const o0 = vbatt();
+  const timersOff = window.__battTimers.size;
+  await sleep(${BATT_MS * 3});
+  const whileOff = vbatt() - o0;
+  setRefresh('300000');
+  const o1 = vbatt();
+  await until(() => vbatt() > o1, ${BATT_MS * 2 + 1000});
+  return {
+    storedOff, timersOff, whileOff,
+    storedOn: localStorage.getItem('${BATT_KEY}'),
+    timersOn: window.__battTimers.size,
+    resumed: vbatt() - o1,
+  };
+`);
+check(
+  "set to Off while connected, the timer stops and no read is sent",
+  brOff.storedOff === "off" && brOff.timersOff === 0 && brOff.whileOff === 0,
+  JSON.stringify(brOff),
+);
+check(
+  "set back on, it restarts at the new interval, which is remembered",
+  brOff.storedOn === "300000" && brOff.timersOn === 1 && brOff.resumed >= 1,
+  JSON.stringify(brOff),
+);
+
+const brDisconnect = await evaluate(`${BR}
+  await until(() => !$('btnDisconnect').disabled, 3000);
+  const link = window.mockTransport;
+  $('btnDisconnect').click();
+  await until(() => $('connPill').textContent === 'disconnected', 4000);
+  const d0 = link.writes.filter(w => (w.bytes ?? w.data)[0] === 0x95).length;
+  await sleep(${BATT_MS * 3});
+  return {
+    timers: window.__battTimers.size,
+    after: link.writes.filter(w => (w.bytes ?? w.data)[0] === 0x95).length - d0,
+    title: $('idBatt').hasAttribute('title'),
+    skippedDisconnected: logHas(/battery auto-refresh paused \\(disconnected\\)/),
+  };
+`);
+check(
+  "Disconnect stops the timer, and the read time goes with the reading",
+  brDisconnect.timers === 0 &&
+    brDisconnect.after === 0 &&
+    !brDisconnect.title &&
+    !brDisconnect.skippedDisconnected,
+  JSON.stringify(brDisconnect),
+);
+
+await goto(`${BASE}?mock=1&battMs=${BATT_MS}`);
+const brRemembered = await evaluate(
+  `return document.getElementById('selBatteryRefresh').value;`,
+);
+check(
+  "the chosen interval is there again after a reload",
+  brRemembered === "300000",
+  brRemembered,
+);
+
+/* The reason the poll starts last in the connect sequence, and skips while a
+   reconnect runs: the automatic reconnect restarts the stream straight after
+   that sequence, through withDevice, which refuses while a read holds the link.
+   A short interval, so a tick has every chance to land in that window. */
+await goto(`${BASE}?mock=1&battMs=300`);
+const brResume = await evaluate(`${BR}
+  const chk = $('chkAutoReconnect');
+  chk.checked = true; chk.dispatchEvent(new Event('change'));
+  $('btnMock').click();
+  await until(() => logHas(/mock sensor connected/), 8000);
+  await until(() => vbatt() >= 2, 3000);
+  const polled = vbatt();
+  await until(() => !$('btnStreamStart').disabled, 2000);
+  $('btnStreamStart').click();
+  await until(() => !$('btnStreamStop').disabled, 4000);
+  await sleep(500);
+  const first = window.mockTransport;
+  first.emitDisconnect(new Error('walked out of range (mock)'));
+  await until(() => window.mockTransport !== first && starts() > 0
+    && !$('btnStreamStop').disabled, 15000);
+  await sleep(1500);
+  const out = {
+    polled,
+    newLink: window.mockTransport !== first,
+    starts: starts(),
+    streaming: !$('btnStreamStop').disabled,
+    vbattOnNewLink: vbatt(),
+    restarted: toasts().some(t => /Reconnected and streaming again/.test(t)),
+    busyToast: toasts().some(t => /busy with another request/.test(t)),
+  };
+  $('btnDisconnect').click();
+  await sleep(800);
+  try { localStorage.removeItem('shimmerCaptureAutoReconnect'); } catch {}
+  try { localStorage.removeItem('${BATT_KEY}'); } catch {}
+  return out;
+`);
+check(
+  "with the poll on, an automatic reconnect still restarts the stream",
+  brResume.polled >= 2 &&
+    brResume.newLink &&
+    brResume.starts === 1 &&
+    brResume.streaming &&
+    brResume.restarted &&
+    !brResume.busyToast,
+  JSON.stringify(brResume),
+);
+check(
+  "and the new link carries only its connect read, none mid-stream",
+  brResume.vbattOnNewLink === 1,
+  JSON.stringify(brResume),
+);
+
+/* A link where every read fails: on the bench a Shimmer3 whose replies failed
+   their link CRC gave one warning per poll for as long as it stayed
+   connected. The poll logs the first failure only, until a read succeeds.
+   The client's getBattery is shadowed to refuse, as the mock's own comment
+   suggests for a link that cannot do something. */
+await goto(`${BASE}?mock=1&battMs=400`);
+const brFail = await evaluate(`${BR}
+  $('btnMock').click();
+  await until(() => logHas(/mock sensor connected/), 8000);
+  await until(() => !$('btnRefreshDevice').disabled, 3000);
+  const c = window.mockClient;
+  const own = Object.prototype.hasOwnProperty.call(c, 'getBattery');
+  const real = c.getBattery;
+  let calls = 0;
+  const fail = () => {
+    c.getBattery = async () => { calls++; throw new Error('NACK (mock)'); };
+  };
+  const heal = () => { if (own) c.getBattery = real; else delete c.getBattery; };
+  const refused = () => logCount(/refused "read the battery"/);
+  const notes = () => logCount(/logs nothing more until a read succeeds/);
+  const now = () => logCount(/battery now/);
+  const snap = () => ({ calls, refused: refused(), notes: notes(), now: now() });
+
+  fail();
+  await until(() => calls >= 3, 4000);
+  await sleep(100);
+  const failing = snap();
+
+  /* Refresh's read was asked for, so it warns every time, and its failure
+     does not end the run: the polls stay quiet after it. */
+  await until(() => !$('btnRefreshDevice').disabled, 2000);
+  const r0 = calls;
+  $('btnRefreshDevice').click();
+  await until(() => calls > r0 && !$('btnRefreshDevice').disabled, 3000);
+  const r1 = calls;
+  await until(() => calls >= r1 + 2, 3000);
+  await sleep(100);
+  const afterRefresh = snap();
+
+  heal();
+  const v0 = vbatt();
+  await until(() => vbatt() > v0, 3000);
+  await sleep(100);
+  const healed = snap();
+
+  fail();
+  const f0 = calls;
+  await until(() => calls >= f0 + 2, 3000);
+  await sleep(100);
+  const again = snap();
+
+  heal();
+  $('btnDisconnect').click();
+  await sleep(800);
+  try { localStorage.removeItem('${BATT_KEY}'); } catch {}
+  return { failing, afterRefresh, healed, again };
+`);
+check(
+  "a poll's read that keeps failing is logged once, not once per poll",
+  brFail.failing.calls >= 3 &&
+    brFail.failing.refused === 1 &&
+    brFail.failing.notes === 1,
+  JSON.stringify(brFail.failing),
+);
+check(
+  "Refresh's own failed read still warns, and the polls after it stay quiet",
+  brFail.afterRefresh.refused === 2 && brFail.afterRefresh.notes === 1,
+  JSON.stringify(brFail.afterRefresh),
+);
+check(
+  "a read that succeeds logs the reading, and the next failure is logged again",
+  brFail.healed.now === brFail.afterRefresh.now + 1 &&
+    brFail.healed.notes === 1 &&
+    brFail.again.calls >= brFail.healed.calls + 2 &&
+    brFail.again.refused === 3 &&
+    brFail.again.notes === 2,
+  `${JSON.stringify(brFail.healed)} → ${JSON.stringify(brFail.again)}`,
 );
 
 // ===========================================================================

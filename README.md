@@ -146,6 +146,34 @@ On a phone it keeps the link, the name and a reconnect, and drops the rest.
 It is for looking at only, and screen readers skip it, since it repeats the
 fields above.
 
+### Battery auto-refresh
+
+The battery in the Device card is re-read every minute while the sensor is
+connected (DEV-1512). It used to be read only at connect and on **Refresh**,
+so a sensor left connected, on charge above all, showed a value that had gone
+stale with nothing to say so. Hover over the reading to see when it was read.
+
+- **The setting.** The **↻** list beside Refresh offers off, 30 s, 1 min and
+  5 min. It is 1 min by default, and the choice is remembered in this browser.
+  A change while connected takes effect at once, and the next read is one new
+  interval later.
+- **When it waits.** Nothing is read while the sensor streams or logs to its
+  SD card, while another panel is using the link (a transfer, the self-test, a
+  write) or while an automatic reconnect runs. Over Bluetooth a battery read
+  sent mid-stream can lose its reply, and a Shimmer3 drops a sample for one
+  (DEV-1297). Reads carry on once the link is free; the log says once when
+  they pause.
+- **What it reads.** The battery only, which over Bluetooth is one GET_VBATT.
+  Refresh still reads the status flags and the clock as well. The first read
+  comes one interval after connecting, because connecting has just read it.
+- **The log.** A read adds a line only when the percentage or the charger state
+  changes. A failed read adds a warning, and further failures add nothing
+  until a read succeeds, which logs the reading. So a link that keeps failing
+  is not reported every interval. Refresh's own read still warns every time.
+
+Checked against the mock; a real sensor docked and undocked over a minute has
+not been run yet.
+
 ## General
 
 The first tab, as in the Verisense device console, and for the same reason: the

@@ -79,6 +79,10 @@ const MIN_USEFUL_SDK = "0.1.12";
  * @param {(session: object) => unknown} [cfg.afterConnect] post-connect hook;
  *   its failure is logged and never tears down the connection it reports on
  * @param {(reason?: Error|string) => void} [cfg.onDisconnected]
+ * @param {(msg: string) => boolean} [cfg.echoStatus] whether one SDK status
+ *   line goes to the log; omitted, every line does. For a page's background
+ *   reads, whose two lines a minute would bury the log. The disconnect line
+ *   is echoed whatever this says, since it explains what happens next.
  * @param {boolean} [cfg.announceStartup=true] log the SDK version and the
  *   per-transport platform advice on creation
  * @returns {{
@@ -344,7 +348,12 @@ export function createConnectController(cfg) {
     }
 
     client.onStatus = (msg) => {
-      log(msg);
+      if (
+        String(msg) === SDK_DISCONNECT_STATUS ||
+        cfg.echoStatus?.(String(msg)) !== false
+      ) {
+        log(msg);
+      }
       pageStatus?.call(client, msg);
       if (!hasHook && String(msg) === SDK_DISCONNECT_STATUS) {
         handleDropped(new Error(SDK_DISCONNECT_STATUS));
