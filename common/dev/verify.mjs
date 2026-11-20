@@ -1822,8 +1822,11 @@ const brandUnknown = await evaluate(
     stats: window.__brandStats(),
     derived: window.brandEditor.fields().ble,
     preview: window.__brandPreview('btClassic'),
+    /* The identification warning itself. The SD tab's refusal on this
+       sensor also says it "did not report its hardware version", so a bare
+       match on that phrase counts both. */
     warned: [...document.querySelectorAll('#log .log-line')]
-      .filter(l => /did not report its hardware version/.test(l.textContent)).length };
+      .filter(l => /did not report its hardware version, so this page assumes/.test(l.textContent)).length };
 `,
 );
 check(
@@ -3662,6 +3665,72 @@ check(
     oldFw.streamTab &&
     oldFw.logs.length === 1,
   oldFw.banner.slice(0, 90) + "…",
+);
+
+// ===========================================================================
+// The gate is per generation (DEV-1517). Only a Shimmer3R serves SD file
+// transfer: log-and-stream-common builds the module and its opcodes for
+// SHIMMER3R alone, and the Shimmer3 numbers its LogAndStream releases on a
+// line of its own, so the Shimmer3R's v1.01.011 says nothing about it. The
+// page used to tell a Shimmer3 on v1.01.009 to update to Shimmer3R firmware,
+// and would have opened the tab for one on v1.01.011. Each refusal names its
+// own reason, and none of them sends an SD command.
+// ===========================================================================
+console.log("\n--- SD transfer refused per generation ---");
+const SD_REFUSAL = `
+  const btn = document.getElementById('tabBtnSd');
+  const sdOps = new Set([0xcc, 0xc2, 0xc4, 0xc7, 0xc8, 0xca]);
+  return { tabDisabled: btn.disabled, title: btn.title,
+    banner: document.getElementById('sdBanner').textContent,
+    bannerKind: document.getElementById('sdBanner').className,
+    streamTab: !document.getElementById('tabBtnStream').disabled,
+    sdWrites: (window.mockTransport.writes ?? [])
+      .filter(w => sdOps.has((w.bytes ?? w.data)[0])).length,
+    logs: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
+      .filter(l => /SD file transfer/.test(l)) };
+`;
+const refusedSd = (r) =>
+  r.tabDisabled &&
+  r.bannerKind === "banner warn" &&
+  r.title === r.banner &&
+  r.streamTab &&
+  r.sdWrites === 0 &&
+  r.logs.length === 1;
+
+for (const fw of ["1.01.009", "1.01.022"]) {
+  await goto(`${BASE}?mock=1&hw=3&fw=${fw}`);
+  check(`connect to a Shimmer3 on v${fw}`, (await evaluate(CONNECT)) === "mock");
+  const s3 = await evaluate(SD_REFUSAL);
+  check(
+    `a Shimmer3 on v${fw} closes the SD tab as a Shimmer3, not as old Shimmer3R firmware`,
+    refusedSd(s3) &&
+      /^A Shimmer3 cannot transfer files/.test(s3.banner) &&
+      /no LogAndStream_Shimmer3 release/.test(s3.banner) &&
+      !/Shimmer3R/.test(s3.banner),
+    s3.banner.slice(0, 90) + "…",
+  );
+}
+
+await goto(`${BASE}?mock=1&fw=1.01.008`);
+check("connect to a Shimmer3R on v1.01.008", (await evaluate(CONNECT)) === "mock");
+const s3rOld = await evaluate(SD_REFUSAL);
+check(
+  "a Shimmer3R before v1.01.009 is told it does not serve SD transfer, not that it corrupts",
+  refusedSd(s3rOld) &&
+    /v1\.01\.008 does not serve SD file transfer/.test(s3rOld.banner) &&
+    /LogAndStream_Shimmer3R v1\.01\.011 or later/.test(s3rOld.banner) &&
+    !/corrupt/.test(s3rOld.banner),
+  s3rOld.banner.slice(0, 90) + "…",
+);
+
+await goto(`${BASE}?mock=1&hw=none`);
+check("connect to a sensor that will not say its hardware", (await evaluate(CONNECT)) === "mock");
+const unknownHw = await evaluate(SD_REFUSAL);
+check(
+  "a sensor that does not report its hardware version gets no SD tab, and is told why",
+  refusedSd(unknownHw) &&
+    /did not report its hardware version/.test(unknownHw.banner),
+  unknownHw.banner.slice(0, 90) + "…",
 );
 
 // ===========================================================================

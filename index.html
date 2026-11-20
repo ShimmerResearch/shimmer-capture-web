@@ -1679,7 +1679,8 @@
       let brandBusy = false;
       /**
        * Why this sensor cannot transfer SD files, when it cannot. Set from
-       * the firmware version at connect time; null when it can.
+       * the hardware and firmware versions at connect time, by
+       * `sdTransferRefusal`; null when it can.
        */
       let sdFirmwareNote = null;
 
@@ -4723,6 +4724,43 @@
       });
 
       /**
+       * Why this sensor cannot transfer SD files, from what it reported at
+       * connect time. Only a Shimmer3R on LogAndStream_Shimmer3R v1.01.011 or
+       * later can, and each other case has its own fix, so each gets its own
+       * sentence: telling a Shimmer3 to update to Shimmer3R firmware, as one
+       * shared message used to, sends its owner after a release that cannot
+       * be installed on it.
+       *
+       * @param {number|null} hardwareVersion as the sensor reported it, or
+       *   null when it did not
+       * @param {{major: number, minor: number, patch: number}|undefined} fw
+       */
+      function sdTransferRefusal(hardwareVersion, fw) {
+        if (hardwareVersion === 3) {
+          return "A Shimmer3 cannot transfer files from its SD card over Bluetooth: no LogAndStream_Shimmer3 release serves the file-transfer commands, whatever its version. Dock it and import the card with Consensys instead.";
+        }
+        if (hardwareVersion == null) {
+          return "The sensor did not report its hardware version, so this page cannot tell whether it serves SD file transfer. Only a Shimmer3R does, on LogAndStream_Shimmer3R v1.01.011 or later. Reconnect to ask again.";
+        }
+        if (hardwareVersion !== 10) {
+          return `This sensor reports hardware version ${hardwareVersion}, and only a Shimmer3R serves SD file transfer.`;
+        }
+        const label = firmwareLabel(fw);
+        if (label === null) {
+          return "The sensor did not report its firmware version, so this page cannot tell whether it transfers SD files intact. That needs LogAndStream_Shimmer3R v1.01.011 or later. Reconnect to ask again.";
+        }
+        const code =
+          fw.major * 1_000_000 + (fw.minor ?? 0) * 1_000 + (fw.patch ?? 0);
+        if (code < 1_001_009) {
+          return `${label} does not serve SD file transfer. It needs LogAndStream_Shimmer3R v1.01.011 or later.`;
+        }
+        if (code < 1_001_011) {
+          return `${label} cannot transfer SD files intact. It needs LogAndStream_Shimmer3R v1.01.011 or later — v1.01.009 and v1.01.010 corrupt every block they send.`;
+        }
+        return `${label} serves SD file transfer, but this sensor did not pass the check for it. Reconnect to try again.`;
+      }
+
+      /**
        * Why the card cannot be browsed right now, in plain language, or null.
        *
        * Same shape as the stream tab's USB refusal: a reason on screen beats
@@ -4739,7 +4777,7 @@
         if (!caps.sdTransfer) {
           return (
             sdFirmwareNote ??
-            "This sensor cannot transfer files from its SD card over Bluetooth. Update it to LogAndStream_Shimmer3R v1.01.011 or later."
+            "This connection cannot transfer files from the sensor's SD card. Only a Shimmer3R serves SD file transfer over Bluetooth, on LogAndStream_Shimmer3R v1.01.011 or later."
           );
         }
         if (streaming || sdLogging) {
@@ -6058,19 +6096,32 @@
           );
         }
 
-        /* The firmware gate on top of the method-and-link check
-                 `describeShimmer3Caps` did: v1.01.009 and v1.01.010 serve the
-                 SD-transfer protocol and ship every 512-byte block shifted three
-                 bytes, so the corruption arrives as valid frames nothing on the
-                 host can detect. The version is the only reliable probe, and
-                 `supportsSdTransfer` owns the threshold — it reuses the version
-                 just read, so this costs no extra round trip. */
+        /* The device gate on top of the method-and-link check
+                 `describeShimmer3Caps` did. Two rules, and the hardware one
+                 comes first:
+                 - Only a Shimmer3R serves SD file transfer. log-and-stream-common
+                   builds the file-transfer module and every one of its opcodes
+                   for SHIMMER3R alone, so no LogAndStream_Shimmer3 release has
+                   them, whatever its version — and a Shimmer3 reads the bytes
+                   after an opcode it does not know as commands of its own.
+                 - On a Shimmer3R, v1.01.009 and v1.01.010 serve the protocol and
+                   ship every 512-byte block shifted three bytes, so the
+                   corruption arrives as valid frames nothing on the host can
+                   detect. The version is the only reliable probe, and
+                   `supportsSdTransfer` owns that threshold.
+                 The SDK checks the generation itself from 0.5.21 (DEV-1517).
+                 The page checks it too, because the SDK vendored before that
+                 judged by the firmware version alone, against the Shimmer3R's
+                 numbering, and would pass a Shimmer3 on v1.01.011. Both reads
+                 are the ones just made, so this costs no extra round trip. */
         if (caps.sdTransfer) {
-          const ok = await client.supportsSdTransfer().catch(() => false);
-          caps.sdTransfer = ok === true;
+          const ok =
+            identifiedHardwareVersion === 10 &&
+            (await client.supportsSdTransfer().catch(() => false)) === true;
+          caps.sdTransfer = ok;
           sdFirmwareNote = ok
             ? null
-            : `${firmwareLabel(fw) ?? "This firmware"} cannot transfer SD files intact. It needs LogAndStream_Shimmer3R v1.01.011 or later — v1.01.009 and v1.01.010 corrupt every block they send.`;
+            : sdTransferRefusal(identifiedHardwareVersion, fw);
           log.log(
             caps.sdTransfer
               ? "SD file transfer supported by this firmware"
