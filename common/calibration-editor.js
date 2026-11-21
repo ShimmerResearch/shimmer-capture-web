@@ -324,6 +324,13 @@ const I8_MAX = 127;
  *   its own busy state, so everything that shares the link is refused while a
  *   calibration write is in flight.
  * @param {(message: string, kind?: string) => void} [opts.toast]
+ * @param {(client: object) => boolean} [opts.linkLive] whether the link a
+ *   read was started on is still the live one. A read that fails once it is
+ *   not was cut off by Disconnect or a drop, and is logged as stopped rather
+ *   than reported as a failure (DEV-1524). Defaults to "the client the
+ *   `client` getter returns is still this one"; a page whose teardown clears
+ *   its client only after awaiting the link's close should pass its own,
+ *   which can say so from the moment the close begins.
  * @param {(text: string) => boolean} [opts.confirm] defaults to
  *   `window.confirm`
  * @param {string|(() => string|null)} [opts.fileNamePrefix="shimmer"] leading
@@ -351,6 +358,7 @@ export function createCalibrationEditor(host, opts = {}) {
     typeof opts.client === "function" ? opts.client : () => opts.client ?? null;
   const log = opts.log ?? { log() {}, warn() {}, error() {} };
   const toast = opts.toast ?? (() => {});
+  const linkLive = opts.linkLive ?? ((client) => getClient() === client);
   const ask = opts.confirm ?? ((text) => window.confirm(text));
   const getGeneration = asGetter(opts.generation);
   const getHardware = asGetter(opts.hardwareVersion);
@@ -1676,6 +1684,7 @@ export function createCalibrationEditor(host, opts = {}) {
       );
       return dump;
     } catch (err) {
+      if (stoppedByClose(client, err)) return null;
       const message = `Reading the calibration failed: ${err?.message ?? err}`;
       log.error(message);
       toast(message, "err");
@@ -1683,6 +1692,28 @@ export function createCalibrationEditor(host, opts = {}) {
     } finally {
       setBusy(false);
     }
+  }
+
+  /**
+   * Whether a read on `client` ended because its link was closed or lost
+   * rather than because the read failed, and if so, say that, in the log only
+   * (DEV-1524).
+   *
+   * A page's connect handshake reads the calibration while Disconnect is
+   * already live, so a user who disconnects a second after the link opens
+   * cuts this read off. Telling them "Reading the calibration failed" in an
+   * error toast says something went wrong when they did what they meant to.
+   * The SDK's own reason is kept in the line: it varies with where the read
+   * was ("RX missing", "The link was reset…"), and is worth having when the
+   * close was not the user's.
+   */
+  function stoppedByClose(client, err) {
+    if (linkLive(client)) return false;
+    log.log(
+      `Reading the calibration stopped: the link was closed` +
+        (err ? ` (${err?.message ?? err})` : ""),
+    );
+    return true;
   }
 
   /** The read-only path: the six InfoMem blocks the page already holds. */
@@ -1699,6 +1730,8 @@ export function createCalibrationEditor(host, opts = {}) {
       }
       infoMemShown = getInfoMemBlocks();
       if (!infoMemShown) {
+        // The re-read above can be the read the closing link cut off.
+        if (stoppedByClose(client, null)) return null;
         const message =
           "The configuration image could not be read, so there is no calibration to show.";
         log.error(message);
@@ -1713,6 +1746,7 @@ export function createCalibrationEditor(host, opts = {}) {
       log.log("calibration read from the configuration image (read-only here)");
       return infoMemShown;
     } catch (err) {
+      if (stoppedByClose(client, err)) return null;
       const message = `Reading the calibration failed: ${err?.message ?? err}`;
       log.error(message);
       toast(message, "err");

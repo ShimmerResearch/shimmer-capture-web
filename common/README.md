@@ -166,6 +166,8 @@ reconnect it reports the version the image carried.
 `transport.identity` is the SR board and module version as the mock now
 holds them, and `transport.sdCard.bytes(path)` is exactly what a download of
 that card file should produce — which is what a test compares against.
+`transport.holdReplies(op)` holds the answers to one opcode until its
+`release()`, so a test can act while the page is part-way through a read.
 
 It is a development aid, not a firmware simulator: it does not model
 power or most error paths, and its timing is plausible rather than real.

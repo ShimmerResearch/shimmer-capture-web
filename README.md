@@ -959,7 +959,10 @@ logs (`logging`). `window.mockRefuseConnects = n` makes the next n connects
 fail, as a sensor still out of range does, so the automatic reconnect's retries
 can be watched. Setting `nackRefusedLogStart` makes it refuse a log start it
 cannot carry out, as firmware that says so does, and `setQuietly({ sdBadFile })`
-changes the card without telling the page. The panels
+changes the card without telling the page. `mockTransport.holdReplies(op)`
+holds the answers to one command until its `release()`, so the page can be
+caught part-way through a read: pressing Disconnect while the connect sequence
+reads the calibration, for one. The panels
 themselves are `factoryTestPanel` and `rtcDriftPanel`, beside `sdBrowser`,
 `brandEditor` and `calibrationEditor`.
 

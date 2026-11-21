@@ -1926,6 +1926,17 @@
        */
       let lastLink = null;
       /**
+       * True from the moment the live link starts to go — Disconnect pressed,
+       * or the link dropped — until the next link is adopted (DEV-1524).
+       *
+       * `client` alone cannot tell: the teardown awaits a stream stop, a
+       * recording close and the link's own disconnect before it clears
+       * `client`, and a read the closing link broke fails inside that window.
+       * Set synchronously, first thing, so whatever fails after it can tell a
+       * link that was closed from a read that went wrong on a live one.
+       */
+      let linkEnding = false;
+      /**
        * The automatic reconnect's handle (`sdk.startAutoReconnect`) while it
        * runs, else null. A drop while it is set belongs to one of its tries.
        */
@@ -2433,6 +2444,18 @@
       }
 
       /**
+       * Whether `c` is still the live link: the client the page holds, and not
+       * on its way out (DEV-1524).
+       *
+       * A read that fails once this is false failed because its link was
+       * closed or lost. Either the user asked for that, or the drop handler is
+       * already telling them about it, so the read's own error is not news.
+       */
+      function linkLive(c) {
+        return c != null && c === client && !linkEnding;
+      }
+
+      /**
        * Run one device operation with the busy flag held, logging either way,
        * toasting a failure, and always re-gating.
        *
@@ -2466,6 +2489,7 @@
           showToast("The sensor is busy with another request", "warn");
           return undefined;
         }
+        const on = client;
         busy = true;
         regate();
         try {
@@ -2473,6 +2497,14 @@
           if (!opts.quiet) log.log(`${what}: done`);
           return result;
         } catch (err) {
+          /* A best-effort read cut off by Disconnect, or by a drop, has not
+             failed: its link has gone (DEV-1524). Said once, in the log, as
+             what happened. An operation the user asked for still reports
+             below, because it did not complete. */
+          if (opts.tolerate && !linkLive(on)) {
+            log.log(`${what}: stopped, the link was closed`);
+            return undefined;
+          }
           const message = humanError(what, err);
           if (opts.tolerate) {
             tolerated(message);
@@ -5021,6 +5053,10 @@
         readInfoMem: () => readConfiguration(),
         log,
         toast: showToast,
+        /* The page's own test, which is true no longer from the moment
+                 Disconnect is pressed: `client` is cleared only once the link has
+                 closed, after the read it cut off has failed (DEV-1524). */
+        linkLive: (c) => linkLive(c),
         fileNamePrefix: () => `Shimmer3R_${macTail()}`,
         onBusyChange: (working) => {
           calibBusy = working;
@@ -6062,9 +6098,13 @@
        * Order matters on the radio path: the firmware and hardware version
        * reads are what resolve the InfoMem addressing and the status payload
        * width, so they come first and everything else builds on them.
+       *
+       * @returns {Promise<boolean>} false when the link went before the
+       *   sequence finished (DEV-1524)
        */
       async function afterConnect(session) {
         client = session.client;
+        linkEnding = false;
         mode = session.mode;
         /* Kept now, while the transport still holds them: the BLE transport
                  keeps its device after a drop, but the serial transport lets go
@@ -6125,8 +6165,16 @@
         deviceName = client.device?.name ?? session.transport?.deviceName ?? "";
         setIdentity({ idLink: session.label });
 
-        if (mode === "usb") await afterConnectWired();
-        else await afterConnectRadio();
+        try {
+          if (mode === "usb") await afterConnectWired();
+          else await afterConnectRadio();
+        } catch (err) {
+          if (!(err instanceof ConnectSequenceStopped)) throw err;
+          log.log(
+            "the connect sequence stopped: the link was closed before it finished",
+          );
+          return false;
+        }
 
         applyModeGating();
         regate();
@@ -6139,6 +6187,35 @@
                  since withDevice refuses while busy. Not if the link went during
                  the sequence: the teardown has already run. */
         if (client) startBatteryRefresh();
+        return true;
+      }
+
+      /**
+       * Thrown inside the connect sequence once the link it was started for
+       * has gone, and caught by afterConnect, which says so once (DEV-1524).
+       *
+       * Disconnect goes live the moment the link opens, while the sequence
+       * still has a dozen reads to make. Reading on after it fails each one,
+       * and paints what came back — or the "could not be read" banner for
+       * what did not — onto a page the teardown has already cleared.
+       */
+      class ConnectSequenceStopped extends Error {}
+
+      /** Stop the connect sequence on `c` if that link has gone. */
+      function assertLinked(c) {
+        if (!linkLive(c)) throw new ConnectSequenceStopped();
+      }
+
+      /**
+       * tryDevice for the connect sequence on `c`: not started once the link
+       * has gone, and the sequence stopped if it went during the read, so
+       * nothing after it paints a departed sensor onto the page.
+       */
+      async function connectRead(c, what, fn) {
+        assertLinked(c);
+        const result = await tryDevice(what, fn);
+        assertLinked(c);
+        return result;
       }
 
       /** The Bluetooth path: BLE, Classic Bluetooth, or the mock. */
@@ -6219,11 +6296,14 @@
           }
           return;
         }
+        const c = client;
         await tryDevice("enable the link CRC", () => client.setCrcMode(want));
         /* The link can drop while this waits - a sensor restarting under a
-           reconnect does exactly that - and the disconnect handler clears
-           `client`; there is then nothing to read back. */
-        if (!client) return;
+           reconnect does exactly that - or be closed by Disconnect, and then
+           there is nothing to read back. `linkLive`, not `client`: a closing
+           link's client is still set, with its CRC mode already reset to
+           off, which would read as a firmware refusal (DEV-1524). */
+        if (!linkLive(c)) return;
         /* Read back from the client rather than from the call: `crcMode` only
                  advances on a successful ACK, so this cannot end up expecting bytes
                  the device is not sending. */
@@ -6242,11 +6322,15 @@
       }
 
       async function afterConnectRadio() {
+        /* Every step below goes through `connectRead` on this link, or checks
+                 it after an await of its own, so the sequence stops where the
+                 link went instead of reading on into it (DEV-1524). */
+        const c = client;
         setLinkCrcEditable(false);
-        const fw = await tryDevice("read the firmware version", () =>
+        const fw = await connectRead(c, "read the firmware version", () =>
           client.readFwVersion(),
         );
-        const hw = await tryDevice("read the hardware version", () =>
+        const hw = await connectRead(c, "read the hardware version", () =>
           client.readDeviceVersion(),
         );
         /* The CRC goes AFTER both version reads, per
@@ -6258,7 +6342,7 @@
                  it first, as this used to, framed a Shimmer3's status a byte too
                  wide for the whole session. */
         await applyLinkCrc();
-        const mac = await tryDevice("read the MAC address", () =>
+        const mac = await connectRead(c, "read the MAC address", () =>
           client.getMacAddress(),
         );
         if (mac) deviceMac = mac;
@@ -6293,6 +6377,7 @@
           const ok =
             identifiedHardwareVersion === 10 &&
             (await client.supportsSdTransfer().catch(() => false)) === true;
+          assertLinked(c);
           caps.sdTransfer = ok;
           sdFirmwareNote = ok
             ? null
@@ -6321,7 +6406,7 @@
 
                  Best-effort: an older firmware may not answer, and a Shimmer3R
                  does not need it for the layout (hardware id 10 decides). */
-        srBoard = await tryDevice("read the board's SR id", () =>
+        srBoard = await connectRead(c, "read the board's SR id", () =>
           typeof client.readSrBoard === "function"
             ? client.readSrBoard()
             : Promise.resolve(null),
@@ -6331,7 +6416,8 @@
                  because it is the one part of a sensor a host cannot otherwise
                  see, and the answer decides whether a link problem is worth
                  chasing in the module's own release notes. */
-        const btModule = await tryDevice(
+        const btModule = await connectRead(
+          c,
           "read the Bluetooth module version",
           () =>
             typeof client.readBtModuleVersion === "function"
@@ -6357,14 +6443,15 @@
           internal: fw?.patch,
         });
 
-        const info = await tryDevice("inquire the channel list", () =>
+        const info = await connectRead(c, "inquire the channel list", () =>
           client.inquiry(),
         );
         if (info) noteInquiry(info);
 
         await refreshDeviceState();
+        assertLinked(c);
 
-        const bytes = await tryDevice("read the configuration image", () =>
+        const bytes = await connectRead(c, "read the configuration image", () =>
           client.readInfoMemBytes(),
         );
 
@@ -6375,7 +6462,8 @@
         eventChannel = false;
         if (caps.eventChannel) {
           eventChannel =
-            (await tryDevice(
+            (await connectRead(
+              c,
               "ask whether the firmware has the event channel",
               () => client.supportsEventChannel(),
             )) === true;
@@ -6398,8 +6486,10 @@
         soundLevelSupport = null;
         if (caps.audio) {
           audio =
-            (await tryDevice("ask whether the firmware records audio", () =>
-              client.supportsAudio(),
+            (await connectRead(
+              c,
+              "ask whether the firmware records audio",
+              () => client.supportsAudio(),
             )) === true;
           log.log(
             audio
@@ -6446,7 +6536,7 @@
         if (eventChannel) {
           evtPanel.resetLink();
           client.onEventRecord = onEventRecord;
-          const on = await tryDevice("turn the event stream on", () =>
+          const on = await connectRead(c, "turn the event stream on", () =>
             client.setEventStream(true),
           );
           if (on !== true) {
@@ -6477,6 +6567,7 @@
                  could not be filled is not a connection that failed. */
         if (caps.calibration || caps.infomem) {
           await cal.read({ reuseInfoMem: true }).catch(() => null);
+          assertLinked(c);
         }
 
         /* The pressure sensor's factory trim
@@ -6488,7 +6579,8 @@
                  older than the command refuses it, and the SDK says so through its
                  status messages. */
         if (caps.pressureCalibration) {
-          const pressure = await tryDevice(
+          const pressure = await connectRead(
+            c,
             "read the pressure calibration",
             () => client.readPressureCalibration(),
           );
@@ -6520,7 +6612,9 @@
                  though it were about to be applied. */
         setLinkCrcEditable(false);
         showLinkCrcNotApplicable();
-        const id = await tryDevice("identify the docked sensor", () =>
+        // Stops where the link went, as the radio path does (DEV-1524).
+        const c = client;
+        const id = await connectRead(c, "identify the docked sensor", () =>
           client.identify(),
         );
         if (id?.mac) deviceMac = id.mac;
@@ -6529,12 +6623,14 @@
         /* Through the same read the auto-refresh uses (DEV-1512), so the
                  row carries its read time from the first reading. */
         await readBatteryIntoPanel();
+        assertLinked(c);
         const version = id?.firmwareVersion;
 
         /* `identify()` already read the ID page over this link, so there is
                  nothing more to ask for. */
         srBoard = id?.expansionBoard ?? null;
-        const btModule = await tryDevice(
+        const btModule = await connectRead(
+          c,
           "read the Bluetooth module version",
           () =>
             typeof client.readBtModuleVersion === "function"
@@ -6593,7 +6689,7 @@
         );
         buildForm(ctx);
 
-        const bytes = await tryDevice("read the configuration image", () =>
+        const bytes = await connectRead(c, "read the configuration image", () =>
           client.readInfoMemBytes(),
         );
         if (bytes) adoptDeviceImage(bytes);
@@ -6611,6 +6707,7 @@
                  reading all 384 bytes a second time to see them. */
         if (caps.infomem) {
           await cal.read({ reuseInfoMem: true }).catch(() => null);
+          assertLinked(c);
         }
       }
 
@@ -6735,6 +6832,9 @@
           );
           return;
         }
+        /* The drop is reported below, once; the reads it cut off are not
+                 reported again, each on its own (DEV-1524). */
+        linkEnding = true;
         /* Now rather than at the reset below, which waits for a recording
                  to close first: a read sent meanwhile would go to a link that has
                  gone. */
@@ -7416,15 +7516,17 @@
             connect.setConnected(true, "mock");
             // As a real link's onConnected does (DEV-1520).
             if (!reconnect) showToast("Connected via mock", "ok");
-            await afterConnect({
+            const finished = await afterConnect({
               client: mockClient,
               mode: framed ? "ble" : "rfcomm",
               transport,
               label: framed ? "mock (framed)" : "mock (unframed)",
               mock: true,
             });
-            log.log("mock sensor connected");
-            return true;
+            /* Not when Disconnect, or a drop, ended the link part-way
+                     through: afterConnect has said so (DEV-1524). */
+            if (finished) log.log("mock sensor connected");
+            return finished;
           } catch (err) {
             log.error(`mock connect failed: ${err?.message ?? err}`);
             connect.setConnected(false);
@@ -7595,6 +7697,11 @@
        * page still believing it was connected.
        */
       async function disconnectFromSensor() {
+        /* First, before anything is awaited: a connect sequence still reading
+                 when Disconnect is pressed stops quietly at its next step, and a
+                 read the closing link breaks is "stopped", not "failed"
+                 (DEV-1524). */
+        linkEnding = true;
         sd.abort();
         /* Disconnecting is the ONLY escape from a running self-test — the
                  firmware has no abort — so it must not wait for one to finish. */

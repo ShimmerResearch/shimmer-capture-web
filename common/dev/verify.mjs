@@ -8688,6 +8688,159 @@ check(
 );
 
 // ===========================================================================
+console.log("\n--- Disconnect during the connect sequence (DEV-1524) ---");
+
+/* Disconnect goes live the moment the link opens, while the connect sequence
+   still has a dozen reads to make; on the bench a Shimmer3R over BLE
+   disconnected a second after connecting toasted "Reading the calibration
+   failed: Not connected (RX missing)". Each case below holds the sensor's
+   answer to one command with `holdReplies`, so the page is provably
+   part-way through that read when the link goes, rather than racing a timer.
+
+   The hold is taken synchronously after the click: the mock's transport
+   exists as soon as the click handler runs, and nothing is sent until the
+   client's connect has resolved. */
+const DURING = `
+  const $ = (id) => document.getElementById(id);
+  const until = async (pred, ms) => {
+    for (let t = 0; t < ms && !pred(); t += 20)
+      await new Promise((r) => setTimeout(r, 20));
+    return pred();
+  };
+  /* Every toast from here on, kept after it fades: an error toast lives 8 s,
+     and a check that only looked at the stack at the end would pass a toast
+     that came and went. */
+  const toasts = [];
+  new MutationObserver((ms) => {
+    for (const m of ms)
+      for (const n of m.addedNodes)
+        if (n.classList?.contains('toast'))
+          toasts.push({ err: n.classList.contains('err'), text: n.textContent });
+  }).observe(document.body, { childList: true, subtree: true });
+  const from = document.querySelectorAll('#log .log-line').length;
+  const lines = () => [...document.querySelectorAll('#log .log-line')]
+    .slice(from).map((l) => l.textContent);
+  const settled = () => lines().some((l) => /connect sequence stopped/.test(l));
+  const outcome = (extra) => ({
+    ...extra,
+    pill: $('connPill').textContent,
+    errToasts: toasts.filter((t) => t.err).map((t) => t.text),
+    banner: { err: $('configBanner').classList.contains('err'),
+              text: $('configBanner').textContent.trim() },
+    idFw: $('idFw').textContent,
+    idMac: $('idMac').textContent,
+    calStopped: lines().filter((l) =>
+      /Reading the calibration stopped: the link was closed/.test(l)).length,
+    seqStopped: lines().filter((l) => /connect sequence stopped/.test(l)).length,
+    failures: lines().filter((l) => /failed|could not be read/i.test(l)),
+    connectedLine: lines().some((l) => /mock sensor connected/.test(l)),
+  });
+`;
+const holdAndEnd = (op, end) => `${DURING}
+  $('btnMock').click();
+  const hold = window.mockTransport.holdReplies(${op});
+  const reached = await until(() => hold.held > 0, 8000);
+  const pillAtEnd = $('connPill').textContent;
+  ${end}
+  await until(settled, 6000);
+  await new Promise((r) => setTimeout(r, 300));
+  return outcome({ reached, pillAtEnd });
+`;
+const freshMockPage = async () => {
+  /* Both off: a dropped link must end the session rather than start the
+     automatic reconnect, and no battery poll may be on the link. */
+  await evaluate(
+    `try { localStorage.setItem('shimmerCaptureAutoReconnect', 'off'); } catch {}
+     try { localStorage.setItem('shimmerCaptureBatteryRefresh', 'off'); } catch {}
+     return 1;`,
+  );
+  await goto(`${BASE}?mock=1`);
+};
+
+await freshMockPage();
+const discCal = await evaluate(holdAndEnd(0x9a, "$('btnDisconnect').click();"));
+check(
+  "Disconnect while the connect sequence reads the calibration raises no error toast",
+  discCal.reached &&
+    discCal.pillAtEnd === "connected via mock" &&
+    discCal.pill === "disconnected" &&
+    discCal.errToasts.length === 0 &&
+    discCal.calStopped === 1,
+  JSON.stringify(discCal),
+);
+check(
+  "…and the sequence stops there, saying so once, with nothing logged as failed",
+  discCal.seqStopped === 1 &&
+    discCal.failures.length === 0 &&
+    !discCal.connectedLine &&
+    discCal.idFw === "–",
+  JSON.stringify(discCal.failures),
+);
+
+await freshMockPage();
+const discEarly = await evaluate(
+  holdAndEnd(0x01, "$('btnDisconnect').click();"),
+);
+check(
+  "Disconnect during an earlier read paints nothing onto the disconnected page",
+  /* The inquiry, which comes before the configuration image: reading on
+     after it used to put an error banner ("could not be read") and the
+     sensor's identity back on a page the teardown had cleared. */
+  discEarly.reached &&
+    discEarly.pill === "disconnected" &&
+    discEarly.errToasts.length === 0 &&
+    !discEarly.banner.err &&
+    discEarly.idFw === "–" &&
+    discEarly.idMac === "–" &&
+    discEarly.seqStopped === 1 &&
+    discEarly.failures.length === 0,
+  JSON.stringify(discEarly),
+);
+
+await freshMockPage();
+const dropCal = await evaluate(
+  holdAndEnd(
+    0x9a,
+    "window.mockTransport.emitDisconnect(new Error('walked out of range (mock)'));",
+  ),
+);
+check(
+  "a drop during the connect sequence is reported once, by the drop, not again by the read",
+  dropCal.reached &&
+    dropCal.pill === "disconnected" &&
+    dropCal.errToasts.length === 1 &&
+    /The sensor disconnected/.test(dropCal.errToasts[0]) &&
+    dropCal.calStopped === 1,
+  JSON.stringify(dropCal.errToasts),
+);
+
+await freshMockPage();
+const liveFail = await evaluate(`${DURING}
+  $('btnMock').click();
+  /* A calibration read that fails while the link is up, as a flash read
+     error would: still a failure, and still reported. */
+  window.mockClient.readCalibDump = async () => {
+    throw new Error('flash read error (mock)');
+  };
+  await until(() => lines().some((l) => /mock sensor connected/.test(l)), 8000);
+  const out = outcome({});
+  $('btnDisconnect').click();
+  await new Promise((r) => setTimeout(r, 300));
+  return out;
+`);
+check(
+  "a calibration read that fails on a live link still reports it",
+  liveFail.pill === "connected via mock" &&
+    liveFail.errToasts.some((t) =>
+      /Reading the calibration failed: flash read error/.test(t),
+    ) &&
+    liveFail.calStopped === 0 &&
+    liveFail.seqStopped === 0 &&
+    liveFail.connectedLine,
+  JSON.stringify(liveFail.errToasts),
+);
+
+// ===========================================================================
 console.log("\n--- console ---");
 check(
   "no console errors across the whole pass",
