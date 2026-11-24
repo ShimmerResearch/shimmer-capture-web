@@ -1223,11 +1223,17 @@ export function createMockShimmer3RTransport(opts = {}) {
             `mock: ignoring rtcWrapIn="${rtcOpts.wrapInSec}" — it must be a non-negative number of seconds.`,
           ),
           null);
+  /* Firmware that holds a clock set made while it streams or logs until both
+     have stopped (DEV-1539). Off by default: released firmware up to v1.01.027
+     applies a set at once, mid-session or not. */
+  const rtcDeferSetWhileSensing = !!rtcOpts.deferSetWhileSensing;
   const rtc = {
     devMsAtSet:
       Date.now() +
       (rtcClockBase === "local" ? -new Date().getTimezoneOffset() * 60000 : 0),
     setAtHostMs: Date.now(),
+    /** A held set, as time sent minus the clock on arrival; null when none. */
+    deferredOffsetMs: null,
   };
   if (rtcWrapInSec != null) {
     const ticks = Math.round(rtc.devMsAtSet * 32.768);
@@ -1574,6 +1580,16 @@ export function createMockShimmer3RTransport(opts = {}) {
         if (key in patch) state[key] = !!patch[key];
       }
     },
+    /**
+     * Start or stop SD logging with no push: a log started before this host
+     * connected, or one whose push the link lost. A host learns of it only
+     * from its next status read. No audio session; `transport.audio` has the
+     * button-press version that pushes.
+     */
+    logQuietly(on) {
+      state.logging = !!on;
+      applyDeferredRwcIfIdle();
+    },
     /** The frame a push (or a GET_STATUS answer) carries, for comparison. */
     bytes: () => new Uint8Array(statusResponse()),
   };
@@ -1620,6 +1636,14 @@ export function createMockShimmer3RTransport(opts = {}) {
     },
     get clockBase() {
       return rtcClockBase;
+    },
+    /** Firmware that holds a clock set made while sensing (DEV-1539). */
+    get defersSetWhileSensing() {
+      return rtcDeferSetWhileSensing;
+    },
+    /** A clock set is held, waiting for streaming and logging to stop. */
+    get setPending() {
+      return rtc.deferredOffsetMs !== null;
     },
     /** The sensor's own clock, in its own epoch. */
     deviceNowMs,
@@ -1912,6 +1936,7 @@ export function createMockShimmer3RTransport(opts = {}) {
     /** Start or stop SD logging as the user button would, and push the status. */
     setLogging(on) {
       state.logging = !!on;
+      applyDeferredRwcIfIdle();
       reply(statusResponse());
       if (on) audioSessionStart();
       else audioSessionStop();
@@ -2092,6 +2117,47 @@ export function createMockShimmer3RTransport(opts = {}) {
     if (!streamTimer) return;
     clearInterval(streamTimer);
     streamTimer = null;
+  }
+
+  /** Set the real-world clock to `ticks` (32768 Hz since the Unix epoch). */
+  function applyRwc(ticks) {
+    state.rwcTicks = ticks;
+    // Re-seat the running clock on what the host wrote: from here the
+    // sensor keeps its own time, and keeps drifting at `rtc.ppm`.
+    rtc.devMsAtSet = Number(ticks) / 32.768;
+    rtc.setAtHostMs = Date.now();
+    /* And re-seat the STREAM counter with it, on a Shimmer3R, because there
+       the two are one number: the packet timestamp is the low 24 bits of the
+       counter `GET_RWC` reports. Released firmware up to v1.01.027 sets the
+       clock mid-stream, and leaving the counter where it was would model a
+       sensor whose packets disagree with its own clock — which is precisely
+       the shape a host's aligned anchor would then be tested against,
+       wrongly. On a Shimmer3 the counter is independent of the clock and
+       correctly stays put. */
+    if (hardwareVersion !== 3 && streamTimer) {
+      streamTicks = streamStartTicks();
+      streamStartMs = deviceNowMs();
+      samplesEmitted = 0;
+    }
+    // What the "Clock set" status bit means: not that the clock reads
+    // something, but that a host has set it since the sensor last lost
+    // power (`RTC_isRwcTimeSet`).
+    state.rwcSet = true;
+  }
+
+  /**
+   * Apply a clock set held while sensing, once streaming and logging have
+   * both stopped (`ShimRtc_applyDeferredRwc`, from `ShimSens_stopSensing`):
+   * the offset kept on arrival, added to the clock as it now reads, which is
+   * the time the host asked for. Called after every stop; does nothing while
+   * either is still running or when no set is held.
+   */
+  function applyDeferredRwcIfIdle() {
+    if (rtc.deferredOffsetMs === null || state.streaming || state.logging)
+      return;
+    const offsetMs = rtc.deferredOffsetMs;
+    rtc.deferredOffsetMs = null;
+    applyRwc(BigInt(Math.round((deviceNowMs() + offsetMs) * 32.768)));
   }
 
   // -------------------------------------------------------------------------
@@ -2541,6 +2607,7 @@ export function createMockShimmer3RTransport(opts = {}) {
     }
     state.streaming = false;
     state.logging = false;
+    applyDeferredRwcIfIdle();
   });
 
   // -------------------------------------------------------------------------
@@ -3426,28 +3493,19 @@ export function createMockShimmer3RTransport(opts = {}) {
         let ticks = 0n;
         for (let i = 8; i >= 1; i--)
           ticks = (ticks << 8n) | BigInt(cmd[i] ?? 0);
-        state.rwcTicks = ticks;
-        // Re-seat the running clock on what the host wrote: from here the
-        // sensor keeps its own time, and keeps drifting at `rtc.ppm`.
-        rtc.devMsAtSet = Number(ticks) / 32.768;
-        rtc.setAtHostMs = Date.now();
-        /* And re-seat the STREAM counter with it, on a Shimmer3R, because
-           there the two are one number: the packet timestamp is the low 24
-           bits of the counter `GET_RWC` reports. Setting the clock mid-stream
-           is allowed by the firmware, and leaving the counter where it was
-           would model a sensor whose packets disagree with its own clock —
-           which is precisely the shape a host's aligned anchor would then be
-           tested against, wrongly. On a Shimmer3 the counter is independent of
-           the clock and correctly stays put. */
-        if (hardwareVersion !== 3 && streamTimer) {
-          streamTicks = streamStartTicks();
-          streamStartMs = deviceNowMs();
-          samplesEmitted = 0;
+        /* Firmware with the deferral (DEV-1539) ACKs a set that arrives while
+           it streams or logs, but keeps only the difference between the time
+           sent and its clock on arrival, and applies that once both have
+           stopped. Until then GET_RWC, the stamps and the "Clock set" bit all
+           carry on unchanged. A later set while still sensing replaces an
+           earlier one. */
+        if (rtcDeferSetWhileSensing && (state.streaming || state.logging)) {
+          rtc.deferredOffsetMs = Number(ticks) / 32.768 - deviceNowMs();
+          reply([ACK]);
+          return;
         }
-        // What the "Clock set" status bit means: not that the clock reads
-        // something, but that a host has set it since the sensor last lost
-        // power (`RTC_isRwcTimeSet`).
-        state.rwcSet = true;
+        rtc.deferredOffsetMs = null;
+        applyRwc(ticks);
         reply([ACK]);
         return;
       }
@@ -3523,6 +3581,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         // STOP_LOGGING_COMMAND: the log alone; a stream goes on.
         const wasLogging = state.logging;
         state.logging = false;
+        applyDeferredRwcIfIdle();
         reply([ACK]);
         if (wasLogging) audioSessionStop();
         return;
@@ -3533,6 +3592,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         // firmware. STOP_SDBT stops both.
         state.streaming = false;
         stopStreaming();
+        applyDeferredRwcIfIdle();
         reply([ACK]);
         return;
 
@@ -3540,6 +3600,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         state.streaming = false;
         state.logging = false;
         stopStreaming();
+        applyDeferredRwcIfIdle();
         reply([ACK]);
         audioSessionStop();
         return;

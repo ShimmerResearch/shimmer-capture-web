@@ -3588,6 +3588,47 @@ check(
   JSON.stringify(logAndStream),
 );
 
+/* DEV-1549: the clock set waits for the end of a session, on every firmware,
+   with the reason beside it. Streaming already greyed it. An SD log on its own
+   did not, and a set then stepped the log on released firmware or was held,
+   unseen, on newer. Reading the clock is not held back by a log. */
+const clockHold = await evaluate(`${LOG_LOOK}
+  const clock = () => ({
+    set: !$('btnSetClock').disabled,
+    read: !$('btnReadClock').disabled,
+    note: $('clockSetNoteRow').hidden ? null : $('clockSetNote').textContent,
+    title: $('btnSetClock').title,
+  });
+  const idle = clock();
+  $('btnLogStart').click();
+  await wait(2000); // the start, then the read-back 1.2 s later
+  const logging = clock();
+  $('btnStreamStart').click();
+  await wait(800);
+  const both = clock();
+  $('btnStreamStop').click();
+  await wait(1000); // the stop drains the tail first
+  $('btnLogStop').click();
+  await wait(600);
+  return { idle, logging, both, stopped: clock() };
+`);
+check(
+  "Set device clock from host is held back, with the reason, while the sensor SD logs or streams, and offered again after the stop; Read device clock is not held back by a log",
+  clockHold.idle.set &&
+    clockHold.idle.note === null &&
+    clockHold.idle.title === "" &&
+    !clockHold.logging.set &&
+    clockHold.logging.read &&
+    /^Stop SD logging first/.test(clockHold.logging.note ?? "") &&
+    clockHold.logging.title === clockHold.logging.note &&
+    !clockHold.both.set &&
+    /^Stop the stream and SD logging first/.test(clockHold.both.note ?? "") &&
+    clockHold.stopped.set &&
+    clockHold.stopped.note === null &&
+    clockHold.stopped.title === "",
+  JSON.stringify(clockHold),
+);
+
 /* Firmware that NACKs a log start it cannot carry out: the start fails with
    the reason, and the page claims no log. Here the card fault is one the
    sensor has not reported, so the page's own gate cannot hold the button. */
@@ -4191,6 +4232,96 @@ check(
   `+09:00 "${stampTokyo}" vs UTC "${stampUtc}" (${stampApart} min apart, want 540)`,
 );
 // Back to this machine's own zone for everything after this section.
+await send("Emulation.setTimezoneOverride", { timezoneId: "" });
+
+// ===========================================================================
+console.log("\n--- a clock set made while the sensor logs unseen ---");
+/* DEV-1549. The button is held while the page knows the sensor is sensing.
+   This is a log it does not know about, one started before it connected or
+   whose push the link lost, so the set goes out. The status read after it
+   says the sensor is logging, and the page says so rather than "set". Run
+   against both firmware behaviours: `rwcDefer=1` holds the set until the log
+   stops (DEV-1539), and the default applies it at once, as released firmware
+   up to v1.01.027 does. The sensor starts nine hours out, its clock on Tokyo
+   civil time, so a set that waited and a set that took read differently. */
+await send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
+const UNSEEN_LOG_SET = `
+  const $ = (id) => document.getElementById(id);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  // The sensor's clock minus this host's, in hours to two places.
+  const offH = () =>
+    Math.round((window.mockTransport.rtc.deviceNowMs() - Date.now()) / 36000) / 100;
+  const toasts = () =>
+    [...document.querySelectorAll('.toast')].map((t) => t.textContent);
+  window.mockTransport.status.logQuietly(true);
+  const offered = !$('btnSetClock').disabled;
+  const before = offH();
+  $('btnSetClock').click();
+  await wait(2500);
+  const during = {
+    off: offH(),
+    pending: window.mockTransport.rtc.setPending,
+    held: $('btnSetClock').disabled,
+    note: $('clockSetNoteRow').hidden ? null : $('clockSetNote').textContent,
+    toasts: toasts(),
+  };
+  $('btnLogStop').click();
+  await wait(800);
+  return {
+    offered,
+    before,
+    during,
+    after: {
+      off: offH(),
+      pending: window.mockTransport.rtc.setPending,
+      offered: !$('btnSetClock').disabled,
+    },
+  };
+`;
+const saidLogging = (r) =>
+  r.during.toasts.some((t) =>
+    /was logging to its SD card when the set arrived/.test(t),
+  ) && !r.during.toasts.some((t) => /Sensor clock set from this host/.test(t));
+
+await goto(`${BASE}?mock=1&rwcDefer=1&clockBase=local`);
+check(
+  "connect to a sensor that holds a clock set made while it senses",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+const heldSet = await evaluate(UNSEEN_LOG_SET);
+check(
+  "a set the sensor holds until its log stops is reported as waiting, not as set, and the clock moves only at the stop",
+  heldSet.offered &&
+    heldSet.before === 9 &&
+    heldSet.during.pending &&
+    heldSet.during.off === 9 &&
+    heldSet.during.held &&
+    /^Stop SD logging first/.test(heldSet.during.note ?? "") &&
+    saidLogging(heldSet) &&
+    !heldSet.after.pending &&
+    heldSet.after.off === 0 &&
+    heldSet.after.offered,
+  JSON.stringify(heldSet),
+);
+
+await goto(`${BASE}?mock=1&clockBase=local`);
+check(
+  "connect to a sensor that applies a clock set at once",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+const steppedSet = await evaluate(UNSEEN_LOG_SET);
+check(
+  "on firmware that applies it at once the clock moves inside the log, and the page still says the sensor was logging rather than claiming a clean set",
+  steppedSet.offered &&
+    steppedSet.before === 9 &&
+    !steppedSet.during.pending &&
+    steppedSet.during.off === 0 &&
+    steppedSet.during.held &&
+    saidLogging(steppedSet) &&
+    steppedSet.after.off === 0 &&
+    steppedSet.after.offered,
+  JSON.stringify(steppedSet),
+);
 await send("Emulation.setTimezoneOverride", { timezoneId: "" });
 
 // ===========================================================================
