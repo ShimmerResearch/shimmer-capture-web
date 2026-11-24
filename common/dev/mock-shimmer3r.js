@@ -1255,6 +1255,9 @@ export function createMockShimmer3RTransport(opts = {}) {
     /* Refuse a log start it cannot carry out with a NACK, starting nothing,
        instead of ACKing it as released firmware does (transport.status). */
     nackRefusedLogStart: false,
+    /* Until this time (Date.now()), a status still says sensing after a stop
+       command closed the log: `transport.status.stopTail`. 0 when not. */
+    sensingUntil: 0,
     /** The clock has been set since the sensor last lost power. */
     rwcSet: false,
     /** The red LED, as TOGGLE_LED leaves it. */
@@ -1574,6 +1577,27 @@ export function createMockShimmer3RTransport(opts = {}) {
         if (key in patch) state[key] = !!patch[key];
       }
     },
+    /**
+     * How a stop command that closes the log finishes (DEV-1553): for `ms`
+     * after it, a status read still says sensing, with logging and streaming
+     * off, and with `endPush` a push saying all three are off ends it, as
+     * the bench sensors' did 5-9 s after the stop. `Infinity` never ends it:
+     * a stop that does not finish. 0 (the default) finishes at once.
+     *
+     * The firmware clears `sensing` within its stop, once the SD and audio
+     * files are closed (`ShimSens_stopSensing`), so a long tail is the case
+     * a host has to survive rather than the usual one. The push from inside
+     * the stop says sensing whatever this is set to (`audioSessionStop`).
+     */
+    stopTail(ms, { endPush = true } = {}) {
+      stopTail.ms = Number(ms) > 0 ? Number(ms) : 0;
+      stopTail.endPush = !!endPush;
+      endStopTail();
+    },
+    /** True while a stop's tail still has the status saying sensing. */
+    get stopTailRunning() {
+      return Date.now() < state.sensingUntil;
+    },
     /** The frame a push (or a GET_STATUS answer) carries, for comparison. */
     bytes: () => new Uint8Array(statusResponse()),
   };
@@ -1779,14 +1803,20 @@ export function createMockShimmer3RTransport(opts = {}) {
    * `Comms/shimmer_bt_uart.c`): docked, sensing, RTC set, SD logging,
    * streaming, card inserted, bad file, red LED. `sensing` is set by either
    * kind of recording, which is how the firmware reports it — it is not a
-   * fourth thing the host can start.
+   * fourth thing the host can start. It also outlasts both for the tail of a
+   * stop (`transport.status.stopTail`).
    *
    * Always two bytes, the Shimmer3R length: a Shimmer3 sends one, but this
    * mock answers as a Shimmer3R whatever hardware id it is told to report,
    * and the SDK reads only as many bytes as the platform it identified has.
+   *
+   * @param {boolean} [sensingNow] the sensing bit, for a status sent while
+   *   the firmware is part-way through a change (`audioSessionStop`)
    */
-  function statusResponse() {
-    const sensing = state.streaming || state.logging;
+  function statusResponse(sensingNow) {
+    const sensing =
+      sensingNow ??
+      (state.streaming || state.logging || Date.now() < state.sensingUntil);
     const status0 =
       (state.docked ? 0x01 : 0) |
       (sensing ? 0x02 : 0) |
@@ -1856,13 +1886,47 @@ export function createMockShimmer3RTransport(opts = {}) {
       setTimeout(() => reply(statusResponse()), 300);
   }
 
-  /** Logging has stopped: the files close, and the recording bit clears. */
+  /**
+   * Logging has stopped: the files close, and the recording bit clears.
+   *
+   * The push that says so is sent from inside the stop, before the firmware
+   * clears `sensing`: `ShimSens_stopSensing` clears `sdLogging`, closes the
+   * SD file, and `ShimSdDataFile_close` → `PlatAudio_sessionStop` pushes the
+   * status through `notifyIfChanged`. So it says sensing with logging off,
+   * whether or not a stream goes on (DEV-1553). For a stop a command caused,
+   * nothing is pushed once `sensing` clears.
+   */
   function audioSessionStop() {
     if (!audioBuilt || aud.sessionStartMs === null) return;
     const before = audioStatusBits();
     if (aud.sessionEndMs === null) aud.sessionEndMs = Date.now();
     if (audioStatusBits() !== before && !aud.dropStopPush)
-      reply(statusResponse());
+      reply(statusResponse(true));
+  }
+
+  /** The tail of a stop command that closed the log (`status.stopTail`). */
+  const stopTail = { ms: 0, endPush: true };
+  let stopTailTimer = null;
+
+  /** A stop command has closed the log, with no stream left to keep sensing. */
+  function beginStopTail() {
+    endStopTail();
+    if (!stopTail.ms) return;
+    state.sensingUntil = Date.now() + stopTail.ms;
+    if (stopTail.endPush && Number.isFinite(stopTail.ms)) {
+      stopTailTimer = setTimeout(() => {
+        stopTailTimer = null;
+        state.sensingUntil = 0;
+        reply(statusResponse());
+      }, stopTail.ms);
+    }
+  }
+
+  /** The tail is over, or a start has made it moot: say sensing as it is. */
+  function endStopTail() {
+    if (stopTailTimer !== null) clearTimeout(stopTailTimer);
+    stopTailTimer = null;
+    state.sensingUntil = 0;
   }
 
   /** `[0xBD][32 bytes]` (`PlatAudio_buildStatus`). */
@@ -1909,12 +1973,22 @@ export function createMockShimmer3RTransport(opts = {}) {
     set dropStopPush(on) {
       aud.dropStopPush = !!on;
     },
-    /** Start or stop SD logging as the user button would, and push the status. */
+    /**
+     * Start or stop SD logging as the user button would, and push the status.
+     * A stop the firmware made itself is pushed again once `sensing` clears
+     * (`ShimBt_instreamStatusRespSendIfNotBtCmd`), after the push from inside
+     * the stop (`audioSessionStop`).
+     */
     setLogging(on) {
       state.logging = !!on;
-      reply(statusResponse());
-      if (on) audioSessionStart();
-      else audioSessionStop();
+      endStopTail();
+      if (on) {
+        reply(statusResponse());
+        audioSessionStart();
+      } else {
+        audioSessionStop();
+        reply(statusResponse());
+      }
     },
     /**
      * A fault, as the firmware raises it: 4 (overrun) and 5 (fingerprint
@@ -2539,6 +2613,7 @@ export function createMockShimmer3RTransport(opts = {}) {
       clearInterval(sdRead.timer);
       sdRead = null;
     }
+    endStopTail();
     state.streaming = false;
     state.logging = false;
   });
@@ -3481,6 +3556,7 @@ export function createMockShimmer3RTransport(opts = {}) {
 
       case CMD.START_STREAMING:
         state.streaming = true;
+        endStopTail();
         reply([ACK]);
         startStreaming();
         return;
@@ -3498,6 +3574,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         const wasLogging = state.logging;
         state.streaming = true;
         state.logging = wasLogging || canLog;
+        endStopTail();
         reply([ACK]);
         startStreaming();
         if (state.logging && !wasLogging) audioSessionStart();
@@ -3514,6 +3591,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         reply([ACK]);
         if (canLog) {
           state.logging = true;
+          endStopTail();
           audioSessionStart();
         }
         return;
@@ -3525,6 +3603,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         state.logging = false;
         reply([ACK]);
         if (wasLogging) audioSessionStop();
+        if (wasLogging && !state.streaming) beginStopTail();
         return;
       }
 
@@ -3536,13 +3615,16 @@ export function createMockShimmer3RTransport(opts = {}) {
         reply([ACK]);
         return;
 
-      case CMD.STOP_SDBT:
+      case CMD.STOP_SDBT: {
+        const wasLogging = state.logging;
         state.streaming = false;
         state.logging = false;
         stopStreaming();
         reply([ACK]);
         audioSessionStop();
+        if (wasLogging) beginStopTail();
         return;
+      }
 
       case CMD.TOGGLE_LED:
         // The status bit the firmware reports is the toggle state, not a
