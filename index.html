@@ -819,6 +819,9 @@
               Read device clock
             </button>
           </div>
+          <div class="row" id="clockSetNoteRow" hidden>
+            <span class="muted" id="clockSetNote"></span>
+          </div>
           <div class="kv">
             <div class="muted">Real-world clock</div>
             <div id="rwcValue" class="mono">–</div>
@@ -2194,13 +2197,17 @@
         $("sdStartNoteRow").hidden = !sdStartBlock || sdLogging;
         $("logOnlyNoteRow").hidden = !client || !sdLogging || streaming;
 
-        /* The clock set waits for a stop to finish (DEV-1553): a set that
-                 arrives while the sensor still senses is applied inside the
-                 session on released firmware, and held until the stop on newer
-                 firmware. `data-requires="idle"` has let it go by then. */
+        /* The clock set waits for the end of a session, with the reason
+                 beside it. `data-requires="idle"` already greys it while
+                 streaming; an SD log on its own is not "busy" to the gate
+                 (DEV-1549), and neither is a stop that is still finishing
+                 (DEV-1553). Both are in `clockSetHeldReason`. */
+        const clockSetHeld = clockSetHeldReason();
         const setClock = $("btnSetClock");
-        if (stopping) setClock.disabled = true;
-        setClock.title = stopping ? STOP_FINISHING_REASON : "";
+        if (clockSetHeld) setClock.disabled = true;
+        setClock.title = clockSetHeld ?? "";
+        $("clockSetNote").textContent = clockSetHeld ?? "";
+        $("clockSetNoteRow").hidden = !clockSetHeld;
 
         /* Each panel is enabled on everything EXCEPT its own busy flag: this
                  is the floor for whether the LINK can do the thing at all, and each
@@ -3214,9 +3221,9 @@
        * broke midnight CSV splits.
        */
       async function setDeviceClock() {
-        // Held while a stop finishes, as the button is (regate, DEV-1553)
-        if (stopping) {
-          showToast(STOP_FINISHING_REASON, "warn");
+        const held = clockSetHeldReason();
+        if (held) {
+          showToast(held, "warn");
           return;
         }
         /* A plain Unix epoch, which is what desktop Consensys and the dock
@@ -3233,17 +3240,79 @@
           showToast("This link cannot set the sensor clock", "warn");
           return;
         }
+        const statedBefore = statusStatements;
         try {
           await withDevice("set the real-world clock", write);
-          showToast("Sensor clock set from this host", "ok");
-          /* Any drift measurement in progress spans a discontinuity now, so
-                   its baseline goes with the write rather than being fitted across
-                   the step. */
-          drift.noteClockWritten();
-          await refreshDeviceState();
         } catch {
           /* logged and toasted by withDevice */
+          return;
         }
+        /* Any drift measurement in progress spans a discontinuity now, so its
+                 baseline goes with the write rather than being fitted across the
+                 step. A set the sensor holds until its stop is no different: the
+                 drift panel skips every sample while the sensor senses, and
+                 re-detects the clock from the first one after. */
+        drift.noteClockWritten();
+        await refreshDeviceState().catch(() => {});
+        /* The button is held while the page knows the sensor is sensing, but
+                 a log started from the sensor's button, or before this page
+                 connected, is learnt from the status read that follows the set.
+                 Then the clock read beside it is the one the session runs on, not
+                 the one just sent, and "set" would be wrong on every firmware. */
+        const sensing =
+          streaming ||
+          sdLogging ||
+          (statusStatements !== statedBefore &&
+            statusView?.status?.sensing === true);
+        if (sensing) {
+          const [doing, ends] = sdLogging
+            ? ["logging to its SD card", "logging stops"]
+            : ["sensing", "sensing stops"];
+          const message =
+            `The sensor was ${doing} when the set arrived. Newer firmware ` +
+            `holds the set until ${ends}, so the clock reads unchanged until ` +
+            "then; released firmware up to v1.01.027 applied it at once, " +
+            "inside the running session.";
+          log.warn(`clock set: ${message}`);
+          showToast(message, "warn", { ttlMs: 12000 });
+          return;
+        }
+        showToast("Sensor clock set from this host", "ok");
+      }
+
+      /**
+       * Why the sensor's clock is not set from here right now, or null.
+       *
+       * Not while it is streaming or SD logging (DEV-1549). Released firmware
+       * up to v1.01.027 applies a set at once, and on a Shimmer3R the sample
+       * stamps ARE that clock, so a set mid-session steps every stamp after
+       * it. Later firmware (DEV-1539) ACKs the set but holds it until streaming
+       * and logging have both stopped, and reads back the old clock until
+       * then, which here would look like a set that failed. The two cannot be
+       * told apart by version yet — Shimmer3R main still reports v1.01.027 —
+       * so the set waits for the stop on every firmware. A clock that should
+       * be right for a session is set before it starts.
+       *
+       * And not while a stop this page sent is still finishing (DEV-1553):
+       * the sensor still senses then, so a set would land inside the session
+       * or wait for its end, exactly as above.
+       */
+      function clockSetHeldReason() {
+        if (!client) return null;
+        if (!(streaming || sdLogging))
+          return stopping ? STOP_FINISHING_REASON : null;
+        const what =
+          streaming && sdLogging
+            ? "the stream and SD logging"
+            : streaming
+              ? "the stream"
+              : "SD logging";
+        return (
+          `Stop ${what} first, or set the clock before you start. While the ` +
+          "sensor is sensing, released firmware up to v1.01.027 steps the " +
+          "running session's timestamps, and newer firmware holds the set " +
+          "until sensing stops."
+        );
       }
 
       /**
@@ -7609,6 +7678,8 @@
        *   ?mock=1&clockBase=local  start the sensor's clock on this host's
        *                        civil time instead of UTC, as a sensor set by
        *                        a tool using the other convention reads
+       *   ?mock=1&rwcDefer=1   firmware that holds a clock set made while it
+       *                        streams or logs until both stop (DEV-1539)
        *   ?mock=1&events=1     firmware with the event channel (DEV-971)
        *   ?mock=1&audio=1      firmware that records audio (DEV-99): byte 233,
        *                        the audio status command and audio/ files on
@@ -7646,6 +7717,11 @@
           wrapInSec: params.has("rtcWrapIn")
             ? Number(params.get("rtcWrapIn"))
             : undefined,
+          /* `rwcDefer=1` is firmware that holds a clock set made while it
+                   streams or logs until both have stopped (DEV-1539). Without it
+                   the mock applies a set at once, as released firmware up to
+                   v1.01.027 does. */
+          deferSetWhileSensing: params.get("rwcDefer") === "1",
         };
         /* `srBoard=48-3-0` sets the board's SR identity, `srBoard=none` leaves
                  its id page erased. `btVersion=` (empty) models the module never
