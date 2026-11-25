@@ -702,9 +702,13 @@ const apply = await evaluate(`
 const opString = apply.seq
   .map((s) => s.op + (s.n > 1 ? "x" + s.n : ""))
   .join(" ");
+// The image goes out as three whole 128-byte SET_INFOMEM pages (0x8c x3), on
+// BLE too, from SDK 0.5.25. Released firmware keeps calibration only from a
+// chunk starting at 0 or 128, so the 64-byte BLE chunks (x6) before it lost the
+// gyro, mag and WR accel calibration (DEV-1562, DEV-1564).
 check(
   "apply runs the firmware's order",
-  opString === "0x8cx6 0x9c 0x08 0x01 0x05 0x09 0x01 0x8ex3",
+  opString === "0x8cx3 0x9c 0x08 0x01 0x05 0x09 0x01 0x8ex3",
   opString,
 );
 check(
@@ -2925,6 +2929,13 @@ await goto(`${BASE}?mock=1&rate=1024`);
 const tapBytes = await evaluate(`
   const chk = document.getElementById('chkRawBytes');
   chk.checked = true; chk.dispatchEvent(new Event('change'));
+  /* The pass's link CRC, as CONNECT sets it: the CRC trailer is part of what
+     the tap has to show, so VERIFY_CRC=0 has to reach this section too. */
+  const crcSel = document.getElementById('crcMode');
+  if (crcSel && !crcSel.disabled) {
+    crcSel.value = '${CRC_MODE}';
+    crcSel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
   document.getElementById('btnMock').click();
   for (let i = 0; i < 80 && !document.getElementById('rateHelper'); i++)
     await new Promise(r => setTimeout(r, 100));
@@ -2954,6 +2965,72 @@ check(
   tapBytes.rxCount >= tapBytes.tx.length - 1 &&
     /^RX ff /.test(tapBytes.firstRx),
   `${tapBytes.rxCount} RX lines, first ${tapBytes.firstRx}`,
+);
+
+/* DEV-1519: the tap used to stop every line at 32 bytes, so a 128-byte
+   InfoMem page -- 131 bytes with its ACK and header, 133 with a 2-byte CRC --
+   was logged as its first 32 and "… +101 of 133", and the CRC trailer never
+   appeared at all. Long traffic in both directions, each line compared with
+   what actually crossed the link: the InfoMem page read, then written back
+   unchanged (132 bytes out), then the calibration dump in 128-byte chunks. */
+const tapLong = await evaluate(`
+  const mt = window.mockTransport;
+  const client = window.mockClient;
+  const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join(' ');
+  const sent = [];
+  const ownNotify = Object.prototype.hasOwnProperty.call(mt, 'notify');
+  const realNotify = mt.notify;
+  mt.notify = function (data) {
+    sent.push('RX ' + hex(data instanceof Uint8Array ? data : new Uint8Array(data)));
+    return realNotify.call(this, data);
+  };
+  const writesBefore = mt.writes.length;
+  document.getElementById('btnLogClear').click();
+  let error = null;
+  try {
+    const page = await client.readInfoMem(0, 128);
+    await client.writeInfoMem(0, page);
+    await client.readCalibDump();
+  } catch (e) {
+    error = String(e?.message ?? e);
+  } finally {
+    if (ownNotify) mt.notify = realNotify;
+    else delete mt.notify;
+  }
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const strip = sel => [...document.querySelectorAll(sel)]
+    .map(l => l.textContent.replace(/^\\S+ \\S+ /, ''));
+  const tx = strip('#log .log-line.sev-tx');
+  const rx = strip('#log .log-line.sev-rx');
+  const width = l => l.split(' ').length - 1;
+  const infoMem = rx.find(l => /^RX ff 8d 80 /.test(l)) ?? '';
+  return {
+    error, crc: client.crcMode,
+    tx, rx,
+    wrote: mt.writes.slice(writesBefore).map(w => 'TX ' + hex(w.bytes)),
+    // Data packets are the tap's to leave out; nothing else is.
+    sent: sent.filter(l => !/^RX 00 /.test(l)),
+    infoMemBytes: width(infoMem), infoMemTail: infoMem.slice(-17),
+    longestTx: Math.max(0, ...tx.map(width)),
+    longestRx: Math.max(0, ...rx.map(width)),
+    elided: tx.concat(rx).filter(l => l.includes('…')).length,
+  };
+`);
+check(
+  "a reply longer than 32 bytes is logged whole, CRC trailer included, and so is a long command",
+  tapLong.error === null &&
+    tapLong.crc === Number(CRC_MODE) &&
+    tapLong.elided === 0 &&
+    tapLong.infoMemBytes === 131 + tapLong.crc &&
+    tapLong.longestRx > 32 &&
+    tapLong.longestTx === 132 &&
+    tapLong.rx.length > 2 &&
+    tapLong.rx.join("|") === tapLong.sent.join("|") &&
+    tapLong.tx.join("|") === tapLong.wrote.join("|"),
+  tapLong.error ??
+    `InfoMem page ${tapLong.infoMemBytes} bytes on CRC ${tapLong.crc} ` +
+      `(ends ${tapLong.infoMemTail}), ${tapLong.rx.length} RX lines up to ` +
+      `${tapLong.longestRx} bytes, ${tapLong.tx.length} TX up to ${tapLong.longestTx}`,
 );
 
 const tapStream = await evaluate(`
@@ -3565,6 +3642,47 @@ check(
   JSON.stringify(logAndStream),
 );
 
+/* DEV-1549: the clock set waits for the end of a session, on every firmware,
+   with the reason beside it. Streaming already greyed it. An SD log on its own
+   did not, and a set then stepped the log on released firmware or was held,
+   unseen, on newer. Reading the clock is not held back by a log. */
+const clockHold = await evaluate(`${LOG_LOOK}
+  const clock = () => ({
+    set: !$('btnSetClock').disabled,
+    read: !$('btnReadClock').disabled,
+    note: $('clockSetNoteRow').hidden ? null : $('clockSetNote').textContent,
+    title: $('btnSetClock').title,
+  });
+  const idle = clock();
+  $('btnLogStart').click();
+  await wait(2000); // the start, then the read-back 1.2 s later
+  const logging = clock();
+  $('btnStreamStart').click();
+  await wait(800);
+  const both = clock();
+  $('btnStreamStop').click();
+  await wait(1000); // the stop drains the tail first
+  $('btnLogStop').click();
+  await wait(600);
+  return { idle, logging, both, stopped: clock() };
+`);
+check(
+  "Set device clock from host is held back, with the reason, while the sensor SD logs or streams, and offered again after the stop; Read device clock is not held back by a log",
+  clockHold.idle.set &&
+    clockHold.idle.note === null &&
+    clockHold.idle.title === "" &&
+    !clockHold.logging.set &&
+    clockHold.logging.read &&
+    /^Stop SD logging first/.test(clockHold.logging.note ?? "") &&
+    clockHold.logging.title === clockHold.logging.note &&
+    !clockHold.both.set &&
+    /^Stop the stream and SD logging first/.test(clockHold.both.note ?? "") &&
+    clockHold.stopped.set &&
+    clockHold.stopped.note === null &&
+    clockHold.stopped.title === "",
+  JSON.stringify(clockHold),
+);
+
 /* Firmware that NACKs a log start it cannot carry out: the start fails with
    the reason, and the page claims no log. Here the card fault is one the
    sensor has not reported, so the page's own gate cannot hold the button. */
@@ -4171,6 +4289,144 @@ check(
 await send("Emulation.setTimezoneOverride", { timezoneId: "" });
 
 // ===========================================================================
+console.log("\n--- a clock set made while the sensor logs unseen ---");
+/* DEV-1549. The button is held while the page knows the sensor is sensing.
+   This is a log it does not know about, one started before it connected or
+   whose push the link lost, so the set goes out. The status read after it
+   says the sensor is logging, and the page says so rather than "set". Run
+   against both firmware behaviours: `rwcDefer=1` holds the set until the log
+   stops (DEV-1539), and the default applies it at once, as released firmware
+   up to v1.01.027 does. The sensor starts nine hours out, its clock on Tokyo
+   civil time, so a set that waited and a set that took read differently. */
+await send("Emulation.setTimezoneOverride", { timezoneId: "Asia/Tokyo" });
+const UNSEEN_LOG_SET = `
+  const $ = (id) => document.getElementById(id);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  // The sensor's clock minus this host's, in hours to two places.
+  const offH = () =>
+    Math.round((window.mockTransport.rtc.deviceNowMs() - Date.now()) / 36000) / 100;
+  const toasts = () =>
+    [...document.querySelectorAll('.toast')].map((t) => t.textContent);
+  window.mockTransport.status.logQuietly(true);
+  const offered = !$('btnSetClock').disabled;
+  const before = offH();
+  $('btnSetClock').click();
+  await wait(2500);
+  const during = {
+    off: offH(),
+    pending: window.mockTransport.rtc.setPending,
+    held: $('btnSetClock').disabled,
+    note: $('clockSetNoteRow').hidden ? null : $('clockSetNote').textContent,
+    toasts: toasts(),
+  };
+  $('btnLogStop').click();
+  await wait(800);
+  return {
+    offered,
+    before,
+    during,
+    after: {
+      off: offH(),
+      pending: window.mockTransport.rtc.setPending,
+      offered: !$('btnSetClock').disabled,
+    },
+  };
+`;
+const saidLogging = (r) =>
+  r.during.toasts.some((t) =>
+    /was logging to its SD card when the set arrived/.test(t),
+  ) && !r.during.toasts.some((t) => /Sensor clock set from this host/.test(t));
+
+await goto(`${BASE}?mock=1&rwcDefer=1&clockBase=local`);
+check(
+  "connect to a sensor that holds a clock set made while it senses",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+const heldSet = await evaluate(UNSEEN_LOG_SET);
+check(
+  "a set the sensor holds until its log stops is reported as waiting, not as set, and the clock moves only at the stop",
+  heldSet.offered &&
+    heldSet.before === 9 &&
+    heldSet.during.pending &&
+    heldSet.during.off === 9 &&
+    heldSet.during.held &&
+    /^Stop SD logging first/.test(heldSet.during.note ?? "") &&
+    saidLogging(heldSet) &&
+    !heldSet.after.pending &&
+    heldSet.after.off === 0 &&
+    heldSet.after.offered,
+  JSON.stringify(heldSet),
+);
+
+/* DEV-1549 and DEV-1553 together: the firmware applies a held set when
+   `sensing` clears, at the end of the stop, so a set held during an unseen
+   log waits through the tail of the stop that ends it. Meanwhile the button
+   says the stop is still finishing. A fresh sensor, nine hours out again. */
+await goto(`${BASE}?mock=1&rwcDefer=1&clockBase=local`);
+check(
+  "connect again for a held set across a stop's tail",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+const tailSet = await evaluate(`
+  const $ = (id) => document.getElementById(id);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const offH = () =>
+    Math.round((window.mockTransport.rtc.deviceNowMs() - Date.now()) / 36000) / 100;
+  const look = () => ({
+    tail: window.mockTransport.status.stopTailRunning,
+    pending: window.mockTransport.rtc.setPending,
+    off: offH(),
+    held: $('btnSetClock').disabled,
+    note: $('clockSetNoteRow').hidden ? null : $('clockSetNote').textContent,
+  });
+  window.mockTransport.status.logQuietly(true);
+  $('btnSetClock').click();
+  await wait(2500);
+  window.mockTransport.status.stopTail(2000);
+  $('btnLogStop').click();
+  await wait(700);
+  const inTail = look();
+  await wait(3000);
+  const after = look();
+  window.mockTransport.status.stopTail(0);
+  return { inTail, after };
+`);
+check(
+  "a set held during a log waits through the stop's tail and is applied when the sensor stops sensing, with the button saying the stop is still finishing",
+  tailSet.inTail.tail &&
+    tailSet.inTail.pending &&
+    tailSet.inTail.off === 9 &&
+    tailSet.inTail.held &&
+    /still finishing the stop/.test(tailSet.inTail.note ?? "") &&
+    !tailSet.after.tail &&
+    !tailSet.after.pending &&
+    tailSet.after.off === 0 &&
+    !tailSet.after.held &&
+    tailSet.after.note === null,
+  JSON.stringify(tailSet),
+);
+
+await goto(`${BASE}?mock=1&clockBase=local`);
+check(
+  "connect to a sensor that applies a clock set at once",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+const steppedSet = await evaluate(UNSEEN_LOG_SET);
+check(
+  "on firmware that applies it at once the clock moves inside the log, and the page still says the sensor was logging rather than claiming a clean set",
+  steppedSet.offered &&
+    steppedSet.before === 9 &&
+    !steppedSet.during.pending &&
+    steppedSet.during.off === 0 &&
+    steppedSet.during.held &&
+    saidLogging(steppedSet) &&
+    steppedSet.after.off === 0 &&
+    steppedSet.after.offered,
+  JSON.stringify(steppedSet),
+);
+await send("Emulation.setTimezoneOverride", { timezoneId: "" });
+
+// ===========================================================================
 console.log("\n--- ExG presets ---");
 await goto(`${BASE}?mock=1`);
 check("connect for the ExG pass", (await evaluate(CONNECT)) === "connected via mock");
@@ -4756,6 +5012,7 @@ const MUST_EXPLAIN = {
   linkTestUnavailableReason: [
     "streaming",
     "sdLogging",
+    "stopping",
     "sdBusy",
     "brandBusy",
     "calibBusy",
@@ -4765,6 +5022,7 @@ const MUST_EXPLAIN = {
   sdUnavailableReason: [
     "streaming",
     "sdLogging",
+    "stopping",
     "linkTesting",
     "brandBusy",
     "calibBusy",
@@ -4774,6 +5032,7 @@ const MUST_EXPLAIN = {
   brandUnavailableReason: [
     "streaming",
     "sdLogging",
+    "stopping",
     "linkTesting",
     "sdBusy",
     "calibBusy",
@@ -4783,6 +5042,7 @@ const MUST_EXPLAIN = {
   calibLinkHeldReason: [
     "streaming",
     "sdLogging",
+    "stopping",
     "linkTesting",
     "sdBusy",
     "brandBusy",
@@ -4796,6 +5056,7 @@ const MUST_EXPLAIN = {
   testUnavailableReason: [
     "streaming",
     "sdLogging",
+    "stopping",
     "linkTesting",
     "sdBusy",
     "brandBusy",
@@ -4808,6 +5069,7 @@ const MUST_EXPLAIN = {
   driftSampleSkipReason: [
     "streaming",
     "sdLogging",
+    "stopping",
     "linkTesting",
     "sdBusy",
     "brandBusy",
@@ -4821,6 +5083,7 @@ const MUST_EXPLAIN = {
   btUpdateHeldReason: [
     "streaming",
     "sdLogging",
+    "stopping",
     "linkTesting",
     "sdBusy",
     "brandBusy",
@@ -4835,6 +5098,7 @@ const MUST_EXPLAIN = {
   batteryRefreshSkipReason: [
     "streaming",
     "sdLogging",
+    "stopping",
     "linkTesting",
     "sdBusy",
     "brandBusy",
@@ -7630,9 +7894,15 @@ const audStopNoPush = await evaluate(`
   const during = recording();
   window.mockTransport.audio.dropStopPush = true;
   document.getElementById('btnSdStop').click();
+  /* Taken the moment the flag goes off: since DEV-1553 the page reads the
+     status back shortly after a stop that closes the log, and that read then
+     replaces the page's belief with the sensor's word. */
+  const off = () => flags().some(f => /^Recording audio\\b/.test(f.text) && !f.on);
+  for (let i = 0; i < 200 && !off(); i++) await new Promise(r => setTimeout(r, 10));
+  const after = flags();
   await new Promise(r => setTimeout(r, 1000));
   window.mockTransport.audio.dropStopPush = false;
-  return { during, after: flags() };
+  return { during, after };
 `);
 check(
   "with the stop's push lost, the stop still turns Recording audio off, as the page's own belief",
@@ -8662,6 +8932,362 @@ check(
     brFail.again.refused === 3 &&
     brFail.again.notes === 2,
   `${JSON.stringify(brFail.healed)} → ${JSON.stringify(brFail.again)}`,
+);
+
+// ===========================================================================
+console.log("\n--- Disconnect during the connect sequence (DEV-1524) ---");
+
+/* Disconnect goes live the moment the link opens, while the connect sequence
+   still has a dozen reads to make; on the bench a Shimmer3R over BLE
+   disconnected a second after connecting toasted "Reading the calibration
+   failed: Not connected (RX missing)". Each case below holds the sensor's
+   answer to one command with `holdReplies`, so the page is provably
+   part-way through that read when the link goes, rather than racing a timer.
+
+   The hold is taken synchronously after the click: the mock's transport
+   exists as soon as the click handler runs, and nothing is sent until the
+   client's connect has resolved. */
+const DURING = `
+  const $ = (id) => document.getElementById(id);
+  const until = async (pred, ms) => {
+    for (let t = 0; t < ms && !pred(); t += 20)
+      await new Promise((r) => setTimeout(r, 20));
+    return pred();
+  };
+  /* Every toast from here on, kept after it fades: an error toast lives 8 s,
+     and a check that only looked at the stack at the end would pass a toast
+     that came and went. */
+  const toasts = [];
+  new MutationObserver((ms) => {
+    for (const m of ms)
+      for (const n of m.addedNodes)
+        if (n.classList?.contains('toast'))
+          toasts.push({ err: n.classList.contains('err'), text: n.textContent });
+  }).observe(document.body, { childList: true, subtree: true });
+  const from = document.querySelectorAll('#log .log-line').length;
+  const lines = () => [...document.querySelectorAll('#log .log-line')]
+    .slice(from).map((l) => l.textContent);
+  const settled = () => lines().some((l) => /connect sequence stopped/.test(l));
+  const outcome = (extra) => ({
+    ...extra,
+    pill: $('connPill').textContent,
+    errToasts: toasts.filter((t) => t.err).map((t) => t.text),
+    banner: { err: $('configBanner').classList.contains('err'),
+              text: $('configBanner').textContent.trim() },
+    idFw: $('idFw').textContent,
+    idMac: $('idMac').textContent,
+    calStopped: lines().filter((l) =>
+      /Reading the calibration stopped: the link was closed/.test(l)).length,
+    seqStopped: lines().filter((l) => /connect sequence stopped/.test(l)).length,
+    failures: lines().filter((l) => /failed|could not be read/i.test(l)),
+    connectedLine: lines().some((l) => /mock sensor connected/.test(l)),
+  });
+`;
+const holdAndEnd = (op, end) => `${DURING}
+  $('btnMock').click();
+  const hold = window.mockTransport.holdReplies(${op});
+  const reached = await until(() => hold.held > 0, 8000);
+  const pillAtEnd = $('connPill').textContent;
+  ${end}
+  await until(settled, 6000);
+  await new Promise((r) => setTimeout(r, 300));
+  return outcome({ reached, pillAtEnd });
+`;
+const freshMockPage = async () => {
+  /* Both off: a dropped link must end the session rather than start the
+     automatic reconnect, and no battery poll may be on the link. */
+  await evaluate(
+    `try { localStorage.setItem('shimmerCaptureAutoReconnect', 'off'); } catch {}
+     try { localStorage.setItem('shimmerCaptureBatteryRefresh', 'off'); } catch {}
+     return 1;`,
+  );
+  await goto(`${BASE}?mock=1`);
+};
+
+await freshMockPage();
+const discCal = await evaluate(holdAndEnd(0x9a, "$('btnDisconnect').click();"));
+check(
+  "Disconnect while the connect sequence reads the calibration raises no error toast",
+  discCal.reached &&
+    discCal.pillAtEnd === "connected via mock" &&
+    discCal.pill === "disconnected" &&
+    discCal.errToasts.length === 0 &&
+    discCal.calStopped === 1,
+  JSON.stringify(discCal),
+);
+check(
+  "…and the sequence stops there, saying so once, with nothing logged as failed",
+  discCal.seqStopped === 1 &&
+    discCal.failures.length === 0 &&
+    !discCal.connectedLine &&
+    discCal.idFw === "–",
+  JSON.stringify(discCal.failures),
+);
+
+await freshMockPage();
+const discEarly = await evaluate(
+  holdAndEnd(0x01, "$('btnDisconnect').click();"),
+);
+check(
+  "Disconnect during an earlier read paints nothing onto the disconnected page",
+  /* The inquiry, which comes before the configuration image: reading on
+     after it used to put an error banner ("could not be read") and the
+     sensor's identity back on a page the teardown had cleared. */
+  discEarly.reached &&
+    discEarly.pill === "disconnected" &&
+    discEarly.errToasts.length === 0 &&
+    !discEarly.banner.err &&
+    discEarly.idFw === "–" &&
+    discEarly.idMac === "–" &&
+    discEarly.seqStopped === 1 &&
+    discEarly.failures.length === 0,
+  JSON.stringify(discEarly),
+);
+
+await freshMockPage();
+const dropCal = await evaluate(
+  holdAndEnd(
+    0x9a,
+    "window.mockTransport.emitDisconnect(new Error('walked out of range (mock)'));",
+  ),
+);
+check(
+  "a drop during the connect sequence is reported once, by the drop, not again by the read",
+  dropCal.reached &&
+    dropCal.pill === "disconnected" &&
+    dropCal.errToasts.length === 1 &&
+    /The sensor disconnected/.test(dropCal.errToasts[0]) &&
+    dropCal.calStopped === 1,
+  JSON.stringify(dropCal.errToasts),
+);
+
+await freshMockPage();
+const liveFail = await evaluate(`${DURING}
+  $('btnMock').click();
+  /* A calibration read that fails while the link is up, as a flash read
+     error would: still a failure, and still reported. */
+  window.mockClient.readCalibDump = async () => {
+    throw new Error('flash read error (mock)');
+  };
+  await until(() => lines().some((l) => /mock sensor connected/.test(l)), 8000);
+  const out = outcome({});
+  $('btnDisconnect').click();
+  await new Promise((r) => setTimeout(r, 300));
+  return out;
+`);
+check(
+  "a calibration read that fails on a live link still reports it",
+  liveFail.pill === "connected via mock" &&
+    liveFail.errToasts.some((t) =>
+      /Reading the calibration failed: flash read error/.test(t),
+    ) &&
+    liveFail.calStopped === 0 &&
+    liveFail.seqStopped === 0 &&
+    liveFail.connectedLine,
+  JSON.stringify(liveFail.errToasts),
+);
+
+// ===========================================================================
+// The tail of a stop that closes the log (DEV-1553).
+//
+// Shimmer3R firmware pushes its status from inside the stop that closes an SD
+// log, before it clears `sensing` (ShimSdDataFile_close → PlatAudio_sessionStop
+// → notifyIfChanged), and sends nothing once it has. On the bench (24 Nov 2026)
+// the page took that push for a stop that failed and a session somebody else
+// started, and offered the clock set and Apply while the sensor still said it
+// was sensing. The mock pushes the same status from the same place, and
+// `status.stopTail` keeps a read saying sensing for as long as a test needs.
+// ===========================================================================
+console.log("\n--- the tail of a stop that closes the log (DEV-1553) ---");
+await freshMockPage();
+await goto(`${BASE}?mock=1&audio=1&stopLimitMs=4000`);
+check(
+  "connect for the stop-tail pass, to firmware that records audio",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+await evaluate(SET_AUDIO(1) + APPLY_AUDIO + "return 1;");
+
+const TAIL = `
+  const $ = (id) => document.getElementById(id);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (pred, ms) => {
+    for (let t = 0; t < ms && !pred(); t += 20) await wait(20);
+    return pred();
+  };
+  const from = document.querySelectorAll('#log .log-line').length;
+  const lines = () => [...document.querySelectorAll('#log .log-line')]
+    .slice(from).map((l) => l.textContent);
+  const falseWarnings = () => lines().filter((l) =>
+    /did not take effect|its own button or by another host/.test(l));
+  const flagOn = (label) => [...document.querySelectorAll('#statusFlags .flag.on')]
+    .some((f) => f.textContent.replace(/ \\*$/, '') === label);
+  const FINISHING = /still finishing the stop/;
+  const look = () => ({
+    applyNote: $('applyNote').textContent,
+    setClock: !$('btnSetClock').disabled,
+    setClockTitle: $('btnSetClock').title,
+    sdTab: $('sdBanner').textContent.trim(),
+    sensing: flagOn('Sensing'),
+  });
+  const held = () => FINISHING.test($('applyNote').textContent);
+  const offered = () => $('applyNote').textContent === '' && !$('btnSetClock').disabled;
+  const statusReads = () => window.mockTransport.writes.filter((w) => w.bytes[0] === 0x72).length;
+  /* Start SD logging with no stream, as far as the sensor saying it records
+     audio, and past the start's own read-back. */
+  const startLog = async () => {
+    await until(() => !$('btnLogStart').disabled, 4000);
+    $('btnLogStart').click();
+    await until(() => flagOn('Recording audio') && !$('btnLogStop').disabled, 4000);
+    await wait(1500);
+  };
+`;
+
+/* The bench case: the push from inside the stop says sensing, and a read
+   straight after says the sensor has stopped. */
+const tailBench = await evaluate(`${TAIL}
+  await startLog();
+  const t0 = performance.now();
+  const reads0 = statusReads();
+  $('btnLogStop').click();
+  await until(() => lines().some((l) => FINISHING.test(l)), 3000);
+  const during = look();
+  const ok = await until(offered, 3000);
+  return { during, ok, after: look(), ms: Math.round(performance.now() - t0),
+    reads: statusReads() - reads0, warned: falseWarnings(),
+    said: lines().filter((l) => /finish/.test(l)) };
+`);
+check(
+  "Stop SD logging: the push from inside the stop (sensing, the log closed) logs no false warning",
+  tailBench.warned.length === 0 &&
+    tailBench.said.some((l) => /still finishing the stop/.test(l)),
+  JSON.stringify({ warned: tailBench.warned, said: tailBench.said }),
+);
+check(
+  "…the clock set and Apply are held with the reason until the sensor says it has stopped",
+  !tailBench.during.setClock &&
+    /still finishing the stop/.test(tailBench.during.setClockTitle) &&
+    /still finishing the stop/.test(tailBench.during.applyNote) &&
+    /still finishing the stop/.test(tailBench.during.sdTab) &&
+    tailBench.during.sensing,
+  JSON.stringify(tailBench.during),
+);
+check(
+  "…and a status read straight after the stop lets them go, with no push needed",
+  tailBench.ok &&
+    tailBench.ms < 2000 &&
+    tailBench.reads >= 1 &&
+    !tailBench.after.sensing &&
+    tailBench.after.setClockTitle === "" &&
+    tailBench.said.some((l) => /has finished the stop/.test(l)),
+  `${tailBench.ms} ms, ${tailBench.reads} status read(s) | ${tailBench.said.join(" / ")}`,
+);
+
+/* A sensor that goes on saying it is sensing when asked, and pushes nothing
+   to say it has stopped: the page keeps asking. */
+const tailReads = await evaluate(`${TAIL}
+  await startLog();
+  window.mockTransport.status.stopTail(2500, { endPush: false });
+  const t0 = performance.now();
+  const reads0 = statusReads();
+  $('btnLogStop').click();
+  await until(held, 3000);
+  await wait(1500);
+  const during = { ...look(), held: held(), tail: window.mockTransport.status.stopTailRunning };
+  const ok = await until(offered, 4000);
+  const ms = Math.round(performance.now() - t0);
+  window.mockTransport.status.stopTail(0);
+  return { during, ok, ms, after: look(), reads: statusReads() - reads0,
+    warned: falseWarnings() };
+`);
+check(
+  "a sensor that still says it is sensing when read keeps the controls held, and they are offered once a read says it has stopped",
+  tailReads.during.held &&
+    tailReads.during.tail &&
+    !tailReads.during.setClock &&
+    tailReads.ok &&
+    tailReads.ms >= 2500 &&
+    tailReads.reads >= 3 &&
+    !tailReads.after.sensing &&
+    tailReads.warned.length === 0,
+  `offered after ${tailReads.ms} ms, ${tailReads.reads} status reads, ` +
+    `${tailReads.warned.length} false warning(s)`,
+);
+
+/* Stop stream + SD logging (0x97): the push comes in the stream's tail, before
+   the stop returns, and an all-off push ends the wait, as the bench sensors'
+   push did 5-9 s after the stop. */
+const tailBoth = await evaluate(`${TAIL}
+  window.mockTransport.status.stopTail(2000, { endPush: true });
+  await until(() => !$('btnSdStart').disabled, 4000);
+  $('btnSdStart').click();
+  await until(() => flagOn('Recording audio') && !$('btnSdStop').disabled, 4000);
+  await wait(800);
+  $('btnSdStop').click();
+  const sawHeld = await until(held, 3000);
+  const during = look();
+  const ok = await until(offered, 5000);
+  window.mockTransport.status.stopTail(0);
+  return { sawHeld, during, ok, after: look(), warned: falseWarnings(),
+    said: lines().filter((l) => /finish/.test(l)) };
+`);
+check(
+  "Stop stream + SD logging holds the same controls through the tail, with no false warning, and lets them go",
+  tailBoth.sawHeld &&
+    !tailBoth.during.setClock &&
+    tailBoth.ok &&
+    tailBoth.warned.length === 0 &&
+    tailBoth.said.some((l) => /has finished the stop/.test(l)),
+  JSON.stringify({ warned: tailBoth.warned, said: tailBoth.said }),
+);
+
+/* A stop the sensor never says has finished: the page cannot hold the
+   controls for good. This page was loaded with a 4 s limit. */
+const tailStuck = await evaluate(`${TAIL}
+  await startLog();
+  window.mockTransport.status.stopTail(Infinity);
+  const t0 = performance.now();
+  $('btnLogStop').click();
+  await until(held, 3000);
+  const during = { held: held(), setClock: !$('btnSetClock').disabled };
+  const ok = await until(offered, 8000);
+  const ms = Math.round(performance.now() - t0);
+  window.mockTransport.status.stopTail(0);
+  return { during, ok, ms, warned: falseWarnings(),
+    gaveUp: lines().filter((l) => /still reports it is sensing \\d+ s after/.test(l)) };
+`);
+check(
+  "a stop the sensor never says has finished holds the controls only until the limit, then lets them go with a warning",
+  tailStuck.during.held &&
+    !tailStuck.during.setClock &&
+    tailStuck.ok &&
+    tailStuck.ms >= 3800 &&
+    tailStuck.ms < 7000 &&
+    tailStuck.gaveUp.length === 1 &&
+    tailStuck.warned.length === 0,
+  `offered after ${tailStuck.ms} ms | ${tailStuck.gaveUp[0]?.slice(21, 120) ?? "no warning"}`,
+);
+
+/* The user button: the firmware pushes from inside that stop too, then once
+   more when sensing clears. Neither is a session somebody else started. */
+const tailButton = await evaluate(`${TAIL}
+  await wait(300);
+  window.mockTransport.audio.setLogging(true);
+  await until(() => flagOn('Recording audio'), 3000);
+  await wait(500);
+  const mark = lines().length;
+  window.mockTransport.audio.setLogging(false);
+  await until(() => !flagOn('Sensing'), 3000);
+  await wait(300);
+  return { warned: lines().slice(mark).filter((l) =>
+      /did not take effect|its own button or by another host/.test(l)),
+    after: look() };
+`);
+check(
+  "a stop from the sensor's own button logs no warning for its push from inside the stop",
+  tailButton.warned.length === 0 &&
+    !tailButton.after.sensing &&
+    tailButton.after.setClock,
+  JSON.stringify(tailButton),
 );
 
 // ===========================================================================

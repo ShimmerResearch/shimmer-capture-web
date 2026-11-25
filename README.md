@@ -423,6 +423,19 @@ Consensys read a whole time-zone offset adrift, and a sensor set here read
 adrift in Consensys.) The **Test** tab measures how far the sensor's clock
 drifts from this host's over time.
 
+**Set device clock from host waits for the end of a session.** It is held
+back, with the reason beside it, while the sensor streams or logs to its SD
+card. Released firmware up to v1.01.027 applies a set at once, and on a
+Shimmer3R the sample stamps _are_ that clock, so a set mid-session steps every
+stamp after it. Newer firmware accepts the set but holds it until streaming and
+logging have both stopped, and reads back the old clock until then, which would
+look like a set that failed. The two cannot be told apart by version yet, so
+the page waits for the stop on every firmware. Set the clock before a session
+starts. If the sensor was logging without the page knowing (started from its
+button, or before the page connected), the status read after the set finds
+it, and the page says the set may be waiting for the stop instead of saying it
+was set.
+
 ## Calibration
 
 Its own tab, because calibration is per-sensor and per-range rather than a
@@ -573,8 +586,10 @@ started. Either way the counter is unwrapped first, so the axis no longer jumps
 back to zero every 512 seconds — and a duplicated packet no longer adds 512
 seconds permanently, which the desktop driver's own rule does.
 
-Setting the sensor's clock mid-stream steps the counter the samples are timed
-by, so the page re-reads it rather than carrying a stale anchor.
+The page does not set the sensor's clock mid-session (see [The clock](#the-clock)).
+On released firmware up to v1.01.027 a set would step the counter the samples
+are timed by, so any clock set re-reads the anchor rather than carrying a stale
+one.
 
 ### The recording
 
@@ -957,6 +972,7 @@ one is a useful thing to be able to see.
 | `&audio=1`         | Firmware that records audio: byte 233 in the form, the audio status command, audio files on the card. `mockTransport.audio` starts and stops logging and raises faults.                                                            |
 | `&soundlevel=1`    | With `&audio=1`, firmware with the sound-level channel: byte 233 bit 4 survives a write, and while it is set the stream carries channel 0x38, no level for 256 ms. Without it the sensor clears the bit, as older firmware does.   |
 | `&rtcWrapIn=<s>`   | Put the sensor's clock this many seconds short of the point where the 24-bit stream counter rolls over, so a short stream crosses a wrap. It moves the clock, not the counter, because on a Shimmer3R the two are the same number. |
+| `&rwcDefer=1`      | Firmware that holds a clock set made while it streams or logs until both have stopped, as firmware newer than v1.01.027 does. Without it the mock applies a set at once, as released firmware does.                                |
 | `&debug=1`         | Log every command and reply to the browser console.                                                                                                                                                                                |
 
 While the mock is connected, `mockTransport.writes` in the console is every
@@ -969,7 +985,13 @@ logs (`logging`). `window.mockRefuseConnects = n` makes the next n connects
 fail, as a sensor still out of range does, so the automatic reconnect's retries
 can be watched. Setting `nackRefusedLogStart` makes it refuse a log start it
 cannot carry out, as firmware that says so does, and `setQuietly({ sdBadFile })`
-changes the card without telling the page. The panels
+changes the card without telling the page. `logQuietly(true)` starts a log the
+page is not told about, as one begun before it connected is;
+`mockTransport.rtc.setPending` says whether a clock set is being held for the
+stop. `mockTransport.holdReplies(op)`
+holds the answers to one command until its `release()`, so the page can be
+caught part-way through a read: pressing Disconnect while the connect sequence
+reads the calibration, for one. The panels
 themselves are `factoryTestPanel` and `rtcDriftPanel`, beside `sdBrowser`,
 `brandEditor` and `calibrationEditor`.
 

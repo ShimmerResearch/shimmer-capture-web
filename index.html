@@ -819,6 +819,9 @@
               Read device clock
             </button>
           </div>
+          <div class="row" id="clockSetNoteRow" hidden>
+            <span class="muted" id="clockSetNote"></span>
+          </div>
           <div class="kv">
             <div class="muted">Real-world clock</div>
             <div id="rwcValue" class="mono">–</div>
@@ -1744,6 +1747,22 @@
       /** True from this page's Start SD logging until the log is known to have ended. */
       let logStartedHere = false;
       /**
+       * A stop this page sent that ends sensing, from just before it goes out
+       * until the sensor says it has stopped sensing; null otherwise
+       * (DEV-1553). While it is set, everything held back while the sensor
+       * senses stays held, with {@link STOP_FINISHING_REASON}.
+       *
+       * `sent` is false until the stop has been acknowledged, `timer` is the
+       * next status re-read ({@link stopCheckTick}), `seenSensing` records that
+       * the sensor said it was still sensing, and `failure` is the last re-read
+       * that did not answer.
+       *
+       * @type {{since: number, sent: boolean,
+       *   timer: ReturnType<typeof setTimeout> | null,
+       *   seenSensing: boolean, failure: string | null} | null}
+       */
+      let stopping = null;
+      /**
        * True while the SD panel is transferring or measuring the link.
        *
        * Held separately from `busy` because the two are used in opposite
@@ -1925,6 +1944,17 @@
        * disconnect.
        */
       let lastLink = null;
+      /**
+       * True from the moment the live link starts to go — Disconnect pressed,
+       * or the link dropped — until the next link is adopted (DEV-1524).
+       *
+       * `client` alone cannot tell: the teardown awaits a stream stop, a
+       * recording close and the link's own disconnect before it clears
+       * `client`, and a read the closing link broke fails inside that window.
+       * Set synchronously, first thing, so whatever fails after it can tell a
+       * link that was closed from a read that went wrong on a live one.
+       */
+      let linkEnding = false;
       /**
        * The automatic reconnect's handle (`sdk.startAutoReconnect`) while it
        * runs, else null. A drop while it is set belongs to one of its tries.
@@ -2167,6 +2197,18 @@
         $("sdStartNoteRow").hidden = !sdStartBlock || sdLogging;
         $("logOnlyNoteRow").hidden = !client || !sdLogging || streaming;
 
+        /* The clock set waits for the end of a session, with the reason
+                 beside it. `data-requires="idle"` already greys it while
+                 streaming; an SD log on its own is not "busy" to the gate
+                 (DEV-1549), and neither is a stop that is still finishing
+                 (DEV-1553). Both are in `clockSetHeldReason`. */
+        const clockSetHeld = clockSetHeldReason();
+        const setClock = $("btnSetClock");
+        if (clockSetHeld) setClock.disabled = true;
+        setClock.title = clockSetHeld ?? "";
+        $("clockSetNote").textContent = clockSetHeld ?? "";
+        $("clockSetNoteRow").hidden = !clockSetHeld;
+
         /* Each panel is enabled on everything EXCEPT its own busy flag: this
                  is the floor for whether the LINK can do the thing at all, and each
                  panel already refuses a second operation of its own. Folding a
@@ -2178,6 +2220,7 @@
             !!caps.sdTransfer &&
             !streaming &&
             !sdLogging &&
+            !stopping &&
             !busy &&
             !brandBusy &&
             !calibBusy &&
@@ -2217,6 +2260,7 @@
             !!caps.branding &&
             !streaming &&
             !sdLogging &&
+            !stopping &&
             !busy &&
             !sdBusy &&
             !calibBusy &&
@@ -2236,6 +2280,7 @@
             (!!caps.calibration || !!caps.infomem) &&
             !streaming &&
             !sdLogging &&
+            !stopping &&
             !busy &&
             !sdBusy &&
             !brandBusy &&
@@ -2252,6 +2297,7 @@
             !!caps.factoryTest &&
             !streaming &&
             !sdLogging &&
+            !stopping &&
             !busy &&
             !sdBusy &&
             !brandBusy &&
@@ -2264,7 +2310,12 @@
                  else holds the link (see driftSampleSkipReason), which keeps a long
                  measurement running across an SD download instead of ending it. */
         drift.setEnabled(
-          !!client && !!caps.rtcRead && !streaming && !sdLogging && !testBusy,
+          !!client &&
+            !!caps.rtcRead &&
+            !streaming &&
+            !sdLogging &&
+            !stopping &&
+            !testBusy,
         );
         /* Through `withDevice`, so its own write is the plain `busy` here: the
                  panel greys for the two round trips and says why in its result. */
@@ -2273,6 +2324,7 @@
             !!caps.srWrite &&
             !streaming &&
             !sdLogging &&
+            !stopping &&
             !busy &&
             !sdBusy &&
             !brandBusy &&
@@ -2304,6 +2356,12 @@
         if (plan?.blocked) {
           $("btnApply").disabled = true;
           $("applyNote").textContent = plan.blocked;
+        } else if (stopping && client) {
+          /* The same refusal, for as long as the sensor is still closing the
+                   log: it says it is sensing, and NACKs a configuration SET until
+                   it has stopped (DEV-1553). */
+          $("btnApply").disabled = true;
+          $("applyNote").textContent = STOP_FINISHING_REASON;
         } else if (linkTesting) {
           $("applyNote").textContent =
             "Waiting for the throughput test to finish — it saturates the link on purpose, which is the whole point of it.";
@@ -2362,6 +2420,9 @@
         }
         if (streaming || sdLogging) {
           return "The test deliberately saturates the link, so it is refused while the sensor is sensing — it would compete with the samples coming the other way. Stop the stream first.";
+        }
+        if (stopping) {
+          return STOP_FINISHING_REASON;
         }
         if (sdBusy) {
           return "An SD card transfer is using the link. The test would compete with it for the same pipe — wait for the transfer to finish.";
@@ -2433,6 +2494,18 @@
       }
 
       /**
+       * Whether `c` is still the live link: the client the page holds, and not
+       * on its way out (DEV-1524).
+       *
+       * A read that fails once this is false failed because its link was
+       * closed or lost. Either the user asked for that, or the drop handler is
+       * already telling them about it, so the read's own error is not news.
+       */
+      function linkLive(c) {
+        return c != null && c === client && !linkEnding;
+      }
+
+      /**
        * Run one device operation with the busy flag held, logging either way,
        * toasting a failure, and always re-gating.
        *
@@ -2466,6 +2539,7 @@
           showToast("The sensor is busy with another request", "warn");
           return undefined;
         }
+        const on = client;
         busy = true;
         regate();
         try {
@@ -2473,6 +2547,14 @@
           if (!opts.quiet) log.log(`${what}: done`);
           return result;
         } catch (err) {
+          /* A best-effort read cut off by Disconnect, or by a drop, has not
+             failed: its link has gone (DEV-1524). Said once, in the log, as
+             what happened. An operation the user asked for still reports
+             below, because it did not complete. */
+          if (opts.tolerate && !linkLive(on)) {
+            log.log(`${what}: stopped, the link was closed`);
+            return undefined;
+          }
           const message = humanError(what, err);
           if (opts.tolerate) {
             tolerated(message);
@@ -2640,11 +2722,24 @@
           paintStatus();
           return;
         }
+        /* A status that says the stop this page sent is under way or done:
+                 logging and streaming off. While the sensor closes the log it can
+                 still say it is sensing — Shimmer3R firmware pushes its status
+                 from inside the stop, before it clears `sensing`, and sends
+                 nothing once it has (DEV-1553). That is the stop finishing, not a
+                 stop that failed or a session somebody else started. */
+        const stopUnderWay =
+          !!stopping &&
+          status.sdLogging === false &&
+          status.streaming === false;
         /* A value this page inferred and the sensor now contradicts is worth
                  saying out loud before it is quietly replaced: the command was
                  accepted but did not take effect — a full card, a bad file, a trial
-                 that had already ended. This is the one moment both are known. */
-        for (const key of statusView?.inferred ?? []) {
+                 that had already ended. This is the one moment both are known.
+                 Not for a stop under way: the inferred values are either what the
+                 stop will leave or, for a status that lands before the stop
+                 returns, what was running before it. */
+        for (const key of stopUnderWay ? [] : (statusView?.inferred ?? [])) {
           if (statusView.status[key] !== status[key]) {
             log.warn(
               `the sensor reports ${key}=${status[key]} where this page ` +
@@ -2682,11 +2777,199 @@
                  stops. Only worth saying for something the sensor stated — an
                  inferred value can teach nobody anything. */
         if (!status.sdLogging) logStartedHere = false;
-        if (status.sensing && !streaming && !logStartedHere) {
+        if (stopUnderWay) {
+          if (status.sensing === true) noteStopFinishing();
+          else finishStopping();
+          return;
+        }
+        /* Still logging or streaming once the stop has been acknowledged: the
+                 stop did not take, or something has started since, and the
+                 warnings say which. Before then it is the state the stop found. */
+        if (stopping?.sent) endStopping();
+        /* Sensing with neither logging nor streaming is a session part-way
+                 through a stop — the firmware's push from inside one, whoever
+                 asked for it — not one somebody else has started. */
+        if (
+          status.sensing &&
+          (status.sdLogging || status.streaming) &&
+          !streaming &&
+          !logStartedHere
+        ) {
           log.warn(
             "the sensor reports it is sensing — it was started from its own button or by another host, and will refuse configuration commands until it stops",
           );
         }
+      }
+
+      /**
+       * Why controls that need the sensor stopped are still held after a stop
+       * this page sent (DEV-1553), word for word on every one of them.
+       */
+      const STOP_FINISHING_REASON =
+        "The sensor is still finishing the stop. This waits until the sensor says it has stopped sensing.";
+
+      /** The first status re-read after a stop, and the gap between re-reads. */
+      const STOP_CHECK_FIRST_MS = 300;
+      const STOP_CHECK_EVERY_MS = 1000;
+
+      /**
+       * How long after a stop the page waits for the sensor to say it has
+       * stopped sensing before it lets the held controls go anyway. The bench
+       * sensors said so 4-5 s after the stop when asked, but pushed nothing to
+       * say it for 5-9 s, which is why the page asks. Mock link only:
+       * `&stopLimitMs=` shortens it, so the verification pass need not wait.
+       */
+      const STOP_CHECK_LIMIT_MS = (() => {
+        const fallback = 15000;
+        if (!mockEnabledFromUrl()) return fallback;
+        const ms = Number(
+          new URLSearchParams(location.search).get("stopLimitMs"),
+        );
+        return Number.isFinite(ms) && ms > 0 ? ms : fallback;
+      })();
+
+      /** True while a stop re-read runs: its SDK status lines are dropped. */
+      let stopCheckMuted = false;
+
+      /**
+       * A stop that ends sensing is about to go out: hold what needs the
+       * sensor stopped until it says it has stopped (DEV-1553).
+       *
+       * Set before the command rather than after it, because the status the
+       * firmware pushes from inside the stop can arrive before the command
+       * returns, and has to be read as part of it. Not on the USB-C link,
+       * whose status read carries no sensing bit to wait for.
+       */
+      function beginStopping() {
+        endStopping();
+        if (mode === "usb" || typeof client?.getStatus !== "function") return;
+        stopping = {
+          since: Date.now(),
+          sent: false,
+          timer: null,
+          seenSensing: false,
+          failure: null,
+        };
+      }
+
+      /**
+       * The stop was acknowledged. Unless the sensor has already said it has
+       * stopped, ask it shortly: the firmware sends nothing for a change a
+       * Bluetooth command caused, so without a read the page could wait for a
+       * push that never comes.
+       */
+      function stopSent() {
+        if (!stopping) return;
+        stopping.sent = true;
+        scheduleStopCheck(STOP_CHECK_FIRST_MS);
+      }
+
+      /** Forget a stop in progress, quietly. */
+      function endStopping() {
+        if (stopping?.timer != null) clearTimeout(stopping.timer);
+        stopping = null;
+      }
+
+      /** The sensor says it is still sensing with the log closed: said once. */
+      function noteStopFinishing() {
+        if (stopping.seenSensing) return;
+        stopping.seenSensing = true;
+        log.log(
+          "the sensor is still finishing the stop: it reports sensing=true with logging and streaming off. What needs it stopped waits until it says it has.",
+        );
+      }
+
+      /** The sensor says it has stopped sensing: let the held controls go. */
+      function finishStopping() {
+        const s = stopping;
+        endStopping();
+        if (s.seenSensing) {
+          const secs = ((Date.now() - s.since) / 1000).toFixed(1);
+          log.log(
+            `the sensor has finished the stop, ${secs} s after it was sent`,
+          );
+        }
+        if (client) regate();
+      }
+
+      function scheduleStopCheck(ms) {
+        if (!stopping) return;
+        if (stopping.timer != null) clearTimeout(stopping.timer);
+        stopping.timer = setTimeout(stopCheckTick, ms);
+      }
+
+      /**
+       * Read the status while a stop finishes, until the sensor says it has
+       * stopped sensing or {@link STOP_CHECK_LIMIT_MS} has passed. A push that
+       * says so first ends this the same way, through renderStatus.
+       */
+      async function stopCheckTick() {
+        const s = stopping;
+        if (!s) return;
+        s.timer = null;
+        if (Date.now() - s.since >= STOP_CHECK_LIMIT_MS) {
+          giveUpStopping();
+          return;
+        }
+        /* Checked synchronously, right before withDevice takes `busy`, as the
+                 battery poll does: a read that would meet another holder waits a
+                 round instead of raising a "busy" toast. */
+        if (
+          !client ||
+          linkEnding ||
+          busy ||
+          sdBusy ||
+          brandBusy ||
+          calibBusy ||
+          testBusy ||
+          otaBusy ||
+          linkTesting ||
+          streaming
+        ) {
+          scheduleStopCheck(STOP_CHECK_EVERY_MS);
+          return;
+        }
+        stopCheckMuted = true;
+        let status;
+        try {
+          status = await tryDevice(
+            "read the device status",
+            () => client.getStatus(),
+            {
+              onFailure: (message) => {
+                s.failure = message;
+              },
+            },
+          );
+        } finally {
+          stopCheckMuted = false;
+        }
+        // Ended meanwhile: a push said so, the link went, or a start began.
+        if (stopping !== s) return;
+        if (status) renderStatus(status);
+        if (stopping === s) scheduleStopCheck(STOP_CHECK_EVERY_MS);
+      }
+
+      /**
+       * The sensor has not said it stopped within the limit. Let the held
+       * controls go rather than hold them for good, and say what the page
+       * last knew: the firmware still refuses configuration commands while it
+       * senses, and does so with its own NACK.
+       */
+      function giveUpStopping() {
+        const s = stopping;
+        endStopping();
+        const secs = Math.round(STOP_CHECK_LIMIT_MS / 1000);
+        if (statusView?.status?.sensing === true) {
+          log.warn(
+            `the sensor still reports it is sensing ${secs} s after this page stopped it, so the stop may not have finished. It refuses configuration commands while it senses; Refresh reads its status again.`,
+          );
+        } else if (s.failure) {
+          log.warn(
+            `the sensor did not answer a status read in the ${secs} s after the stop (${s.failure}), so this page cannot tell whether it has finished. Refresh reads its status again.`,
+          );
+        }
+        if (client) regate();
       }
 
       /**
@@ -2721,6 +3004,12 @@
        * command went out is kept, rather than overwritten by this guess. A
        * count, not a time: the push before the command can land in the same
        * millisecond as the click that sends it.
+       *
+       * A stop that closes an SD log is the exception that does read back,
+       * {@link STOP_CHECK_FIRST_MS} after it returns rather than straight
+       * after it (stopCheckTick): the sensor goes on saying it is sensing
+       * while the log closes, and the controls that need it stopped wait for
+       * its word (DEV-1553).
        *
        * @param {Record<string, boolean>} patch flags the command changed
        * @param {number} [statedBefore] {@link statusStatements} when the
@@ -2932,6 +3221,11 @@
        * broke midnight CSV splits.
        */
       async function setDeviceClock() {
+        const held = clockSetHeldReason();
+        if (held) {
+          showToast(held, "warn");
+          return;
+        }
         /* A plain Unix epoch, which is what desktop Consensys and the dock
                  software write: a sensor set here and a sensor set there must read
                  the same. */
@@ -2946,17 +3240,79 @@
           showToast("This link cannot set the sensor clock", "warn");
           return;
         }
+        const statedBefore = statusStatements;
         try {
           await withDevice("set the real-world clock", write);
-          showToast("Sensor clock set from this host", "ok");
-          /* Any drift measurement in progress spans a discontinuity now, so
-                   its baseline goes with the write rather than being fitted across
-                   the step. */
-          drift.noteClockWritten();
-          await refreshDeviceState();
         } catch {
           /* logged and toasted by withDevice */
+          return;
         }
+        /* Any drift measurement in progress spans a discontinuity now, so its
+                 baseline goes with the write rather than being fitted across the
+                 step. A set the sensor holds until its stop is no different: the
+                 drift panel skips every sample while the sensor senses, and
+                 re-detects the clock from the first one after. */
+        drift.noteClockWritten();
+        await refreshDeviceState().catch(() => {});
+        /* The button is held while the page knows the sensor is sensing, but
+                 a log started from the sensor's button, or before this page
+                 connected, is learnt from the status read that follows the set.
+                 Then the clock read beside it is the one the session runs on, not
+                 the one just sent, and "set" would be wrong on every firmware. */
+        const sensing =
+          streaming ||
+          sdLogging ||
+          (statusStatements !== statedBefore &&
+            statusView?.status?.sensing === true);
+        if (sensing) {
+          const [doing, ends] = sdLogging
+            ? ["logging to its SD card", "logging stops"]
+            : ["sensing", "sensing stops"];
+          const message =
+            `The sensor was ${doing} when the set arrived. Newer firmware ` +
+            `holds the set until ${ends}, so the clock reads unchanged until ` +
+            "then; released firmware up to v1.01.027 applied it at once, " +
+            "inside the running session.";
+          log.warn(`clock set: ${message}`);
+          showToast(message, "warn", { ttlMs: 12000 });
+          return;
+        }
+        showToast("Sensor clock set from this host", "ok");
+      }
+
+      /**
+       * Why the sensor's clock is not set from here right now, or null.
+       *
+       * Not while it is streaming or SD logging (DEV-1549). Released firmware
+       * up to v1.01.027 applies a set at once, and on a Shimmer3R the sample
+       * stamps ARE that clock, so a set mid-session steps every stamp after
+       * it. Later firmware (DEV-1539) ACKs the set but holds it until streaming
+       * and logging have both stopped, and reads back the old clock until
+       * then, which here would look like a set that failed. The two cannot be
+       * told apart by version yet — Shimmer3R main still reports v1.01.027 —
+       * so the set waits for the stop on every firmware. A clock that should
+       * be right for a session is set before it starts.
+       *
+       * And not while a stop this page sent is still finishing (DEV-1553):
+       * the sensor still senses then, so a set would land inside the session
+       * or wait for its end, exactly as above.
+       */
+      function clockSetHeldReason() {
+        if (!client) return null;
+        if (!(streaming || sdLogging))
+          return stopping ? STOP_FINISHING_REASON : null;
+        const what =
+          streaming && sdLogging
+            ? "the stream and SD logging"
+            : streaming
+              ? "the stream"
+              : "SD logging";
+        return (
+          `Stop ${what} first, or set the clock before you start. While the ` +
+          "sensor is sensing, released firmware up to v1.01.027 steps the " +
+          "running session's timestamps, and newer firmware holds the set " +
+          "until sensing stops."
+        );
       }
 
       /**
@@ -4944,6 +5300,9 @@
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses every SD command while it is — a download and a live stream would compete for the same link. Stop the stream to download from the card.";
         }
+        if (stopping) {
+          return STOP_FINISHING_REASON;
+        }
         /* The other holders of the one link. This panel is disabled for all
                  three (see its setEnabled call), so leaving them unsaid greyed the
                  card out with no reason on screen. */
@@ -5021,6 +5380,10 @@
         readInfoMem: () => readConfiguration(),
         log,
         toast: showToast,
+        /* The page's own test, which is true no longer from the moment
+                 Disconnect is pressed: `client` is cleared only once the link has
+                 closed, after the read it cut off has failed (DEV-1524). */
+        linkLive: (c) => linkLive(c),
         fileNamePrefix: () => `Shimmer3R_${macTail()}`,
         onBusyChange: (working) => {
           calibBusy = working;
@@ -5191,6 +5554,9 @@
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses every configuration command while it is. Stop the stream before reading or writing calibration.";
         }
+        if (stopping) {
+          return STOP_FINISHING_REASON;
+        }
         if (linkTesting) {
           return "The throughput test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
         }
@@ -5239,6 +5605,9 @@
         }
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses a self-test while it is — the test takes the whole sensor over for up to a minute. Stop the stream first.";
+        }
+        if (stopping) {
+          return STOP_FINISHING_REASON;
         }
         if (linkTesting) {
           return "The throughput test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
@@ -5332,6 +5701,7 @@
         if (!client) return "disconnected";
         if (testBusy) return "the self-test is running";
         if (streaming || sdLogging) return "the sensor is sensing";
+        if (stopping) return "the sensor is finishing a stop";
         if (linkTesting) return "the throughput test is running";
         if (sdBusy) return "an SD card transfer is using the link";
         if (brandBusy) return "a device-naming write is using the link";
@@ -5456,6 +5826,9 @@
         if (streaming || sdLogging) {
           return "The sensor is sensing. Stop the stream (or the SD recording) before updating the Bluetooth module — the sensor restarts at the end of the update.";
         }
+        if (stopping) {
+          return STOP_FINISHING_REASON;
+        }
         if (linkTesting) {
           return "The throughput test is running — wait the few seconds for it to finish.";
         }
@@ -5483,6 +5856,9 @@
         }
         if (streaming || sdLogging) {
           return "The sensor is sensing. New names only take effect when it restarts, and the firmware skips a restart while it is sensing so a recording can never be truncated — stop the stream before changing the names.";
+        }
+        if (stopping) {
+          return STOP_FINISHING_REASON;
         }
         if (linkTesting) {
           return "The throughput test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
@@ -5560,6 +5936,10 @@
        * @param {boolean} withSd also log to the sensor's own SD card
        */
       async function startStream(withSd) {
+        /* A start is not held while a stop finishes, since the firmware queues
+                 it behind the stop. What the sensor says from here is about the
+                 new session, so the wait for the old one ends (DEV-1553). */
+        endStopping();
         // Ask the sensor what it is configured for rather than trusting what
         // the page believes it wrote.
         const info = await tryDevice("inquire before streaming", () =>
@@ -5621,6 +6001,12 @@
 
       async function stopStream(withSd) {
         const statedBefore = statusStatements;
+        /* Only the stop that closes a log: the sensor goes on saying it is
+                 sensing while the log closes (DEV-1553). A stream alone stops at
+                 once, and the status read the wait needs would cost every plain
+                 stop a round trip. */
+        if (withSd) beginStopping();
+        let stopped = false;
         try {
           await withDevice(
             withSd ? "stop streaming and SD logging" : "stop streaming",
@@ -5629,10 +6015,13 @@
                 ? client.stopStreamingAndLogging()
                 : client.stopStreaming(),
           );
+          stopped = true;
         } catch {
           /* Logged and toasted. Fall through anyway: leaving the page stuck in
                    "streaming" would refuse every later command for no good reason. */
         }
+        if (stopped) stopSent();
+        else endStopping();
         streaming = false;
         // STOP_STREAMING leaves a log running (the SD logging controls show it)
         if (withSd) {
@@ -5675,6 +6064,8 @@
        * the start fail with the reason, through `withDevice`.
        */
       async function startLog() {
+        // As for startStream: the wait for an earlier stop ends here.
+        endStopping();
         const statedBefore = statusStatements;
         try {
           await withDevice("start SD logging", () => client.startLogging());
@@ -5707,13 +6098,19 @@
       /** Stop SD logging only (STOP_LOGGING_COMMAND 0x93); a stream goes on. */
       async function stopLog() {
         const statedBefore = statusStatements;
+        /* With no stream, this stop ends sensing, and the sensor says so only
+                 once the log has closed (DEV-1553). With one, it goes on sensing
+                 and there is nothing to wait for. */
+        if (!streaming) beginStopping();
         try {
           await withDevice("stop SD logging", () => client.stopLogging());
         } catch {
           /* Logged and toasted. The flag stays as the sensor last said, so
                    Stop SD logging is still offered. */
+          endStopping();
           return;
         }
+        stopSent();
         sdLogging = false;
         logStartedHere = false;
         log.log(
@@ -6067,9 +6464,13 @@
        * Order matters on the radio path: the firmware and hardware version
        * reads are what resolve the InfoMem addressing and the status payload
        * width, so they come first and everything else builds on them.
+       *
+       * @returns {Promise<boolean>} false when the link went before the
+       *   sequence finished (DEV-1524)
        */
       async function afterConnect(session) {
         client = session.client;
+        linkEnding = false;
         mode = session.mode;
         /* Kept now, while the transport still holds them: the BLE transport
                  keeps its device after a drop, but the serial transport lets go
@@ -6130,8 +6531,16 @@
         deviceName = client.device?.name ?? session.transport?.deviceName ?? "";
         setIdentity({ idLink: session.label });
 
-        if (mode === "usb") await afterConnectWired();
-        else await afterConnectRadio();
+        try {
+          if (mode === "usb") await afterConnectWired();
+          else await afterConnectRadio();
+        } catch (err) {
+          if (!(err instanceof ConnectSequenceStopped)) throw err;
+          log.log(
+            "the connect sequence stopped: the link was closed before it finished",
+          );
+          return false;
+        }
 
         applyModeGating();
         regate();
@@ -6144,6 +6553,35 @@
                  since withDevice refuses while busy. Not if the link went during
                  the sequence: the teardown has already run. */
         if (client) startBatteryRefresh();
+        return true;
+      }
+
+      /**
+       * Thrown inside the connect sequence once the link it was started for
+       * has gone, and caught by afterConnect, which says so once (DEV-1524).
+       *
+       * Disconnect goes live the moment the link opens, while the sequence
+       * still has a dozen reads to make. Reading on after it fails each one,
+       * and paints what came back — or the "could not be read" banner for
+       * what did not — onto a page the teardown has already cleared.
+       */
+      class ConnectSequenceStopped extends Error {}
+
+      /** Stop the connect sequence on `c` if that link has gone. */
+      function assertLinked(c) {
+        if (!linkLive(c)) throw new ConnectSequenceStopped();
+      }
+
+      /**
+       * tryDevice for the connect sequence on `c`: not started once the link
+       * has gone, and the sequence stopped if it went during the read, so
+       * nothing after it paints a departed sensor onto the page.
+       */
+      async function connectRead(c, what, fn) {
+        assertLinked(c);
+        const result = await tryDevice(what, fn);
+        assertLinked(c);
+        return result;
       }
 
       /** The Bluetooth path: BLE, Classic Bluetooth, or the mock. */
@@ -6224,11 +6662,14 @@
           }
           return;
         }
+        const c = client;
         await tryDevice("enable the link CRC", () => client.setCrcMode(want));
         /* The link can drop while this waits - a sensor restarting under a
-           reconnect does exactly that - and the disconnect handler clears
-           `client`; there is then nothing to read back. */
-        if (!client) return;
+           reconnect does exactly that - or be closed by Disconnect, and then
+           there is nothing to read back. `linkLive`, not `client`: a closing
+           link's client is still set, with its CRC mode already reset to
+           off, which would read as a firmware refusal (DEV-1524). */
+        if (!linkLive(c)) return;
         /* Read back from the client rather than from the call: `crcMode` only
                  advances on a successful ACK, so this cannot end up expecting bytes
                  the device is not sending. */
@@ -6247,11 +6688,15 @@
       }
 
       async function afterConnectRadio() {
+        /* Every step below goes through `connectRead` on this link, or checks
+                 it after an await of its own, so the sequence stops where the
+                 link went instead of reading on into it (DEV-1524). */
+        const c = client;
         setLinkCrcEditable(false);
-        const fw = await tryDevice("read the firmware version", () =>
+        const fw = await connectRead(c, "read the firmware version", () =>
           client.readFwVersion(),
         );
-        const hw = await tryDevice("read the hardware version", () =>
+        const hw = await connectRead(c, "read the hardware version", () =>
           client.readDeviceVersion(),
         );
         /* The CRC goes AFTER both version reads, per
@@ -6263,7 +6708,7 @@
                  it first, as this used to, framed a Shimmer3's status a byte too
                  wide for the whole session. */
         await applyLinkCrc();
-        const mac = await tryDevice("read the MAC address", () =>
+        const mac = await connectRead(c, "read the MAC address", () =>
           client.getMacAddress(),
         );
         if (mac) deviceMac = mac;
@@ -6298,6 +6743,7 @@
           const ok =
             identifiedHardwareVersion === 10 &&
             (await client.supportsSdTransfer().catch(() => false)) === true;
+          assertLinked(c);
           caps.sdTransfer = ok;
           sdFirmwareNote = ok
             ? null
@@ -6326,7 +6772,7 @@
 
                  Best-effort: an older firmware may not answer, and a Shimmer3R
                  does not need it for the layout (hardware id 10 decides). */
-        srBoard = await tryDevice("read the board's SR id", () =>
+        srBoard = await connectRead(c, "read the board's SR id", () =>
           typeof client.readSrBoard === "function"
             ? client.readSrBoard()
             : Promise.resolve(null),
@@ -6336,7 +6782,8 @@
                  because it is the one part of a sensor a host cannot otherwise
                  see, and the answer decides whether a link problem is worth
                  chasing in the module's own release notes. */
-        const btModule = await tryDevice(
+        const btModule = await connectRead(
+          c,
           "read the Bluetooth module version",
           () =>
             typeof client.readBtModuleVersion === "function"
@@ -6362,14 +6809,15 @@
           internal: fw?.patch,
         });
 
-        const info = await tryDevice("inquire the channel list", () =>
+        const info = await connectRead(c, "inquire the channel list", () =>
           client.inquiry(),
         );
         if (info) noteInquiry(info);
 
         await refreshDeviceState();
+        assertLinked(c);
 
-        const bytes = await tryDevice("read the configuration image", () =>
+        const bytes = await connectRead(c, "read the configuration image", () =>
           client.readInfoMemBytes(),
         );
 
@@ -6380,7 +6828,8 @@
         eventChannel = false;
         if (caps.eventChannel) {
           eventChannel =
-            (await tryDevice(
+            (await connectRead(
+              c,
               "ask whether the firmware has the event channel",
               () => client.supportsEventChannel(),
             )) === true;
@@ -6403,8 +6852,10 @@
         soundLevelSupport = null;
         if (caps.audio) {
           audio =
-            (await tryDevice("ask whether the firmware records audio", () =>
-              client.supportsAudio(),
+            (await connectRead(
+              c,
+              "ask whether the firmware records audio",
+              () => client.supportsAudio(),
             )) === true;
           log.log(
             audio
@@ -6451,7 +6902,7 @@
         if (eventChannel) {
           evtPanel.resetLink();
           client.onEventRecord = onEventRecord;
-          const on = await tryDevice("turn the event stream on", () =>
+          const on = await connectRead(c, "turn the event stream on", () =>
             client.setEventStream(true),
           );
           if (on !== true) {
@@ -6482,6 +6933,7 @@
                  could not be filled is not a connection that failed. */
         if (caps.calibration || caps.infomem) {
           await cal.read({ reuseInfoMem: true }).catch(() => null);
+          assertLinked(c);
         }
 
         /* The pressure sensor's factory trim
@@ -6493,7 +6945,8 @@
                  older than the command refuses it, and the SDK says so through its
                  status messages. */
         if (caps.pressureCalibration) {
-          const pressure = await tryDevice(
+          const pressure = await connectRead(
+            c,
             "read the pressure calibration",
             () => client.readPressureCalibration(),
           );
@@ -6525,7 +6978,9 @@
                  though it were about to be applied. */
         setLinkCrcEditable(false);
         showLinkCrcNotApplicable();
-        const id = await tryDevice("identify the docked sensor", () =>
+        // Stops where the link went, as the radio path does (DEV-1524).
+        const c = client;
+        const id = await connectRead(c, "identify the docked sensor", () =>
           client.identify(),
         );
         if (id?.mac) deviceMac = id.mac;
@@ -6534,12 +6989,14 @@
         /* Through the same read the auto-refresh uses (DEV-1512), so the
                  row carries its read time from the first reading. */
         await readBatteryIntoPanel();
+        assertLinked(c);
         const version = id?.firmwareVersion;
 
         /* `identify()` already read the ID page over this link, so there is
                  nothing more to ask for. */
         srBoard = id?.expansionBoard ?? null;
-        const btModule = await tryDevice(
+        const btModule = await connectRead(
+          c,
           "read the Bluetooth module version",
           () =>
             typeof client.readBtModuleVersion === "function"
@@ -6598,7 +7055,7 @@
         );
         buildForm(ctx);
 
-        const bytes = await tryDevice("read the configuration image", () =>
+        const bytes = await connectRead(c, "read the configuration image", () =>
           client.readInfoMemBytes(),
         );
         if (bytes) adoptDeviceImage(bytes);
@@ -6616,6 +7073,7 @@
                  reading all 384 bytes a second time to see them. */
         if (caps.infomem) {
           await cal.read({ reuseInfoMem: true }).catch(() => null);
+          assertLinked(c);
         }
       }
 
@@ -6651,6 +7109,7 @@
         streaming = false;
         sdLogging = false;
         logStartedHere = false;
+        endStopping();
         btUpdate.onDisconnected();
         /* Back to reporting the selection, because the link that a CRC was
                  agreed on has gone and leaving "CRC 2 bytes" up would describe a
@@ -6740,6 +7199,9 @@
           );
           return;
         }
+        /* The drop is reported below, once; the reads it cut off are not
+                 reported again, each on its own (DEV-1524). */
+        linkEnding = true;
         /* Now rather than at the reset below, which waits for a recording
                  to close first: a read sent meanwhile would go to a link that has
                  gone. */
@@ -7186,12 +7648,15 @@
        * Whether an SDK status line goes to the log. The poll's own read
        * would otherwise add two lines a minute ("GET_VBATT → waiting…",
        * "Battery: …") for the life of the connection; it logs a change
-       * itself instead (readBatteryIntoPanel). The stale-calibration warning
-       * (DEV-1528) is never muted: the SDK says it once per connection.
+       * itself instead (readBatteryIntoPanel). The status re-reads after a
+       * stop are dropped too: they say only what the flags panel shows, and
+       * the page logs the stop's outcome itself (stopCheckTick). The
+       * stale-calibration warning (DEV-1528) is never muted: the SDK says it
+       * once per connection.
        */
       function echoSdkStatus(msg) {
         if (msg === sdk.STALE_LN_ACCEL_DEFAULT_WARNING) return true;
-        return !batteryRefresh.muted;
+        return !batteryRefresh.muted && !stopCheckMuted;
       }
 
       // =====================================================================
@@ -7221,6 +7686,8 @@
        *   ?mock=1&clockBase=local  start the sensor's clock on this host's
        *                        civil time instead of UTC, as a sensor set by
        *                        a tool using the other convention reads
+       *   ?mock=1&rwcDefer=1   firmware that holds a clock set made while it
+       *                        streams or logs until both stop (DEV-1539)
        *   ?mock=1&events=1     firmware with the event channel (DEV-971)
        *   ?mock=1&audio=1      firmware that records audio (DEV-99): byte 233,
        *                        the audio status command and audio/ files on
@@ -7258,6 +7725,11 @@
           wrapInSec: params.has("rtcWrapIn")
             ? Number(params.get("rtcWrapIn"))
             : undefined,
+          /* `rwcDefer=1` is firmware that holds a clock set made while it
+                   streams or logs until both have stopped (DEV-1539). Without it
+                   the mock applies a set at once, as released firmware up to
+                   v1.01.027 does. */
+          deferSetWhileSensing: params.get("rwcDefer") === "1",
         };
         /* `srBoard=48-3-0` sets the board's SR identity, `srBoard=none` leaves
                  its id page erased. `btVersion=` (empty) models the module never
@@ -7423,15 +7895,17 @@
             connect.setConnected(true, "mock");
             // As a real link's onConnected does (DEV-1520).
             if (!reconnect) showToast("Connected via mock", "ok");
-            await afterConnect({
+            const finished = await afterConnect({
               client: mockClient,
               mode: framed ? "ble" : "rfcomm",
               transport,
               label: framed ? "mock (framed)" : "mock (unframed)",
               mock: true,
             });
-            log.log("mock sensor connected");
-            return true;
+            /* Not when Disconnect, or a drop, ended the link part-way
+                     through: afterConnect has said so (DEV-1524). */
+            if (finished) log.log("mock sensor connected");
+            return finished;
           } catch (err) {
             log.error(`mock connect failed: ${err?.message ?? err}`);
             connect.setConnected(false);
@@ -7602,6 +8076,11 @@
        * page still believing it was connected.
        */
       async function disconnectFromSensor() {
+        /* First, before anything is awaited: a connect sequence still reading
+                 when Disconnect is pressed stops quietly at its next step, and a
+                 read the closing link breaks is "stopped", not "failed"
+                 (DEV-1524). */
+        linkEnding = true;
         sd.abort();
         /* Disconnecting is the ONLY escape from a running self-test — the
                  firmware has no abort — so it must not wait for one to finish. */

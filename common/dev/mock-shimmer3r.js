@@ -1131,7 +1131,9 @@ export function mockEnabledFromUrl() {
  *   STATUS_RESPONSE, which is how the firmware tells a host about a change
  *   the host did not cause. `transport.factoryTest` is the self-test run
  *   count, whether a report is still printing and the exact text printed;
- *   `transport.rtc` exposes the sensor's own running clock.
+ *   `transport.rtc` exposes the sensor's own running clock; and
+ *   `transport.holdReplies(op)` holds the answers to one opcode until
+ *   released, to catch a page part-way through a read.
  */
 export function createMockShimmer3RTransport(opts = {}) {
   const framed = opts.framed !== false;
@@ -1221,11 +1223,17 @@ export function createMockShimmer3RTransport(opts = {}) {
             `mock: ignoring rtcWrapIn="${rtcOpts.wrapInSec}" — it must be a non-negative number of seconds.`,
           ),
           null);
+  /* Firmware that holds a clock set made while it streams or logs until both
+     have stopped (DEV-1539). Off by default: released firmware up to v1.01.027
+     applies a set at once, mid-session or not. */
+  const rtcDeferSetWhileSensing = !!rtcOpts.deferSetWhileSensing;
   const rtc = {
     devMsAtSet:
       Date.now() +
       (rtcClockBase === "local" ? -new Date().getTimezoneOffset() * 60000 : 0),
     setAtHostMs: Date.now(),
+    /** A held set, as time sent minus the clock on arrival; null when none. */
+    deferredOffsetMs: null,
   };
   if (rtcWrapInSec != null) {
     const ticks = Math.round(rtc.devMsAtSet * 32.768);
@@ -1253,6 +1261,9 @@ export function createMockShimmer3RTransport(opts = {}) {
     /* Refuse a log start it cannot carry out with a NACK, starting nothing,
        instead of ACKing it as released firmware does (transport.status). */
     nackRefusedLogStart: false,
+    /* Until this time (Date.now()), a status still says sensing after a stop
+       command closed the log: `transport.status.stopTail`. 0 when not. */
+    sensingUntil: 0,
     /** The clock has been set since the sensor last lost power. */
     rwcSet: false,
     /** The red LED, as TOGGLE_LED leaves it. */
@@ -1572,6 +1583,37 @@ export function createMockShimmer3RTransport(opts = {}) {
         if (key in patch) state[key] = !!patch[key];
       }
     },
+    /**
+     * Start or stop SD logging with no push: a log started before this host
+     * connected, or one whose push the link lost. A host learns of it only
+     * from its next status read. No audio session; `transport.audio` has the
+     * button-press version that pushes.
+     */
+    logQuietly(on) {
+      state.logging = !!on;
+      applyDeferredRwcIfIdle();
+    },
+    /**
+     * How a stop command that closes the log finishes (DEV-1553): for `ms`
+     * after it, a status read still says sensing, with logging and streaming
+     * off, and with `endPush` a push saying all three are off ends it, as
+     * the bench sensors' did 5-9 s after the stop. `Infinity` never ends it:
+     * a stop that does not finish. 0 (the default) finishes at once.
+     *
+     * The firmware clears `sensing` within its stop, once the SD and audio
+     * files are closed (`ShimSens_stopSensing`), so a long tail is the case
+     * a host has to survive rather than the usual one. The push from inside
+     * the stop says sensing whatever this is set to (`audioSessionStop`).
+     */
+    stopTail(ms, { endPush = true } = {}) {
+      stopTail.ms = Number(ms) > 0 ? Number(ms) : 0;
+      stopTail.endPush = !!endPush;
+      endStopTail();
+    },
+    /** True while a stop's tail still has the status saying sensing. */
+    get stopTailRunning() {
+      return Date.now() < state.sensingUntil;
+    },
     /** The frame a push (or a GET_STATUS answer) carries, for comparison. */
     bytes: () => new Uint8Array(statusResponse()),
   };
@@ -1618,6 +1660,14 @@ export function createMockShimmer3RTransport(opts = {}) {
     },
     get clockBase() {
       return rtcClockBase;
+    },
+    /** Firmware that holds a clock set made while sensing (DEV-1539). */
+    get defersSetWhileSensing() {
+      return rtcDeferSetWhileSensing;
+    },
+    /** A clock set is held, waiting for streaming and logging to stop. */
+    get setPending() {
+      return rtc.deferredOffsetMs !== null;
     },
     /** The sensor's own clock, in its own epoch. */
     deviceNowMs,
@@ -1766,6 +1816,14 @@ export function createMockShimmer3RTransport(opts = {}) {
   // -------------------------------------------------------------------------
 
   /**
+   * `shimmerStatus.sensing`: a stream, a log, or the tail of a stop that has
+   * not finished (`transport.status.stopTail`).
+   */
+  function isSensing() {
+    return state.streaming || state.logging || Date.now() < state.sensingUntil;
+  }
+
+  /**
    * `[0x8A][0x71][status0][status1]` — the in-stream status message.
    *
    * ONE builder for both the answer to GET_STATUS and the unsolicited push, so
@@ -1777,14 +1835,18 @@ export function createMockShimmer3RTransport(opts = {}) {
    * `Comms/shimmer_bt_uart.c`): docked, sensing, RTC set, SD logging,
    * streaming, card inserted, bad file, red LED. `sensing` is set by either
    * kind of recording, which is how the firmware reports it — it is not a
-   * fourth thing the host can start.
+   * fourth thing the host can start. It also outlasts both for the tail of a
+   * stop (`transport.status.stopTail`).
    *
    * Always two bytes, the Shimmer3R length: a Shimmer3 sends one, but this
    * mock answers as a Shimmer3R whatever hardware id it is told to report,
    * and the SDK reads only as many bytes as the platform it identified has.
+   *
+   * @param {boolean} [sensingNow] the sensing bit, for a status sent while
+   *   the firmware is part-way through a change (`audioSessionStop`)
    */
-  function statusResponse() {
-    const sensing = state.streaming || state.logging;
+  function statusResponse(sensingNow) {
+    const sensing = sensingNow ?? isSensing();
     const status0 =
       (state.docked ? 0x01 : 0) |
       (sensing ? 0x02 : 0) |
@@ -1854,13 +1916,50 @@ export function createMockShimmer3RTransport(opts = {}) {
       setTimeout(() => reply(statusResponse()), 300);
   }
 
-  /** Logging has stopped: the files close, and the recording bit clears. */
+  /**
+   * Logging has stopped: the files close, and the recording bit clears.
+   *
+   * The push that says so is sent from inside the stop, before the firmware
+   * clears `sensing`: `ShimSens_stopSensing` clears `sdLogging`, closes the
+   * SD file, and `ShimSdDataFile_close` → `PlatAudio_sessionStop` pushes the
+   * status through `notifyIfChanged`. So it says sensing with logging off,
+   * whether or not a stream goes on (DEV-1553). For a stop a command caused,
+   * nothing is pushed once `sensing` clears.
+   */
   function audioSessionStop() {
     if (!audioBuilt || aud.sessionStartMs === null) return;
     const before = audioStatusBits();
     if (aud.sessionEndMs === null) aud.sessionEndMs = Date.now();
     if (audioStatusBits() !== before && !aud.dropStopPush)
-      reply(statusResponse());
+      reply(statusResponse(true));
+  }
+
+  /** The tail of a stop command that closed the log (`status.stopTail`). */
+  const stopTail = { ms: 0, endPush: true };
+  let stopTailTimer = null;
+
+  /** A stop command has closed the log, with no stream left to keep sensing. */
+  function beginStopTail() {
+    endStopTail();
+    if (!stopTail.ms) return;
+    state.sensingUntil = Date.now() + stopTail.ms;
+    if (Number.isFinite(stopTail.ms)) {
+      stopTailTimer = setTimeout(() => {
+        stopTailTimer = null;
+        state.sensingUntil = 0;
+        /* `sensing` clears here, and so a clock set held while sensing is
+           applied here (`ShimSens_stopSensing`, DEV-1539), push or not. */
+        applyDeferredRwcIfIdle();
+        if (stopTail.endPush) reply(statusResponse());
+      }, stopTail.ms);
+    }
+  }
+
+  /** The tail is over, or a start has made it moot: say sensing as it is. */
+  function endStopTail() {
+    if (stopTailTimer !== null) clearTimeout(stopTailTimer);
+    stopTailTimer = null;
+    state.sensingUntil = 0;
   }
 
   /** `[0xBD][32 bytes]` (`PlatAudio_buildStatus`). */
@@ -1907,12 +2006,23 @@ export function createMockShimmer3RTransport(opts = {}) {
     set dropStopPush(on) {
       aud.dropStopPush = !!on;
     },
-    /** Start or stop SD logging as the user button would, and push the status. */
+    /**
+     * Start or stop SD logging as the user button would, and push the status.
+     * A stop the firmware made itself is pushed again once `sensing` clears
+     * (`ShimBt_instreamStatusRespSendIfNotBtCmd`), after the push from inside
+     * the stop (`audioSessionStop`).
+     */
     setLogging(on) {
       state.logging = !!on;
-      reply(statusResponse());
-      if (on) audioSessionStart();
-      else audioSessionStop();
+      endStopTail();
+      applyDeferredRwcIfIdle();
+      if (on) {
+        reply(statusResponse());
+        audioSessionStart();
+      } else {
+        audioSessionStop();
+        reply(statusResponse());
+      }
     },
     /**
      * A fault, as the firmware raises it: 4 (overrun) and 5 (fingerprint
@@ -2090,6 +2200,48 @@ export function createMockShimmer3RTransport(opts = {}) {
     if (!streamTimer) return;
     clearInterval(streamTimer);
     streamTimer = null;
+  }
+
+  /** Set the real-world clock to `ticks` (32768 Hz since the Unix epoch). */
+  function applyRwc(ticks) {
+    state.rwcTicks = ticks;
+    // Re-seat the running clock on what the host wrote: from here the
+    // sensor keeps its own time, and keeps drifting at `rtc.ppm`.
+    rtc.devMsAtSet = Number(ticks) / 32.768;
+    rtc.setAtHostMs = Date.now();
+    /* And re-seat the STREAM counter with it, on a Shimmer3R, because there
+       the two are one number: the packet timestamp is the low 24 bits of the
+       counter `GET_RWC` reports. Released firmware up to v1.01.027 sets the
+       clock mid-stream, and leaving the counter where it was would model a
+       sensor whose packets disagree with its own clock — which is precisely
+       the shape a host's aligned anchor would then be tested against,
+       wrongly. On a Shimmer3 the counter is independent of the clock and
+       correctly stays put. */
+    if (hardwareVersion !== 3 && streamTimer) {
+      streamTicks = streamStartTicks();
+      streamStartMs = deviceNowMs();
+      samplesEmitted = 0;
+    }
+    // What the "Clock set" status bit means: not that the clock reads
+    // something, but that a host has set it since the sensor last lost
+    // power (`RTC_isRwcTimeSet`).
+    state.rwcSet = true;
+  }
+
+  /**
+   * Apply a clock set held while sensing, once streaming and logging have
+   * both stopped (`ShimRtc_applyDeferredRwc`, from `ShimSens_stopSensing`):
+   * the offset kept on arrival, added to the clock as it now reads, which is
+   * the time the host asked for. Called after every stop and at the end of a
+   * stop's tail (`beginStopTail`); does nothing while the sensor still
+   * senses (a stream, a log, or a stop still finishing) or when no set is
+   * held.
+   */
+  function applyDeferredRwcIfIdle() {
+    if (rtc.deferredOffsetMs === null || isSensing()) return;
+    const offsetMs = rtc.deferredOffsetMs;
+    rtc.deferredOffsetMs = null;
+    applyRwc(BigInt(Math.round((deviceNowMs() + offsetMs) * 32.768)));
   }
 
   // -------------------------------------------------------------------------
@@ -2537,8 +2689,10 @@ export function createMockShimmer3RTransport(opts = {}) {
       clearInterval(sdRead.timer);
       sdRead = null;
     }
+    endStopTail();
     state.streaming = false;
     state.logging = false;
+    applyDeferredRwcIfIdle();
   });
 
   // -------------------------------------------------------------------------
@@ -2909,14 +3063,56 @@ export function createMockShimmer3RTransport(opts = {}) {
   }
 
   // -------------------------------------------------------------------------
+  // Held replies
+  // -------------------------------------------------------------------------
+
+  /** Opcode → the commands taken while its answers are held. */
+  const holds = new Map();
+
+  /**
+   * Hold the answer to every command with opcode `op` until `release()`: the
+   * command is taken and nothing comes back yet, as when the reply is still
+   * in the air.
+   *
+   * For catching a page part-way through a read — Disconnect pressed while
+   * the connect sequence's calibration read waits is the case it was added
+   * for (DEV-1524). `held` is how many commands are waiting. `release()`
+   * answers them in order if the link is still up, and drops them if it is
+   * not: a sensor does not answer a host that has gone.
+   *
+   * @param {number} op
+   * @returns {{readonly held: number, release: () => void}}
+   */
+  transport.holdReplies = (op) => {
+    const queue = [];
+    holds.set(op, queue);
+    return {
+      get held() {
+        return queue.length;
+      },
+      release() {
+        if (holds.get(op) === queue) holds.delete(op);
+        const waiting = queue.splice(0);
+        if (transport.connected) for (const c of waiting) onCommand(c);
+      },
+    };
+  };
+
+  // -------------------------------------------------------------------------
   // Command handling
   // -------------------------------------------------------------------------
 
-  transport.setOnWrite((bytes) => {
+  function onCommand(bytes) {
     const cmd = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
     if (!cmd.length) return;
     if (debug) console.log("[mock] <-", hex(cmd));
     const op = cmd[0];
+
+    const held = holds.get(op);
+    if (held) {
+      held.push(cmd);
+      return;
+    }
 
     if (op in REMEMBERED_SETS) {
       state[REMEMBERED_SETS[op]] = cmd[1] ?? 0;
@@ -3382,28 +3578,19 @@ export function createMockShimmer3RTransport(opts = {}) {
         let ticks = 0n;
         for (let i = 8; i >= 1; i--)
           ticks = (ticks << 8n) | BigInt(cmd[i] ?? 0);
-        state.rwcTicks = ticks;
-        // Re-seat the running clock on what the host wrote: from here the
-        // sensor keeps its own time, and keeps drifting at `rtc.ppm`.
-        rtc.devMsAtSet = Number(ticks) / 32.768;
-        rtc.setAtHostMs = Date.now();
-        /* And re-seat the STREAM counter with it, on a Shimmer3R, because
-           there the two are one number: the packet timestamp is the low 24
-           bits of the counter `GET_RWC` reports. Setting the clock mid-stream
-           is allowed by the firmware, and leaving the counter where it was
-           would model a sensor whose packets disagree with its own clock —
-           which is precisely the shape a host's aligned anchor would then be
-           tested against, wrongly. On a Shimmer3 the counter is independent of
-           the clock and correctly stays put. */
-        if (hardwareVersion !== 3 && streamTimer) {
-          streamTicks = streamStartTicks();
-          streamStartMs = deviceNowMs();
-          samplesEmitted = 0;
+        /* Firmware with the deferral (DEV-1539) ACKs a set that arrives while
+           it streams or logs, but keeps only the difference between the time
+           sent and its clock on arrival, and applies that once both have
+           stopped. Until then GET_RWC, the stamps and the "Clock set" bit all
+           carry on unchanged. A later set while still sensing replaces an
+           earlier one. A stop still finishing (`stopTail`) is sensing too. */
+        if (rtcDeferSetWhileSensing && isSensing()) {
+          rtc.deferredOffsetMs = Number(ticks) / 32.768 - deviceNowMs();
+          reply([ACK]);
+          return;
         }
-        // What the "Clock set" status bit means: not that the clock reads
-        // something, but that a host has set it since the sensor last lost
-        // power (`RTC_isRwcTimeSet`).
-        state.rwcSet = true;
+        rtc.deferredOffsetMs = null;
+        applyRwc(ticks);
         reply([ACK]);
         return;
       }
@@ -3437,6 +3624,7 @@ export function createMockShimmer3RTransport(opts = {}) {
 
       case CMD.START_STREAMING:
         state.streaming = true;
+        endStopTail();
         reply([ACK]);
         startStreaming();
         return;
@@ -3454,6 +3642,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         const wasLogging = state.logging;
         state.streaming = true;
         state.logging = wasLogging || canLog;
+        endStopTail();
         reply([ACK]);
         startStreaming();
         if (state.logging && !wasLogging) audioSessionStart();
@@ -3470,6 +3659,7 @@ export function createMockShimmer3RTransport(opts = {}) {
         reply([ACK]);
         if (canLog) {
           state.logging = true;
+          endStopTail();
           audioSessionStart();
         }
         return;
@@ -3481,6 +3671,9 @@ export function createMockShimmer3RTransport(opts = {}) {
         state.logging = false;
         reply([ACK]);
         if (wasLogging) audioSessionStop();
+        if (wasLogging && !state.streaming) beginStopTail();
+        // After the tail has begun, so a held set waits for its end.
+        applyDeferredRwcIfIdle();
         return;
       }
 
@@ -3489,16 +3682,22 @@ export function createMockShimmer3RTransport(opts = {}) {
         // firmware. STOP_SDBT stops both.
         state.streaming = false;
         stopStreaming();
+        applyDeferredRwcIfIdle();
         reply([ACK]);
         return;
 
-      case CMD.STOP_SDBT:
+      case CMD.STOP_SDBT: {
+        const wasLogging = state.logging;
         state.streaming = false;
         state.logging = false;
         stopStreaming();
         reply([ACK]);
         audioSessionStop();
+        if (wasLogging) beginStopTail();
+        // After the tail has begun, so a held set waits for its end.
+        applyDeferredRwcIfIdle();
         return;
+      }
 
       case CMD.TOGGLE_LED:
         // The status bit the firmware reports is the toggle state, not a
@@ -3517,7 +3716,9 @@ export function createMockShimmer3RTransport(opts = {}) {
         reply([NACK]);
         return;
     }
-  });
+  }
+
+  transport.setOnWrite(onCommand);
 
   return transport;
 }
