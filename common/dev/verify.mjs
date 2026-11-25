@@ -702,9 +702,13 @@ const apply = await evaluate(`
 const opString = apply.seq
   .map((s) => s.op + (s.n > 1 ? "x" + s.n : ""))
   .join(" ");
+// The image goes out as three whole 128-byte SET_INFOMEM pages (0x8c x3), on
+// BLE too, from SDK 0.5.25. Released firmware keeps calibration only from a
+// chunk starting at 0 or 128, so the 64-byte BLE chunks (x6) before it lost the
+// gyro, mag and WR accel calibration (DEV-1562, DEV-1564).
 check(
   "apply runs the firmware's order",
-  opString === "0x8cx6 0x9c 0x08 0x01 0x05 0x09 0x01 0x8ex3",
+  opString === "0x8cx3 0x9c 0x08 0x01 0x05 0x09 0x01 0x8ex3",
   opString,
 );
 check(
