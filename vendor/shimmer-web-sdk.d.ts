@@ -15900,7 +15900,8 @@ declare const SMARTDOCK_BASE_CMD: Readonly<{
  * and com.shimmerresearch.managers.dockManager.AbstractDock:
  * - `SLOT_CHANGEOVER_DELAY_WITHOUT_SD_CARD` = 1500 ms (AbstractDock.java:96) —
  *   settle delay after a without-SD slot change before talking to the Shimmer.
- * - `CMD_RETRY_ATTEMPTS` = 2 (SmartDockUart.java:30).
+ *
+ * The two retry values are not the Java's: see `CMD_RETRY_ATTEMPTS` below.
  */
 declare const SMARTDOCK_DEFAULTS: Readonly<{
     RESPONSE_TIMEOUT_MS: 1000;
@@ -15926,7 +15927,38 @@ declare const SMARTDOCK_DEFAULTS: Readonly<{
     SLOT_CHANGEOVER_DELAY_WITH_SD_WIN_MS: 5000;
     /** As above on macOS/Linux (AbstractDock.java:95, selected by `getSDMountDelay()`). */
     SLOT_CHANGEOVER_DELAY_WITH_SD_UNIX_MS: 6000;
-    CMD_RETRY_ATTEMPTS: 2;
+    /**
+     * How many times in all a base command is sent while each try fails: on an
+     * `E`, on no answer in time, or, for a slot change, on an answer naming
+     * another slot (a slot, for `SDD$`).
+     *
+     * The Java has 2 (`CMD_RETRY_ATTEMPTS`, SmartDockUart.java:30), but
+     * `waitForSmartDockResponse` throws on the first `E` and the first timeout,
+     * so Consensys sends each command once. That is not enough. On 24 Nov 2026 a
+     * Base6 (`V,2,1,0,1,0`) answered most `SDC,NN$`, `SDP,NN$` and `SDD$` with an
+     * `E` within 20 ms and others not at all, through a power cycle; sent again
+     * every 2 s, each got through within 6 tries.
+     *
+     * The base firmware loses bytes (smartdock-firmware `CBase6/main.c` at
+     * 66532f8). Its UART interrupt (`USCI_A0_ISR`) keeps only the last byte
+     * received, and the main loop decodes one byte per pass, so a byte that
+     * arrives while the loop is busy is lost. A command short a byte is answered
+     * `E` at its `$`; one that loses its `$` is not answered at all.
+     *
+     * 15, not the 8 first chosen: the same Base6 later refused one select 8
+     * times in a row, so the HIL harness's Base6 driver went to 15
+     * (log-and-stream-common DEV-1533), and shimmer-host-core sends 15 too.
+     *
+     * The cost is time when the base will not answer: a query refused on every
+     * try ends after 28 s, and unanswered after 43 s; a slot change unanswered,
+     * after 178 s.
+     */
+    CMD_RETRY_ATTEMPTS: 15;
+    /**
+     * How long after a try fails the command is sent again: the 2 s that got
+     * every command through on that Base6.
+     */
+    CMD_RETRY_INTERVAL_MS: 2000;
     /**
      * Attempts at the FIRST per-Shimmer read after a slot change
      * (`READ_MAC_RETRY_ATTEMPTS`, AbstractDock.java:92, used by
@@ -15963,8 +15995,10 @@ type SmartDockHardwareType = 'base6' | 'base15' | 'basic' | 'unknown';
  * Map a base hardware-version byte to a family + slot count
  * (HwDriverShimmerDeviceDetails.java:313-321: BASE15→15 slots, BASE6→6 slots,
  * BASICDOCK→1). NB: in the Java driver the slot count actually comes from the
- * USB device descriptor, not the version byte — see the SmartDock README
- * hardware-verify note.
+ * USB device descriptor, not the version byte. The version byte alone was
+ * right on a Base6 and a Base15, both firmware 0.1.0 (25 Nov 2026); other
+ * firmware versions and board revisions are unconfirmed — see the SmartDock
+ * README hardware-verify note.
  */
 declare function baseHardwareType(hardwareVersion: number): {
     hardwareType: SmartDockHardwareType;
@@ -16029,7 +16063,8 @@ declare function parseSmartDockVersion(line: string): SmartDockVersionInfo | nul
  *
  * NB: the Java `remapSlotsSmartDockToUi` remap for the BASE15U *prototype*
  * board (firmware 1.0.0.≤5) is deliberately NOT applied here — it only affects
- * pre-production hardware; see the README hardware-verify note.
+ * pre-production hardware. A Base15 on 1.0.1.0 (identifier 1, firmware 0.1.0)
+ * needed none (25 Nov 2026); see the README hardware-verify note.
  */
 declare function parseSlotOccupancy(line: string): boolean[] | null;
 /**
@@ -16070,7 +16105,17 @@ interface SmartDockClientOptions extends ShimmerClientOptions {
         slotChangeTimeoutMs: number;
         /** Post-slot-change settle delay (ms). Default 1500. */
         slotChangeoverDelayMs: number;
+        /** Wait after a try that fails before the command is sent again (ms). Default 2000. */
+        retryIntervalMs: number;
     }>;
+    /**
+     * How many times in all a base command is sent while each try fails.
+     * Default {@link SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS} (15), which a base
+     * that refuses commands at random needs. A host probing a port that may not
+     * be a base at all can pass fewer, at the risk of taking a refusing base for
+     * no base.
+     */
+    commandTries?: number;
 }
 /** Result of {@link SmartDockClient.getDockInfo}. */
 interface SmartDockInfo {
@@ -16119,6 +16164,11 @@ interface SlotOccupancy {
  * which naturally resyncs after garbage. Per-op timeouts are ported from Java
  * (normal 1000 ms; slot change 10000 ms).
  *
+ * A base can refuse commands at random, so a command that is refused (`E`),
+ * unanswered, or, for a slot change, answered with another slot is sent again,
+ * up to {@link SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS} (15) tries 2 s apart; see
+ * {@link _sendWithRetry}. Each call still ends with one result.
+ *
  * Transport injection is mandatory — `connect()` with no base transport throws.
  *
  * @example
@@ -16152,6 +16202,12 @@ declare class SmartDockClient extends BaseShimmerClient {
     private readonly _responseTimeoutMs;
     private readonly _slotChangeTimeoutMs;
     private readonly _slotChangeoverDelayMs;
+    private readonly _retryIntervalMs;
+    private readonly _commandTries;
+    /** Ends the base command in progress, saying why; it sends nothing more. */
+    private readonly _aborts;
+    /** The base transport reported a disconnect; cleared by {@link connect}. */
+    private _linkLost;
     /** Cached dock info (from the last {@link getDockInfo}). */
     dockInfo: SmartDockInfo | null;
     /** The last active slot confirmed by {@link selectSlot} (1-based; -1 when disconnected). */
@@ -16176,6 +16232,8 @@ declare class SmartDockClient extends BaseShimmerClient {
     connect(transport?: ShimmerTransport): Promise<void>;
     disconnect(): Promise<void>;
     private _handleTransportDisconnect;
+    /** End the base command in progress, if any: it rejects, and sends nothing more. */
+    private _abortCommands;
     /** Streaming is not part of the SmartDock protocol. */
     startStreaming(): Promise<void>;
     stopStreaming(): Promise<void>;
@@ -16197,12 +16255,17 @@ declare class SmartDockClient extends BaseShimmerClient {
     /**
      * Select the active slot (WITHOUT SD access — the read path). Sends
      * `SDP,NN$`, awaits the `P,NN` confirmation with the ported ~10 s slot-change
-     * timeout, verifies the returned slot matches the request (Java throws
-     * `DOCK_CMD_ERR_FAIL_SET` on mismatch, SmartDockUart.java:233-241), then waits
+     * timeout, verifies the returned slot matches the request, then waits
      * the ported settle delay (1500 ms) before the per-Shimmer UART is usable
      * (SmartDock.java:674-691). Finally resyncs the per-Shimmer byte stream (the
      * slot re-route may leave stale bytes) — reusing D1's
      * {@link WiredShimmerClient.resyncStream}.
+     *
+     * An answer naming another slot fails that try, and the command is sent
+     * again: it may be a late answer to an earlier command. Only after the last
+     * try does the call fail (`DOCK_CMD_ERR_FAIL_SET`, as the Java does at once,
+     * SmartDockUart.java:233-241), and then {@link activeSlot} is what that last
+     * answer named.
      *
      * @param slotNumber 1-based slot (1..slotCount).
      */
@@ -16245,24 +16308,56 @@ declare class SmartDockClient extends BaseShimmerClient {
     }>;
     /** Lazily build + connect the composed D1 client over the per-Shimmer transport. */
     private _ensureWired;
-    /** Send an ASCII base command and await a response of one of `kinds`. */
+    /**
+     * Send a query (`SDV$`, `SDQ$`) and await its answer of `kind`. A malformed
+     * answer ends the call; the caller says why.
+     */
     private _command;
     /**
-     * Write `cmdBytes` and await a matching response, re-sending the command on a
-     * missed reply for a total of `SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS` (= 2)
-     * attempts before failing — mirroring SmartDockUart.java:526-537
-     * (`txBytesAndWaitForReply`). Retries on TIMEOUT ONLY; an explicit `E` error
-     * response ({@link SmartDockTimeoutError} is not thrown for it) propagates
-     * immediately, matching the Java path where `waitForSmartDockResponse` throws
-     * on an error instead of returning false.
+     * Send a slot change, or `SDD$` (`slot` -1), and await the answer naming
+     * `slot` (-1: none). An answer naming another slot fails that try. If the
+     * last try's does, the call fails, and {@link activeSlot} is what it named:
+     * only the last try's answer is taken as what the base routes.
+     */
+    private _changeSlot;
+    /**
+     * Write `cmdBytes` and await the base's answer of one of `kinds` that
+     * `judge` takes, sending the command again while it is refused or
+     * unanswered. A base can refuse commands at random: it loses bytes that
+     * arrive while its main loop is busy (see
+     * {@link SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS}). So:
+     *
+     * - The command is sent up to `commandTries` (15) times, `retryIntervalMs`
+     *   (2 s) after each try that fails.
+     * - A try fails on an `E`, on no answer within `timeoutMs`, or on an answer
+     *   `judge` calls `otherSlot`. That answer may be a late one to an earlier
+     *   command, so it is not taken.
+     * - An answer `judge` takes that arrives between tries is still taken, and
+     *   the command is not sent again. Anything else between tries, an `E`
+     *   included, is dropped: it is not this try's.
+     * - A `malformed` answer to a try in flight ends the call at once, with that
+     *   line; the caller says why. It is not a refusal.
+     * - Lines of other kinds (garbage, partial lines) are ignored: the resync
+     *   discipline.
+     * - The call ends with one result: the answer, or the last try's failure.
+     *   It also ends, sending nothing more, when the link is lost or
+     *   {@link disconnect} is called.
+     *
+     * The rule is the one that got every command through on a Base6 refusing
+     * them at random (24 Nov 2026), sent from the HIL harness. This client ran
+     * it from Node on 25 Nov 2026, at commit afc58f6, on that Base6 and on a
+     * Base15 (both firmware 0.1.0), three runs on each: getDockInfo,
+     * getSlotOccupancy, an identify, status and InfoMem read of each docked
+     * Shimmer3 (four on the Base6; six on the Base15, slots 14 and 15
+     * included), and disconnectAllSlots, all passing. In each run the first try
+     * of `SDQ$`, `SDP,01$` and `SDD$` was cut short a byte and refused with
+     * `E`, and the first `SDV$` was sent without its `$` and left unanswered;
+     * each was taken on try 2.
+     *
+     * HARDWARE-VERIFY: not yet seen on a base: two or more failed tries in a
+     * row, and `SDC,NN$` (a select with the SD card).
      */
     private _sendWithRetry;
-    /**
-     * Resolve with the first response line whose classification is in `kinds`;
-     * reject on an `E` error line or timeout. Lines of any other kind (including
-     * `unknown`/garbage) are ignored — this is the resync discipline.
-     */
-    private _waitForResponse;
     private _delay;
     /**
      * Run `fn` after every previously-queued operation has settled, so all public
