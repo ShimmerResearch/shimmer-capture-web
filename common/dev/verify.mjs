@@ -702,9 +702,13 @@ const apply = await evaluate(`
 const opString = apply.seq
   .map((s) => s.op + (s.n > 1 ? "x" + s.n : ""))
   .join(" ");
+/* Three SET_INFOMEM (0x8c), one per 128-byte page, since SDK 0.5.25
+   (DEV-1564). It was six 64-byte chunks, and over BLE that left the
+   calibration in bytes 64-127 half old: the firmware copies InfoMem's
+   calibration into its dump only for a write that starts a page. */
 check(
   "apply runs the firmware's order",
-  opString === "0x8cx6 0x9c 0x08 0x01 0x05 0x09 0x01 0x8ex3",
+  opString === "0x8cx3 0x9c 0x08 0x01 0x05 0x09 0x01 0x8ex3",
   opString,
 );
 check(
