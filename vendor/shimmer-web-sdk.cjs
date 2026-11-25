@@ -9,7 +9,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.5.22';
+const SDK_VERSION = '0.5.24';
 
 /**
  * Container for a single decoded sensor frame.
@@ -1712,9 +1712,20 @@ const HUB_FW_UPLOAD_STAGE = Object.freeze({
     ABORT: 0x03,
 });
 /** MAX32674C .msbl image geometry (mirrors firmware flashUpdater.h). A page on
- * the wire is PAGE_PAYLOAD + PAGE_CRC bytes; HEADER_SIZE bytes precede page 0. */
+ * the wire is PAGE_PAYLOAD + PAGE_CRC bytes; HEADER_SIZE bytes precede page 0.
+ *
+ * The header opens with the magic `msbl` and, at OFF_TARGET, the part the image
+ * was built for: NUL-padded ASCII. ADI's MAX32674C images name its die,
+ * `MAX32670`, for example `MAX32670_WHRM_AEC_SCD_WSPO2_C_50.4.4.msbl`, the v50.4.4
+ * the SR68 hubs report. A MAX32664 image names `MAX32660`. The device firmware
+ * reads neither field, and it erases the hub before the first page. */
 const MSBL = Object.freeze({
     HEADER_SIZE: 0x4c,
+    MAGIC: 'msbl',
+    OFF_TARGET: 0x08,
+    TARGET_LEN: 16,
+    /** The only target the Verisense algorithm hub (MAX32674C) accepts. */
+    HUB_TARGET: 'MAX32670',
     OFF_NUMPAGES: 0x44,
     PAGE_PAYLOAD: 8192,
     PAGE_CRC: 16,
@@ -18073,7 +18084,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'wrAccelRate.lis2dw12',
         label: 'WR Accel Rate',
-        desc: 'LIS2DW12 (Shimmer3R) rate — ConfigSetupByte0 bits 4-7 (SensorLIS2DW12.java:428).',
+        desc: 'LIS2DW12 (Shimmer3R) rate — ConfigSetupByte0 bits 4-7 (SensorLIS2DW12.java:428). The labels are the high-performance rates; in a low-power mode code 1 is 1.6 Hz and codes 7-9 deliver only 200 Hz.',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte0',
         shift: 4,
@@ -18086,7 +18097,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'wrAccelLpm',
         label: 'WR Accel Low-Power Mode',
-        desc: 'ConfigSetupByte0 bit 1 (bitShiftLSM303DLHCAccelLPM=1, FW wrAccelLpModeLsb).',
+        desc: 'ConfigSetupByte0 bit 1 (bitShiftLSM303DLHCAccelLPM=1, FW wrAccelLpModeLsb). On a Shimmer3R (LIS2DW12) it only picks WHICH low-power mode the part uses while High-Performance Mode is off; with that off the part is in a low-power mode whatever this says. Consensys always sets it to the opposite of High-Performance Mode (SensorLIS2DW12.setLowPowerAccelWR).',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte0',
         shift: 1,
@@ -18099,14 +18110,30 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'wrAccelHrm',
         label: 'WR Accel High-Resolution Mode',
-        desc: 'ConfigSetupByte0 bit 0 (bitShiftLSM303DLHCAccelHRM=0, FW wrAccelHrMode).',
+        desc: 'LSM303 (Shimmer3) high-resolution mode — ConfigSetupByte0 bit 0 (bitShiftLSM303DLHCAccelHRM=0, FW wrAccelHrMode).',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte0',
         shift: 0,
         width: 1,
         options: ON_OFF,
         group: 'wrAccel',
-        appliesTo: ALL,
+        appliesTo: SHIMMER3_ONLY,
+        configKey: 'imu.wrAccelHrm',
+    },
+    {
+        // The same bit as `wrAccelHrm`, under the name it has on this chip. Labelled
+        // "High-Resolution" here it read as a resolution setting, and turning it off
+        // put a Shimmer3R's LIS2DW12 into low-power mode at 256 Hz (DEV-1563).
+        key: 'wrAccelHrm.lis2dw12',
+        label: 'WR Accel High-Performance Mode',
+        desc: 'LIS2DW12 (Shimmer3R) high-performance mode — ConfigSetupByte0 bit 0 (FW wrAccelHrMode; Java mHighPerModeAccelWR). The firmware gives the part (this bit << 2) | low-power mode, so this bit alone decides high performance against low power. On: every rate up to 1600 Hz. Off: a low-power mode, which cannot deliver more than 200 Hz, so a sampling rate above that leaves packets with no new wide-range reading. Consensys turns it on whenever the sensor is enabled (SensorLIS2DW12.setDefaultLIS2DW12AccelSensorConfig).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 0,
+        width: 1,
+        options: ON_OFF,
+        group: 'wrAccel',
+        appliesTo: S3R_ONLY,
         configKey: 'imu.wrAccelHrm',
     },
     // ---- Gyroscope
@@ -19022,115 +19049,6 @@ function defaultTrialIdentity(mac) {
 }
 
 /**
- * Does the configured sensor output rate keep up with the configured packet
- * rate?
- *
- * These are two independent InfoMem fields and nothing in the firmware relates
- * them. The packet rate (`samplingRate`, bytes 0-1) decides how often a frame
- * is assembled; the IMU's ODR (`ConfigSetupByte1`) decides how often the
- * LSM6DSV actually produces a new sample. Set the packet rate above the ODR and
- * the firmware dutifully packages the same sample several times over, with a
- * fresh timestamp on each - so the stream looks perfect (regular timestamps, no
- * loss, valid CRCs) while the plotted signal is a staircase of repeats.
- *
- * That the two are meant to agree is not an inference. The firmware's own
- * Shimmer3R defaults pair a 51.2 Hz packet rate with the ODR immediately above
- * it, and say so:
- *
- *     // LSM6DSV Gyro sampling rate, next highest to 51.2Hz
- *     ShimConfig_gyroRateSet(LSM6DSV_ODR_AT_60Hz);
- *     -- log-and-stream-common Configuration/shimmer_config.c:183-184
- *
- * Consensys maintains the invariant by deriving sensor ODRs from the trial
- * rate, which is why reconfiguring there makes the staircase disappear. A host
- * that edits the fields independently has to check it instead, and this is that
- * check.
- *
- * Deliberately scoped to the LSM6DSV accel/gyro pair. The same trap exists for
- * the wide-range accelerometer and the magnetometers, but each has its own
- * enable bits and its own ODR table, and a warning that fires on a sensor the
- * user has not enabled is worse than no warning at all.
- */
-/** A rate option label parsed to Hz, or null when it names no rate. */
-function labelToHz(label) {
-    // "60.0Hz" / "1.875Hz" / "Power-down". Parsed from the option table rather
-    // than duplicated as numbers, so the two cannot drift apart.
-    const m = /^([\d.]+)\s*Hz$/i.exec(label.trim());
-    if (!m)
-        return null;
-    const hz = Number(m[1]);
-    return Number.isFinite(hz) && hz > 0 ? hz : null;
-}
-/**
- * Output rate of an LSM6DSV accel/gyro ODR code, in Hz.
- *
- * @param code the value stored in `ConfigSetupByte1`
- * @returns the rate in Hz, or null for power-down and for codes with no rate
- *   (the Java table carries one writable value it does not name)
- */
-function lsm6dsvAccelGyroRateHz(code) {
-    const hit = SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS.find(([value]) => value === code);
-    return hit ? labelToHz(hit[1]) : null;
-}
-/** Packet rate in Hz from the stored `samplingRate` divider. */
-function samplingRateHzFromDivider(divider) {
-    if (!Number.isFinite(divider) || divider <= 0)
-        return null;
-    return INFOMEM_SAMPLING_CLOCK_FREQ / divider;
-}
-/**
- * Check the LSM6DSV ODR against the packet rate.
- *
- * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
- * @param opts.imuRateCode stored `ConfigSetupByte1`
- * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
- *   low-noise accelerometer or the gyroscope is actually enabled, since the ODR
- *   is irrelevant to a stream that carries neither
- */
-function checkImuRateCoversPacketRate(opts) {
-    const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
-    const imuRateHz = lsm6dsvAccelGyroRateHz(opts.imuRateCode);
-    const usesImu = (opts.enabledSensors &
-        (SensorBitmapShimmer3.SENSOR_A_ACCEL | SensorBitmapShimmer3.SENSOR_GYRO)) !==
-        0;
-    const none = {
-        packetRateHz,
-        imuRateHz,
-        repeatsPerSample: null,
-        short: false,
-        problem: null,
-    };
-    if (!usesImu || packetRateHz === null)
-        return none;
-    if (imuRateHz === null) {
-        // Power-down with the IMU enabled is its own fault, and a worse one: the
-        // sample never changes at all.
-        return {
-            ...none,
-            short: true,
-            problem: `The accelerometer/gyroscope output rate is set to "power-down" while those ` +
-                `sensors are enabled, so every frame will carry the same reading. Raise it to ` +
-                `at least ${packetRateHz.toFixed(1)} Hz.`,
-        };
-    }
-    if (imuRateHz >= packetRateHz)
-        return { ...none, short: false, problem: null };
-    const repeats = packetRateHz / imuRateHz;
-    return {
-        packetRateHz,
-        imuRateHz,
-        repeatsPerSample: repeats,
-        short: true,
-        problem: `The accelerometer/gyroscope output rate (${imuRateHz} Hz) is below the sampling ` +
-            `rate (${packetRateHz.toFixed(1)} Hz), so the sensor will repeat each reading about ` +
-            `${repeats < 10 ? repeats.toFixed(1) : Math.round(repeats)} times instead of ` +
-            `producing new data. Timestamps and packet loss will still look correct while the ` +
-            `signal is a staircase. Raise "Gyro/Accel Rate" to the next value at or above ` +
-            `${packetRateHz.toFixed(1)} Hz.`,
-    };
-}
-
-/**
  * Derive a sensor's output rate from the configured packet rate, the way the
  * Java driver does.
  *
@@ -19144,7 +19062,8 @@ function checkImuRateCoversPacketRate(opts) {
  *
  * Ported from `SensorLSM6DSV.getGyroRateFromFreq` (`SensorLSM6DSV.java:676`)
  * and `setDefaultLSM6DSVGyroSensorConfig`, against the checkouts in
- * `eclipse-java-workspace_2024`.
+ * `eclipse-java-workspace_2024`, and from `SensorLIS2DW12` for the wide-range
+ * accelerometer (below), against `Shimmer-Java-Android-API` master.
  */
 /** ODR codes with a meaning beyond "this many Hz". */
 const LSM6DSV_ODR = Object.freeze({
@@ -19230,6 +19149,350 @@ function deriveLsm6dsvRateOnEnableChange(opts) {
             lowPower: false,
         })
         : LSM6DSV_ODR.LOW_POWER;
+}
+// ---------------------------------------------------------------------------
+// LIS2DW12 — Shimmer3R wide-range accelerometer
+// ---------------------------------------------------------------------------
+//
+// Ported from `SensorLIS2DW12.getAccelRateFromFreq` and
+// `setDefaultLIS2DW12AccelSensorConfig` (Shimmer-Java-Android-API
+// `ShimmerDriver/.../sensors/lis2dw12/SensorLIS2DW12.java`, master).
+//
+// Unlike the LSM6DSV, the LIS2DW12's low-power state is NOT read back from its
+// rate. It is two bits of ConfigSetupByte0 beside the rate:
+//
+//   bit 1  `wrAccelLpModeLsb` — Java's `mLowPowerAccelWR`
+//   bit 0  `wrAccelHrMode`    — Java's `mHighPerModeAccelWR`
+//
+// and the firmware hands the part `(wrAccelHrMode << 2) | lpMode` as its power
+// mode (`ShimConfig_wrAccelModeGet`, log-and-stream-common
+// `Configuration/shimmer_config.c`). `LIS2DW12_HIGH_PERFORMANCE` is 0x04, so
+// **bit 0 alone decides high performance against low power**: with it clear
+// the part runs in one of its continuous low-power modes whatever bit 1 says,
+// and no low-power mode goes faster than 200 Hz. Java never lets the two
+// disagree — `setLowPowerAccelWR(enable)` sets bit 1 to `enable` and bit 0 to
+// `!enable` — which is why the defaults below always return them as a pair.
+/** LIS2DW12 ODR codes with a meaning beyond "this many Hz". */
+const LIS2DW12_ODR = Object.freeze({
+    /** Sensor off. What the driver writes for a disabled wide-range accelerometer. */
+    POWER_DOWN: 0,
+    /**
+     * `LIS2DW12_XL_ODR_1Hz6_LP_ONLY`: 1.6 Hz in a low-power mode, 12.5 Hz in high
+     * performance. Java's ladder gives it for `freq <= 12.5` (high performance,
+     * where it really is 12.5 Hz) and for every rate when low-power is asked for
+     * (where it is 1.6 Hz).
+     */
+    LOW_POWER: 1,
+});
+/**
+ * The fastest output rate the LIS2DW12 delivers in any low-power mode. ODR
+ * codes 7-9 saturate here (`SensorLIS2DW12.ListofLIS2DW12AccelRateLpm`, and the
+ * firmware's `ShimConfig_lis2dw12OdrToHz`).
+ */
+const LIS2DW12_LOW_POWER_MAX_HZ = 200;
+/**
+ * The ladder from `getAccelRateFromFreq`'s high-performance branch, as
+ * `[maxFreqHz, code]` pairs in the order Java tests them. Code 2 is absent
+ * because Java gives code 1 for `freq <= 12.5` — 12.5 Hz in high performance,
+ * the only mode this branch is ever paired with.
+ */
+const LIS2DW12_LADDER = Object.freeze([
+    [12.5, 1],
+    [25, 3],
+    [50, 4],
+    [100, 5],
+    [200, 6],
+    [400, 7],
+    [800, 8],
+]);
+/** The fastest ODR code, 1600 Hz in high performance. */
+const LIS2DW12_TOP_CODE$1 = 9;
+/**
+ * The LIS2DW12 ODR code for a packet rate — `getAccelRateFromFreq(isEnabled,
+ * freq, isLowPowerMode)`, same inputs, same results.
+ *
+ * @param opts.enabled whether the wide-range accelerometer is enabled
+ * @param opts.samplingRateHz the configured packet rate
+ * @param opts.lowPower Java's `mLowPowerAccelWR`. When set, Java answers code 1
+ *   (1.6 Hz in a low-power mode) whatever the packet rate. A host that never
+ *   wants a rate below its packet rate passes false
+ * @returns the ODR code to store in ConfigSetupByte0 bits 4-7. A non-finite or
+ *   non-positive packet rate gives power-down, as
+ *   {@link deriveLsm6dsvAccelGyroRate} does, rather than Java's fall-through
+ */
+function deriveLis2dw12AccelRate(opts) {
+    if (!opts.enabled)
+        return LIS2DW12_ODR.POWER_DOWN;
+    if (opts.lowPower)
+        return LIS2DW12_ODR.LOW_POWER;
+    const hz = opts.samplingRateHz;
+    if (!Number.isFinite(hz) || hz <= 0)
+        return LIS2DW12_ODR.POWER_DOWN;
+    for (const [maxHz, code] of LIS2DW12_LADDER) {
+        if (hz <= maxHz)
+            return code;
+    }
+    return LIS2DW12_TOP_CODE$1;
+}
+/**
+ * What to store when the wide-range accelerometer's enabled state has just
+ * changed — `setDefaultLIS2DW12AccelSensorConfig(isSensorEnabled)`.
+ *
+ * - **Enabled:** `setLowPowerAccelWR(false)` — low-power off, high-performance
+ *   on, and the rate re-derived from the packet rate. The range is kept.
+ * - **Disabled:** `setLIS2DW12AccelRange(0)` then `setLowPowerAccelWR(true)` —
+ *   ±2 g, low-power on, high-performance off, and the rate re-derived. Java
+ *   sets the enabled state before it applies these defaults
+ *   (`ShimmerDevice.setSensorEnabledState`), so that re-derivation sees a
+ *   disabled sensor and gives power-down. ConfigSetupByte0 ends up `0x02`.
+ *
+ * The disabled default is the state that stranded a Shimmer3R: a host that
+ * later enables the channel without applying the enabled default leaves bit 0
+ * clear, and the part in a low-power mode that cannot pass 200 Hz.
+ *
+ * @param opts.enabled the state being applied
+ * @param opts.samplingRateHz the configured packet rate
+ */
+function deriveLis2dw12ConfigOnEnableChange(opts) {
+    if (opts.enabled) {
+        return {
+            rate: deriveLis2dw12AccelRate({
+                enabled: true,
+                samplingRateHz: opts.samplingRateHz,
+                lowPower: false,
+            }),
+            range: null,
+            lowPower: false,
+            highPerformance: true,
+        };
+    }
+    return {
+        rate: LIS2DW12_ODR.POWER_DOWN,
+        range: 0,
+        lowPower: true,
+        highPerformance: false,
+    };
+}
+
+/**
+ * Does the configured sensor output rate keep up with the configured packet
+ * rate?
+ *
+ * These are two independent InfoMem fields and nothing in the firmware relates
+ * them. The packet rate (`samplingRate`, bytes 0-1) decides how often a frame
+ * is assembled; the IMU's ODR (`ConfigSetupByte1`) decides how often the
+ * LSM6DSV actually produces a new sample. Set the packet rate above the ODR and
+ * the firmware dutifully packages the same sample several times over, with a
+ * fresh timestamp on each - so the stream looks perfect (regular timestamps, no
+ * loss, valid CRCs) while the plotted signal is a staircase of repeats.
+ *
+ * That the two are meant to agree is not an inference. The firmware's own
+ * Shimmer3R defaults pair a 51.2 Hz packet rate with the ODR immediately above
+ * it, and say so:
+ *
+ *     // LSM6DSV Gyro sampling rate, next highest to 51.2Hz
+ *     ShimConfig_gyroRateSet(LSM6DSV_ODR_AT_60Hz);
+ *     -- log-and-stream-common Configuration/shimmer_config.c:183-184
+ *
+ * Consensys maintains the invariant by deriving sensor ODRs from the trial
+ * rate, which is why reconfiguring there makes the staircase disappear. A host
+ * that edits the fields independently has to check it instead, and this is that
+ * check.
+ *
+ * Each check covers one chip, with its own enable bits and its own ODR table,
+ * and stays silent unless that sensor is enabled: a warning that fires on a
+ * sensor the user has not enabled is worse than no warning at all. There are
+ * two: the LSM6DSV accel/gyro pair ({@link checkImuRateCoversPacketRate}) and
+ * the Shimmer3R's LIS2DW12 wide-range accelerometer
+ * ({@link checkWrAccelRateCoversPacketRate}). The magnetometers have the same
+ * trap and no check yet.
+ */
+/** A rate option label parsed to Hz, or null when it names no rate. */
+function labelToHz(label) {
+    // "60.0Hz" / "1.875Hz" / "Power-down". Parsed from the option table rather
+    // than duplicated as numbers, so the two cannot drift apart.
+    const m = /^([\d.]+)\s*Hz$/i.exec(label.trim());
+    if (!m)
+        return null;
+    const hz = Number(m[1]);
+    return Number.isFinite(hz) && hz > 0 ? hz : null;
+}
+/**
+ * Output rate of an LSM6DSV accel/gyro ODR code, in Hz.
+ *
+ * @param code the value stored in `ConfigSetupByte1`
+ * @returns the rate in Hz, or null for power-down and for codes with no rate
+ *   (the Java table carries one writable value it does not name)
+ */
+function lsm6dsvAccelGyroRateHz(code) {
+    const hit = SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS.find(([value]) => value === code);
+    return hit ? labelToHz(hit[1]) : null;
+}
+/** Packet rate in Hz from the stored `samplingRate` divider. */
+function samplingRateHzFromDivider(divider) {
+    if (!Number.isFinite(divider) || divider <= 0)
+        return null;
+    return INFOMEM_SAMPLING_CLOCK_FREQ / divider;
+}
+/**
+ * Check the LSM6DSV ODR against the packet rate.
+ *
+ * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
+ * @param opts.imuRateCode stored `ConfigSetupByte1`
+ * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
+ *   low-noise accelerometer or the gyroscope is actually enabled, since the ODR
+ *   is irrelevant to a stream that carries neither
+ */
+function checkImuRateCoversPacketRate(opts) {
+    const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
+    const imuRateHz = lsm6dsvAccelGyroRateHz(opts.imuRateCode);
+    const usesImu = (opts.enabledSensors &
+        (SensorBitmapShimmer3.SENSOR_A_ACCEL | SensorBitmapShimmer3.SENSOR_GYRO)) !==
+        0;
+    const none = {
+        packetRateHz,
+        imuRateHz,
+        repeatsPerSample: null,
+        short: false,
+        problem: null,
+    };
+    if (!usesImu || packetRateHz === null)
+        return none;
+    if (imuRateHz === null) {
+        // Power-down with the IMU enabled is its own fault, and a worse one: the
+        // sample never changes at all.
+        return {
+            ...none,
+            short: true,
+            problem: `The accelerometer/gyroscope output rate is set to "power-down" while those ` +
+                `sensors are enabled, so every frame will carry the same reading. Raise it to ` +
+                `at least ${packetRateHz.toFixed(1)} Hz.`,
+        };
+    }
+    if (imuRateHz >= packetRateHz)
+        return { ...none, short: false, problem: null };
+    const repeats = packetRateHz / imuRateHz;
+    return {
+        packetRateHz,
+        imuRateHz,
+        repeatsPerSample: repeats,
+        short: true,
+        problem: `The accelerometer/gyroscope output rate (${imuRateHz} Hz) is below the sampling ` +
+            `rate (${packetRateHz.toFixed(1)} Hz), so the sensor will repeat each reading about ` +
+            `${repeats < 10 ? repeats.toFixed(1) : Math.round(repeats)} times instead of ` +
+            `producing new data. Timestamps and packet loss will still look correct while the ` +
+            `signal is a staircase. Raise "Gyro/Accel Rate" to the next value at or above ` +
+            `${packetRateHz.toFixed(1)} Hz.`,
+    };
+}
+// ---------------------------------------------------------------------------
+// LIS2DW12 — Shimmer3R wide-range accelerometer
+// ---------------------------------------------------------------------------
+/** The LIS2DW12's fastest ODR code: 1600 Hz in high performance. */
+const LIS2DW12_TOP_CODE = 9;
+/**
+ * Output rate of a LIS2DW12 ODR code, in Hz, as the part delivers it.
+ *
+ * Mode-dependent, unlike the LSM6DSV's: code 1 is 12.5 Hz in high performance
+ * but 1.6 Hz in a low-power mode, and codes 7-9 deliver only 200 Hz in a
+ * low-power mode. Read from the Java driver's two lists
+ * (`SensorLIS2DW12.ListofLIS2DW12AccelRateHpm` / `...Lpm`), which agree with
+ * the firmware's `ShimConfig_lis2dw12OdrToHz`.
+ *
+ * @param code ConfigSetupByte0 bits 4-7
+ * @param highPerformance ConfigSetupByte0 bit 0 (`wrAccelHrMode`). With it
+ *   clear the part is in a low-power mode, whatever bit 1 says
+ * @returns the rate in Hz, or null for power-down and for codes with no rate
+ */
+function lis2dw12AccelRateHz(code, highPerformance) {
+    const table = highPerformance
+        ? SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS
+        : SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS;
+    const hit = table.find(([value]) => value === code);
+    return hit ? labelToHz(hit[1]) : null;
+}
+/**
+ * Check the Shimmer3R wide-range accelerometer (LIS2DW12) against the packet
+ * rate, and above all flag a low-power mode above 200 Hz.
+ *
+ * That combination is what a Shimmer3R configured in Shimmer Capture at 256 Hz
+ * was found holding: ConfigSetupByte0 `0x62`, high performance off. No
+ * low-power mode passes 200 Hz, so the firmware lowers the rate to that cap,
+ * and on the ticks the part has no new sample the slot goes out unfilled -
+ * about one packet in five at 256 Hz, zero at first and a stale reading after
+ * that. Consensys never writes it: enabling the sensor turns high performance
+ * on (`SensorLIS2DW12.setDefaultLIS2DW12AccelSensorConfig`).
+ *
+ * Shimmer3R only. On a Shimmer3 the same bits drive an LSM303, whose modes and
+ * rates are different.
+ *
+ * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
+ * @param opts.wrAccelRateCode ConfigSetupByte0 bits 4-7
+ * @param opts.highPerformance ConfigSetupByte0 bit 0
+ * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
+ *   wide-range accelerometer (`SENSOR_D_ACCEL`) is enabled
+ */
+function checkWrAccelRateCoversPacketRate(opts) {
+    const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
+    const lowPower = !opts.highPerformance;
+    const wrAccelRateHz = lis2dw12AccelRateHz(opts.wrAccelRateCode, opts.highPerformance);
+    const enabled = (opts.enabledSensors & SensorBitmapShimmer3.SENSOR_D_ACCEL) !== 0;
+    const none = {
+        packetRateHz,
+        wrAccelRateHz,
+        lowPower,
+        lowPowerTooSlow: false,
+        unfilledFraction: null,
+        short: false,
+        problem: null,
+    };
+    if (!enabled || packetRateHz === null)
+        return none;
+    const hz = packetRateHz.toFixed(1);
+    if (lowPower && packetRateHz > LIS2DW12_LOW_POWER_MAX_HZ) {
+        const unfilled = 1 - LIS2DW12_LOW_POWER_MAX_HZ / packetRateHz;
+        return {
+            ...none,
+            lowPowerTooSlow: true,
+            unfilledFraction: unfilled,
+            short: true,
+            problem: `The wide-range accelerometer is in low-power mode, which cannot deliver more than ` +
+                `${LIS2DW12_LOW_POWER_MAX_HZ} Hz, and the sampling rate is ${hz} Hz. About ` +
+                `${Math.round(unfilled * 100)}% of packets will carry no new wide-range reading, ` +
+                `while timestamps and packet loss still look correct. Turn on "WR Accel ` +
+                `High-Performance Mode", as Consensys does whenever the sensor is enabled, or lower ` +
+                `the sampling rate to ${LIS2DW12_LOW_POWER_MAX_HZ} Hz or below.`,
+        };
+    }
+    if (wrAccelRateHz === null) {
+        return {
+            ...none,
+            unfilledFraction: 1,
+            short: true,
+            problem: `The wide-range accelerometer output rate is set to "power-down" while the sensor ` +
+                `is enabled, so it will produce no new readings. Raise "WR Accel Rate" to at least ` +
+                `${hz} Hz.`,
+        };
+    }
+    if (wrAccelRateHz >= packetRateHz)
+        return none;
+    // Below the packet rate the firmware gates the read on the part's data-ready
+    // line, so the slots it has nothing for go out unfilled rather than repeated
+    // (shimmer3r-firmware `hal_lis2dw12.c`, `lis2dw12_is_shimmer_freq_higher`).
+    const unfilled = 1 - wrAccelRateHz / packetRateHz;
+    const fastestHz = lis2dw12AccelRateHz(LIS2DW12_TOP_CODE, true) ?? 0;
+    const advice = packetRateHz > fastestHz
+        ? `The part has no faster rate, so lower the sampling rate to ${fastestHz} Hz or below.`
+        : `Raise "WR Accel Rate" to the next value at or above ${hz} Hz.`;
+    return {
+        ...none,
+        unfilledFraction: unfilled,
+        short: true,
+        problem: `The wide-range accelerometer output rate (${wrAccelRateHz} Hz` +
+            `${lowPower ? ' in low-power mode' : ''}) is below the sampling rate (${hz} Hz), so ` +
+            `about ${Math.round(unfilled * 100)}% of packets will carry no new wide-range reading. ` +
+            advice,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -36284,6 +36547,17 @@ function validatePendingResponse(pending, msg) {
 // (request timeout / gatt server is disconnected / unexpected response
 // property) so it always aborts the retry loop.
 const CONNECT_CANCELLED_MESSAGE = 'Connect cancelled: disconnect requested during connect attempt.';
+/** A NUL-padded ASCII field of a .msbl header, up to its first NUL, with any
+ * unprintable byte shown as `\xNN` so a wrong file reads clearly in an error. */
+function msblAscii(img, off, len) {
+    let s = '';
+    for (const b of img.subarray(off, off + len)) {
+        if (b === 0)
+            break;
+        s += b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : `\\x${b.toString(16).padStart(2, '0')}`;
+    }
+    return s;
+}
 // ---------------------------------------------------------------------------
 // VerisenseBleDevice
 // ---------------------------------------------------------------------------
@@ -37613,6 +37887,13 @@ class VerisenseBleDevice extends BaseShimmerClient {
      * erased and each page is written. Only SR68 Pulse+ hardware (the only board
      * carrying the hub) accepts it — other hardware NACKs the BEGIN stage.
      *
+     * The image is refused, before anything is sent, unless its header says
+     * `msbl` and names the hub's die, `MAX32670`. BEGIN erases the hub's
+     * application and the device does not read the target, so an image for
+     * another part, such as a MAX32664's (`MAX32660`), would leave the hub empty.
+     * The C-keyed and development-keyed builds both name `MAX32670`, so this
+     * cannot tell which key an image carries.
+     *
      * @param msbl       raw .msbl file bytes
      * @param onProgress optional progress callback (pagesDone, totalPages)
      * @returns the hub application firmware version string read back after flashing
@@ -37621,6 +37902,15 @@ class VerisenseBleDevice extends BaseShimmerClient {
         const img = msbl instanceof Uint8Array ? msbl : new Uint8Array(msbl);
         if (img.length < MSBL.HEADER_SIZE) {
             throw new Error('uploadHubFirmware: file is too small to be a valid .msbl');
+        }
+        const magic = msblAscii(img, 0, MSBL.MAGIC.length);
+        if (magic !== MSBL.MAGIC) {
+            throw new Error(`uploadHubFirmware: not a .msbl image (header starts "${magic}", expected "${MSBL.MAGIC}"); nothing was sent`);
+        }
+        const target = msblAscii(img, MSBL.OFF_TARGET, MSBL.TARGET_LEN);
+        if (target !== MSBL.HUB_TARGET) {
+            throw new Error(`uploadHubFirmware: this .msbl is built for "${target}", not the MAX32674C algorithm hub ` +
+                `(expected "${MSBL.HUB_TARGET}"); nothing was sent and the hub was not erased`);
         }
         const numPages = img[MSBL.OFF_NUMPAGES] | (img[MSBL.OFF_NUMPAGES + 1] << 8);
         const expectedLen = MSBL.HEADER_SIZE + numPages * MSBL.PAGE_FILE_BYTES;
@@ -40741,6 +41031,8 @@ exports.LEAD_OFF_CURRENT_OPTIONS = LEAD_OFF_CURRENT_OPTIONS;
 exports.LEAD_OFF_DETECTION_LABELS = LEAD_OFF_DETECTION_LABELS;
 exports.LEAD_OFF_DETECTION_OPTIONS = LEAD_OFF_DETECTION_OPTIONS;
 exports.LEAD_OFF_FREQUENCY_LABELS = LEAD_OFF_FREQUENCY_LABELS;
+exports.LIS2DW12_LOW_POWER_MAX_HZ = LIS2DW12_LOW_POWER_MAX_HZ;
+exports.LIS2DW12_ODR = LIS2DW12_ODR;
 exports.LOG_TRIGGERS = LOG_TRIGGERS;
 exports.LOG_TRIGGER_OPTIONS = LOG_TRIGGER_OPTIONS;
 exports.LSM6DSV_ODR = LSM6DSV_ODR;
@@ -41043,6 +41335,7 @@ exports.channelLayoutDiffersByGeneration = channelLayoutDiffersByGeneration;
 exports.checkConfigBytesValid = checkConfigBytesValid;
 exports.checkImuRateCoversPacketRate = checkImuRateCoversPacketRate;
 exports.checkSensorRules = checkSensorRules;
+exports.checkWrAccelRateCoversPacketRate = checkWrAccelRateCoversPacketRate;
 exports.classifyBaseResponse = classifyBaseResponse;
 exports.classifyFactoryTestAckPacket = classifyFactoryTestAckPacket;
 exports.classifyLiteProtocolAck = classifyLiteProtocolAck;
@@ -41083,6 +41376,8 @@ exports.defaultTrialIdentity = defaultTrialIdentity;
 exports.defaultVerisensePasskeyForId = defaultVerisensePasskeyForId;
 exports.deleteDownloadedFromCard = deleteDownloadedFromCard;
 exports.deriveExpPower = deriveExpPower;
+exports.deriveLis2dw12AccelRate = deriveLis2dw12AccelRate;
+exports.deriveLis2dw12ConfigOnEnableChange = deriveLis2dw12ConfigOnEnableChange;
 exports.deriveLsm6dsvAccelGyroRate = deriveLsm6dsvAccelGyroRate;
 exports.deriveLsm6dsvRateOnEnableChange = deriveLsm6dsvRateOnEnableChange;
 exports.deriveShimmer3FirmwareVersionCode = deriveShimmer3FirmwareVersionCode;
@@ -41209,6 +41504,7 @@ exports.isVerisenseSecondGenerationHardware = isVerisenseSecondGenerationHardwar
 exports.joinAudioMode = joinAudioMode;
 exports.joinButtonMode = joinButtonMode;
 exports.keepsLinkCrcWhenSensingStops = keepsLinkCrcWhenSensingStops;
+exports.lis2dw12AccelRateHz = lis2dw12AccelRateHz;
 exports.listShimmerSrBoards = listShimmerSrBoards;
 exports.localCivilUnixSecondsNow = localCivilUnixSecondsNow;
 exports.logTriggersOf = logTriggersOf;

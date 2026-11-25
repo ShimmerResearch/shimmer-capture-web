@@ -1084,6 +1084,10 @@ export function mockEnabledFromUrl() {
  * @param {number} [opts.rateHz=51.2] initial sampling rate
  * @param {number} [opts.sensors=0x00E0] initial sensor bitmap
  *   (default = LN accel | gyro | mag)
+ * @param {number} [opts.configSetupByte0=0x02] initial ConfigSetupByte0: the
+ *   wide-range accel's rate, range, low-power and high-performance bits. The
+ *   default is what Consensys writes for the sensor disabled; `0x62` is the
+ *   low-power configuration a Shimmer3R was found holding at 256 Hz (DEV-1563)
  * @param {number} [opts.dribbleBytes=3] chunk size when `framed` is false
  * @param {string} [opts.deviceName] advertised name
  * @param {string} [opts.mac="000666668091"] MAC, hex, no separators
@@ -1282,7 +1286,19 @@ export function createMockShimmer3RTransport(opts = {}) {
        pairs the 51.2 Hz default packet rate with "next highest", 60 Hz
        (LSM6DSV_ODR_AT_60Hz = 5), and this follows it so the mock exercises a
        coherent configuration by default. */
-    configSetupBytes: Uint8Array.of(0x02, 0x05, 0x01, 0x08, 0x00, 0x88, 0x10),
+    configSetupBytes: Uint8Array.of(
+      Number.isInteger(opts.configSetupByte0) &&
+        opts.configSetupByte0 >= 0 &&
+        opts.configSetupByte0 <= 0xff
+        ? opts.configSetupByte0
+        : 0x02,
+      0x05,
+      0x01,
+      0x08,
+      0x00,
+      0x88,
+      0x10,
+    ),
     /** 64-bit RTC ticks, LSB first on the wire. */
     rwcTicks: 0n,
     /** A soft restart has been armed for the next disconnect. */
