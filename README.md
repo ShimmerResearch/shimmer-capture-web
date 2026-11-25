@@ -306,6 +306,22 @@ bit does not in fact power the ExG board, which comes up through its own reset
 line; Consensys sets it for ExG on every platform, a Shimmer3 genuinely needs
 it, and matching Consensys keeps the two tools' images identical.)
 
+**The IMU's and the wide-range accelerometer's own rates are derived too.**
+Setting the sampling rate re-derives each one's output rate, and ticking or
+unticking the sensor applies the defaults Consensys applies, each with a line in
+the log. On a Shimmer3R the wide-range accelerometer is a LIS2DW12, and its
+**High-Performance Mode** bit (byte 6 bit 0, the Shimmer3's high-resolution bit)
+alone decides between high performance and low power. No low-power mode goes
+faster than 200 Hz. A sensor found at 256 Hz with that bit off missed about one
+wide-range reading in five (DEV-1563). So:
+
+- **Ticking it** turns high performance on and sets the rate for the sampling
+  rate, as Consensys does: byte 6 is `0x71` at 256 Hz and ±2 g.
+- **Unticking it** parks it at power-down, ±2 g, low-power: `0x02`.
+- **Low-power mode above 200 Hz** is flagged above the form. Apply and the raw
+  image write ask before writing it: OK switches it to high performance first,
+  and Cancel writes nothing.
+
 **A sensor this hardware does not have is greyed out**, with the board it needs
 in its tooltip: GSR wants a GSR+ board, ExG an ECG/EMG board, and the bridge
 amplifier an SR8 or SR49 **on a Shimmer3** — the Shimmer3R firmware has no
@@ -958,6 +974,7 @@ one is a useful thing to be able to see.
 | `&btVersion=`      | What the Bluetooth module replied. Defaults to a CYW20820 line, or an RN4678 banner with `&hw=3`. Empty models a module that never answered.                                                                                       |
 | `&sensors=`        | Preload the enabled-sensor bitmap, `0x0422E6` or decimal — how a calibrated multi-channel stream, or an image that already breaks a sensor rule, is reachable from a URL.                                                          |
 | `&pressure=`       | Which pressure part the mock claims: `390`, `581`, `180`, or `nack` / `silent` for the two ways real firmware fails to serve the coefficients.                                                                                     |
+| `&cfg0=`           | Preload byte 6, the wide-range accel's rate, range and mode bits, `0x62` or decimal. Default `0x02`, Consensys's setting for the sensor off. `0x62` is the low-power setting a Shimmer3R was found holding at 256 Hz (DEV-1563).   |
 | `&events=1`        | Firmware with the event channel: byte 232 in the form, and button and TTL records to a host that opts in. `mockTransport.events.button(true/false)` and `.ttl(true/false)` produce them from the console.                          |
 | `&audio=1`         | Firmware that records audio: byte 233 in the form, the audio status command, audio files on the card. `mockTransport.audio` starts and stops logging and raises faults.                                                            |
 | `&soundlevel=1`    | With `&audio=1`, firmware with the sound-level channel: byte 233 bit 4 survives a write, and while it is set the stream carries channel 0x38, no level for 256 ms. Without it the sensor clears the bit, as older firmware does.   |

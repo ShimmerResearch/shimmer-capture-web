@@ -927,10 +927,11 @@
           <div class="banner info" id="configBanner">
             Connect a sensor to read its configuration.
           </div>
-          <!-- Fires when the sampling rate outruns the accel/gyro output rate.
-               Nothing else on this page can show that: timestamps, packet loss
-               and the CRC all stay correct while the signal is a staircase of
-               repeated readings. -->
+          <!-- Fires when the sampling rate outruns the accel/gyro output rate,
+               or the wide-range accel's (above all its low-power mode above
+               200 Hz, DEV-1563). Nothing else on this page can show that:
+               timestamps, packet loss and the CRC all stay correct while the
+               signal repeats or misses readings. -->
           <div class="banner warn" id="rateCoverageNote" hidden></div>
           <!-- Sensor rules: two sensors on one ADC input, a board sensor
                without expansion power, a sensor this board or generation does
@@ -3811,6 +3812,9 @@
           deriveImuRate({
             enableChanged: imuEnabled(mask) !== imuEnabled(before),
           });
+          deriveWrAccel({
+            enableChanged: wrAccelEnabled(mask) !== wrAccelEnabled(before),
+          });
           afterImageEdit();
           return;
         }
@@ -3841,6 +3845,10 @@
           enableChanged:
             imuEnabled(result.enabledSensors) !== imuEnabled(before),
         });
+        deriveWrAccel({
+          enableChanged:
+            wrAccelEnabled(result.enabledSensors) !== wrAccelEnabled(before),
+        });
         afterImageEdit();
       }
 
@@ -3850,6 +3858,11 @@
           sdk.SensorBitmapShimmer3.SENSOR_A_ACCEL |
           sdk.SensorBitmapShimmer3.SENSOR_GYRO;
         return (mask & bits) !== 0;
+      }
+
+      /** Is the wide-range accelerometer (the Shimmer3R's LIS2DW12) enabled? */
+      function wrAccelEnabled(mask) {
+        return (mask & sdk.SensorBitmapShimmer3.SENSOR_D_ACCEL) !== 0;
       }
 
       /**
@@ -3901,6 +3914,79 @@
         log.log(
           `derived Gyro/Accel Rate ${before} → ${next} ` +
             `(${enabled ? "enabled" : "disabled"} at ${samplingRateHz.toFixed(1)} Hz)`,
+        );
+      }
+
+      /**
+       * Re-derive the Shimmer3R wide-range accelerometer (LIS2DW12) the way
+       * Consensys does (DEV-1563).
+       *
+       * Its rate, range and two mode bits share ConfigSetupByte0, and on this
+       * chip bit 0 alone decides high performance against low power: the
+       * firmware gives the part `(wrAccelHrMode << 2) | lpMode`. A sensor
+       * another host had disabled (Consensys parks it at 0x02: power-down,
+       * low-power) and this page then enabled kept bit 0 clear, and at 256 Hz
+       * the part sat in a low-power mode capped at 200 Hz, leaving about one
+       * packet in five without a wide-range reading. So:
+       *
+       * - **An enable or disable** applies
+       *   `SensorLIS2DW12.setDefaultLIS2DW12AccelSensorConfig`: enabled is
+       *   high performance with the rate derived (0x71 at 256 Hz, the range
+       *   kept); disabled is power-down, ±2 g, low-power (0x02).
+       * - **A sampling-rate change** re-derives the rate alone, as
+       *   `setSensorSamplingRate` does, and leaves the mode bits as they are.
+       *   One departure from Java: it never asks for Java's low-power rate,
+       *   code 1 (1.6 Hz), for an enabled sensor, because this page never
+       *   picks a rate below the sampling rate. A low-power mode the user chose
+       *   is kept, and `syncRateCoverage` and `guardWrAccelLowPower` deal with
+       *   one that cannot keep up.
+       *
+       * @param {{enableChanged?: boolean}} [opts]
+       */
+      function deriveWrAccel(opts = {}) {
+        if (!form || !layout) return;
+        if (typeof sdk.deriveLis2dw12AccelRate !== "function") return;
+        if (!fields.some((f) => f.key === "wrAccelRate.lis2dw12")) return; // not a Shimmer3R layout
+        const divider = Number(fieldValue("samplingRate"));
+        const samplingRateHz = sdk.samplingRateHzFromDivider(divider);
+        if (samplingRateHz === null) return;
+        const enabled = wrAccelEnabled(sensorsFromImage());
+
+        const next = { "wrAccelRate.lis2dw12": null };
+        if (opts.enableChanged) {
+          const d = sdk.deriveLis2dw12ConfigOnEnableChange({
+            enabled,
+            samplingRateHz,
+          });
+          next["wrAccelRate.lis2dw12"] = d.rate;
+          if (d.range !== null) next.wrAccelRange = d.range;
+          next.wrAccelLpm = d.lowPower ? 1 : 0;
+          next["wrAccelHrm.lis2dw12"] = d.highPerformance ? 1 : 0;
+        } else {
+          next["wrAccelRate.lis2dw12"] = sdk.deriveLis2dw12AccelRate({
+            enabled,
+            samplingRateHz,
+            lowPower: false,
+          });
+        }
+
+        const changed = [];
+        for (const [key, value] of Object.entries(next)) {
+          const field = fields.find((f) => f.key === key);
+          if (!field) continue;
+          const before = Number(fieldValue(key));
+          if (before === value) continue;
+          sdk.writeInfoMemFieldValue(form.getImage(), field, layout, value);
+          changed.push(
+            `${field.label} ${displayValue(field, before)} → ${displayValue(field, value)}`,
+          );
+        }
+        if (!changed.length) return;
+        // `refresh`, not `setImage`, for the reason deriveImuRate gives.
+        form.refresh();
+        log.log(
+          `derived ${changed.join(", ")} ` +
+            `(wide-range accel ${enabled ? "enabled" : "disabled"} at ${samplingRateHz.toFixed(1)} Hz)`,
         );
       }
 
@@ -4107,7 +4193,10 @@
             /* Setting the packet rate re-derives the sensors' own rates, which
                      is what `setShimmerAndSensorsSamplingRate` does in the driver
                      (`ShimmerDevice.java:3399`) and what this page used to skip. */
-            if (key === "samplingRate") deriveImuRate();
+            if (key === "samplingRate") {
+              deriveImuRate();
+              deriveWrAccel();
+            }
             afterImageEdit();
           },
           onDirtyChange: () => updateDirtyPill(),
@@ -4635,6 +4724,11 @@
           enableChanged:
             imuEnabled(check.derivations.enabledSensors) !== imuEnabled(before),
         });
+        deriveWrAccel({
+          enableChanged:
+            wrAccelEnabled(check.derivations.enabledSensors) !==
+            wrAccelEnabled(before),
+        });
         afterImageEdit();
       }
 
@@ -4669,8 +4763,11 @@
                    is right: this warns about a specific pair, and cannot warn about
                    fields that do not exist. */
         }
-        const problem = verdict?.problem ?? "";
-        host.textContent = problem;
+        const problems = [verdict?.problem, wrAccelCoverage()?.problem].filter(
+          Boolean,
+        );
+        const problem = problems.join("\n");
+        host.replaceChildren(...problems.map((p) => el("div", {}, p)));
         host.hidden = !problem;
         if (problem && problem !== lastRateCoverageWarning) {
           lastRateCoverageWarning = problem;
@@ -4682,6 +4779,65 @@
 
       /** Last coverage warning logged, so an edit does not repeat it every time. */
       let lastRateCoverageWarning = "";
+
+      /**
+       * The Shimmer3R wide-range accelerometer against the packet rate
+       * (`checkWrAccelRateCoversPacketRate`), or null where the image has no
+       * LIS2DW12 fields or the vendored SDK has no such check.
+       */
+      function wrAccelCoverage(image = form?.getImage()) {
+        if (
+          !image ||
+          typeof sdk.checkWrAccelRateCoversPacketRate !== "function"
+        )
+          return null;
+        if (!fields.some((f) => f.key === "wrAccelHrm.lis2dw12")) return null;
+        return sdk.checkWrAccelRateCoversPacketRate({
+          samplingRateDivider: Number(fieldValue("samplingRate", image)),
+          wrAccelRateCode: Number(fieldValue("wrAccelRate.lis2dw12", image)),
+          highPerformance:
+            Number(fieldValue("wrAccelHrm.lis2dw12", image)) === 1,
+          enabledSensors: sensorsFromImage(image),
+        });
+      }
+
+      /**
+       * Never write the LIS2DW12 in a low-power mode above 200 Hz (DEV-1563).
+       *
+       * No low-power mode passes 200 Hz, so the part cannot fill every packet
+       * and the firmware sends the rest without a new wide-range reading:
+       * about one in five at 256 Hz, which is what a Shimmer3R configured here
+       * was found doing. Consensys never writes it. Asked before any write of
+       * the image, Apply's or the raw image's: OK switches the sensor to
+       * Consensys's enabled default (high performance, rate derived, range
+       * kept) and carries on, Cancel writes nothing.
+       *
+       * @param {string} what the write being guarded, for the prompt and log
+       * @returns {boolean} false when the user declined, so nothing is written
+       */
+      function guardWrAccelLowPower(what) {
+        const verdict = wrAccelCoverage();
+        if (!verdict?.lowPowerTooSlow) return true;
+        const fix = window.confirm(
+          `${verdict.problem}\n\n` +
+            "OK: switch the wide-range accelerometer to high-performance mode, as Consensys does, " +
+            `and continue with the ${what}.\n` +
+            `Cancel: stop. Nothing is written.`,
+        );
+        if (!fix) {
+          log.warn(
+            `${what} cancelled: the wide-range accelerometer was left in low-power mode above 200 Hz`,
+          );
+          return false;
+        }
+        log.log(
+          "wide-range accel: low-power mode above 200 Hz switched to high performance before the write",
+        );
+        // The enabled default is the fix: the sensor is on, or there would be no verdict.
+        deriveWrAccel({ enableChanged: true });
+        afterImageEdit();
+        return true;
+      }
 
       /** Before an image write: remember byte 233 if it asks for the sound level. */
       function askSoundLevel(image) {
@@ -4953,17 +5109,27 @@
         conformEventChannel();
         conformAudio();
         conformTcxo();
-        const plan = currentPlan();
+        let plan = currentPlan();
         if (plan.blocked) {
           showToast(plan.blocked, "warn");
           log.warn(`Apply refused: ${plan.blocked}`);
           return;
         }
-        const changes = describeChanges();
+        let changes = describeChanges();
         if (!changes.length) {
           showToast("Nothing has changed since the last read", "info");
           return;
         }
+        if (!guardWrAccelLowPower("Apply")) {
+          showToast(
+            "Apply cancelled: the wide-range accelerometer would be in low-power mode above 200 Hz",
+            "info",
+          );
+          return;
+        }
+        // The guard may have switched the wide-range accel to high performance.
+        plan = currentPlan();
+        changes = describeChanges();
         if (!confirmAudioMode()) {
           log.log("Apply cancelled: raw audio recording was not confirmed");
           showToast(
@@ -7736,6 +7902,13 @@
                  real firmware fails to serve 0xA7, and both leave pressure and
                  temperature streaming raw-only. */
         const pressure = params.get("pressure") ?? undefined;
+        /* `cfg0=0x62` (or decimal) preloads ConfigSetupByte0, the wide-range
+                 accel's rate, range and mode bits: 0x62 is the low-power
+                 configuration a Shimmer3R was found holding at 256 Hz
+                 (DEV-1563). Absent or out of range, the mock keeps 0x02. */
+        const cfg0Param = params.get("cfg0");
+        const configSetupByte0 =
+          cfg0Param == null ? undefined : Number(cfg0Param);
         /* `sensors=0x0422E6` (or decimal) preloads the enabled-sensor
                  bitmap, which is how a calibrated multi-channel stream, or an
                  image that already breaks a sensor rule, is reachable from a
@@ -7816,6 +7989,7 @@
                 : btVersion,
             pressure,
             sensors,
+            configSetupByte0,
             eventChannel: params.get("events") === "1",
             audio: params.get("audio") === "1",
             soundLevel: params.get("soundlevel") === "1",
@@ -8179,6 +8353,9 @@
       });
 
       $("btnImWrite").addEventListener("click", async () => {
+        /* Before the image is taken: if the user lets it switch the
+                 wide-range accel to high performance, that is the image written. */
+        if (!guardWrAccelLowPower("image write")) return;
         const changes = describeChanges();
         const byteCount = changedByteCount();
         if (
