@@ -479,6 +479,16 @@ zeros, and showing that as a calibration of zero would be a lie about a sensor
 that has never been calibrated. A per-sensor restore puts the factory seed back
 for the selected range.
 
+A fourth state exists on a Shimmer3's low-noise accelerometer (DEV-1528).
+Firmware before February 2025 seeded it with offset 2253 and sensitivity 92,
+the KXTC9-2050's 3.3 V figures, but every Shimmer3 runs the part at 3.0 V, so
+those numbers read about 17 % high. The card marks the record **pre-2025
+default** and says so in the SDK's own words. It still shows the values as
+stored, and the stream still uses them, because a sensor's output should not
+change under someone partway through using it. Recalibrating corrects it. The
+log says the same once per connection, and the stream's calibration summary
+marks the group.
+
 The calibration is read **as part of the connect handshake**, along with the
 configuration image, so the tab is populated before anybody opens it — a page
 that showed a sensor's settings without showing what it is calibrated to had

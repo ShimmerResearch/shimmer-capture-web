@@ -6313,7 +6313,12 @@
         const parts = [];
         if (info?.inertial) {
           for (const [group, entry] of Object.entries(info.inertial)) {
-            parts.push(`${group} range ${entry.range} (${entry.source})`);
+            /* DEV-1528: a Shimmer3 still on the pre-2025 KXTC9 default. The
+               SDK said why once at adoption; the summary marks it per stream. */
+            parts.push(
+              `${group} range ${entry.range} (${entry.source}` +
+                `${entry.staleDefault ? ", pre-2025 default, reads ~17 % high" : ""})`,
+            );
           }
         }
         if (info?.gsr) parts.push(`GSR range ${info.gsr.range}`);
@@ -6616,7 +6621,7 @@
                  connect can take several seconds, mostly spent looking at the
                  browser's picker or the sensor, not at this pill. */
         onConnected: (label) => showToast(`Connected via ${label}`, "ok"),
-        echoStatus: () => echoSdkStatus(),
+        echoStatus: (msg) => echoSdkStatus(msg),
       });
 
       /**
@@ -7811,9 +7816,12 @@
        * "Battery: …") for the life of the connection; it logs a change
        * itself instead (readBatteryIntoPanel). The status re-reads after a
        * stop are dropped too: they say only what the flags panel shows, and
-       * the page logs the stop's outcome itself (stopCheckTick).
+       * the page logs the stop's outcome itself (stopCheckTick). The
+       * stale-calibration warning (DEV-1528) is never muted: the SDK says it
+       * once per connection.
        */
-      function echoSdkStatus() {
+      function echoSdkStatus(msg) {
+        if (msg === sdk.STALE_LN_ACCEL_DEFAULT_WARNING) return true;
         return !batteryRefresh.muted && !stopCheckMuted;
       }
 
