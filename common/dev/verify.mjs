@@ -9291,6 +9291,200 @@ check(
 );
 
 // ===========================================================================
+// The wide-range accel (LIS2DW12), configured as Consensys configures it
+// (DEV-1563)
+//
+// A Shimmer3R configured on this page at 256 Hz held ConfigSetupByte0 0x62:
+// bit 0, high-performance mode, off, so the LIS2DW12 was in a low-power mode
+// that cannot pass 200 Hz and about one packet in five carried no wide-range
+// reading. Consensys writes 0x71 there. `cfg0=` seeds the mock's byte 6.
+// ===========================================================================
+console.log("\n--- wide-range accel (LIS2DW12) ---");
+
+const WR = `
+  const lines = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+  const box = () => document.querySelector('[data-sensor-key="SENSOR_D_ACCEL"]');
+  const byte6 = () => {
+    const cell = [...document.querySelectorAll('.hexview-byte')].find(c => c.title === 'byte 6 (0x6)');
+    return cell ? parseInt(cell.textContent, 16) : null;
+  };
+  const note = () => {
+    const n = document.getElementById('rateCoverageNote');
+    return n.hidden ? '' : n.textContent;
+  };
+  const field = (k) => document.querySelector('#configForm .field[data-field-key="' + k + '"]');
+  const setField = async (k, v) => {
+    const ctl = field(k).querySelector('select, input');
+    ctl.value = String(v);
+    ctl.dispatchEvent(new Event('change', { bubbles: true }));
+    await wait(100);
+  };
+  const setInfoMemWrites = () => window.mockTransport.writes.filter(w => (w.bytes ?? w.data)[0] === 0x8c).length;
+`;
+const hex = (b) => "0x" + (b ?? 0).toString(16).padStart(2, "0");
+
+await goto(`${BASE}?mock=1&rate=256&sensors=0x0010e0&cfg0=0x62`);
+check(
+  "connect the unit as it was found: 256 Hz, wide-range accel on, byte 6 0x62",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+
+const wrFound = await evaluate(`${WR}
+  return { byte6: byte6(), note: note(),
+    hpm: field('wrAccelHrm.lis2dw12')?.textContent ?? null,
+    hrm: !!field('wrAccelHrm'),
+    warned: lines().filter(l => /wide-range accelerometer is in low-power mode/.test(l)).length };
+`);
+check(
+  "bit 0 is labelled for the chip, High-Performance Mode, not the Shimmer3's High-Resolution",
+  /WR Accel High-Performance Mode/.test(wrFound.hpm ?? "") &&
+    /200 Hz/.test(wrFound.hpm ?? "") &&
+    !wrFound.hrm,
+  `${wrFound.hpm?.slice(0, 60)} | Shimmer3 field shown: ${wrFound.hrm}`,
+);
+check(
+  "a read of 0x62 at 256 Hz is flagged on the form and in the log, with the share of packets it costs",
+  wrFound.byte6 === 0x62 &&
+    /wide-range accelerometer is in low-power mode/.test(wrFound.note) &&
+    /256\.0 Hz/.test(wrFound.note) &&
+    /About 22% of packets/.test(wrFound.note) &&
+    /High-Performance Mode/.test(wrFound.note) &&
+    wrFound.warned === 1,
+  `${hex(wrFound.byte6)} | ${wrFound.note.slice(0, 120)}`,
+);
+
+const wrDecline = await evaluate(`${WR}
+  await setField('wrAccelRange', 1);
+  window.mockTransport.writes.length = 0;
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return !/low-power mode/.test(m); };
+  document.getElementById('btnApply').click();
+  await wait(600);
+  const writes = setInfoMemWrites();
+  const im = await window.mockClient.readInfoMemBytes();
+  return { asked: window.__asked, writes, device: im[6], form: byte6(),
+    said: lines().filter(l => /Apply cancelled: the wide-range accelerometer was left in low-power mode above 200 Hz/.test(l)).length };
+`);
+check(
+  "Apply asks before writing low-power above 200 Hz, and declining writes nothing",
+  wrDecline.asked.length === 1 &&
+    /low-power mode/.test(wrDecline.asked[0]) &&
+    /OK: switch the wide-range accelerometer to high-performance mode, as Consensys does/.test(
+      wrDecline.asked[0],
+    ) &&
+    wrDecline.writes === 0 &&
+    wrDecline.device === 0x62 &&
+    wrDecline.form === 0x66 &&
+    wrDecline.said === 1,
+  `${wrDecline.asked.length} prompt(s), ${wrDecline.writes} SET_INFOMEM | device ${hex(wrDecline.device)}, form ${hex(wrDecline.form)}`,
+);
+
+const wrAccept = await evaluate(`${WR}
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return true; };
+  document.getElementById('btnApply').click();
+  for (let i = 0; i < 100 && !document.getElementById('dirtyPill').hidden; i++) await wait(100);
+  await wait(300);
+  const im = await window.mockClient.readInfoMemBytes();
+  return { asked: window.__asked, device: im[6], note: note(),
+    derived: lines().filter(l => /derived .*\\(wide-range accel enabled at 256\\.0 Hz\\)/.test(l)) };
+`);
+check(
+  "accepting switches it to Consensys's high-performance setting first, and that is what is written (0x75 at ±4 g)",
+  wrAccept.asked.length === 2 &&
+    /low-power mode/.test(wrAccept.asked[0]) &&
+    /Write this configuration to the sensor\?/.test(wrAccept.asked[1]) &&
+    /WR Accel High-Performance Mode: Disabled → Enabled/.test(
+      wrAccept.asked[1],
+    ) &&
+    wrAccept.device === 0x75 &&
+    !/wide-range/.test(wrAccept.note) &&
+    wrAccept.derived.length === 1,
+  `device ${hex(wrAccept.device)} | ${wrAccept.derived[0]?.slice(21) ?? "no derivation logged"}`,
+);
+
+await goto(`${BASE}?mock=1&rate=256`);
+check(
+  "connect at 256 Hz with the wide-range accel off (Consensys's 0x02)",
+  (await evaluate(CONNECT)) === "connected via mock",
+);
+
+const wrEnable = await evaluate(`${WR}
+  const before = byte6();
+  box().click();
+  await wait(150);
+  return { before, after: byte6(), note: note(),
+    said: lines().filter(l => /^.*derived /.test(l)).map(l => l.slice(l.indexOf('derived'))) };
+`);
+check(
+  "enabling it applies Consensys's enabled default: high performance, 400 Hz at 256 Hz (0x02 → 0x71)",
+  wrEnable.before === 0x02 &&
+    wrEnable.after === 0x71 &&
+    !/wide-range/.test(wrEnable.note) &&
+    wrEnable.said.some((l) =>
+      /WR Accel Rate Power-down → 400\.0Hz.*WR Accel Low-Power Mode Enabled → Disabled.*WR Accel High-Performance Mode Disabled → Enabled.*\(wide-range accel enabled at 256\.0 Hz\)/.test(
+        l,
+      ),
+    ),
+  `${hex(wrEnable.before)} → ${hex(wrEnable.after)} | ${wrEnable.said.join(" / ")}`,
+);
+
+const wrRate = await evaluate(`${WR}
+  const h = document.getElementById('rateHelper');
+  h.value = '512'; h.dispatchEvent(new Event('change', { bubbles: true }));
+  await wait(150);
+  return { after: byte6(),
+    said: lines().filter(l => /derived WR Accel Rate/.test(l)).map(l => l.slice(l.indexOf('derived'))) };
+`);
+check(
+  "a sampling-rate change re-derives its rate and keeps high performance (512 Hz → 800 Hz, 0x81)",
+  wrRate.after === 0x81 &&
+    wrRate.said.some((l) =>
+      /WR Accel Rate 400\.0Hz → 800\.0Hz \(wide-range accel enabled at 512\.0 Hz\)/.test(
+        l,
+      ),
+    ),
+  `${hex(wrRate.after)} | ${wrRate.said.at(-1)}`,
+);
+
+const wrImage = await evaluate(`${WR}
+  await setField('wrAccelHrm.lis2dw12', 0);
+  const flagged = note();
+  window.mockTransport.writes.length = 0;
+  window.__asked = [];
+  window.confirm = (m) => { window.__asked.push(m); return !/low-power mode/.test(m); };
+  document.getElementById('btnImWrite').click();
+  await wait(600);
+  return { byte6: byte6(), flagged, asked: window.__asked.length,
+    first: window.__asked[0] ?? '', writes: setInfoMemWrites() };
+`);
+check(
+  "turning High-Performance Mode off at 512 Hz is flagged, and the raw image write asks too and writes nothing when declined",
+  wrImage.byte6 === 0x80 &&
+    /low-power mode/.test(wrImage.flagged) &&
+    /About 61% of packets/.test(wrImage.flagged) &&
+    wrImage.asked === 1 &&
+    /continue with the image write/.test(wrImage.first) &&
+    wrImage.writes === 0,
+  `${hex(wrImage.byte6)} | ${wrImage.asked} prompt(s), ${wrImage.writes} SET_INFOMEM`,
+);
+
+const wrDisable = await evaluate(`${WR}
+  box().click();
+  await wait(150);
+  return { after: byte6(), note: note(),
+    said: lines().filter(l => /wide-range accel disabled at 512\\.0 Hz/.test(l)).length };
+`);
+check(
+  "disabling it parks it as Consensys does: power-down, ±2 g, low-power (0x02), and the warning goes",
+  wrDisable.after === 0x02 &&
+    !/wide-range/.test(wrDisable.note) &&
+    wrDisable.said === 1,
+  `${hex(wrDisable.after)} | ${wrDisable.note.slice(0, 80)}`,
+);
+
+// ===========================================================================
 console.log("\n--- console ---");
 check(
   "no console errors across the whole pass",

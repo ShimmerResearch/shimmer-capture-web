@@ -18144,7 +18144,7 @@
         {
             key: 'wrAccelRate.lis2dw12',
             label: 'WR Accel Rate',
-            desc: 'LIS2DW12 (Shimmer3R) rate — ConfigSetupByte0 bits 4-7 (SensorLIS2DW12.java:428).',
+            desc: 'LIS2DW12 (Shimmer3R) rate — ConfigSetupByte0 bits 4-7 (SensorLIS2DW12.java:428). The labels are the high-performance rates; in a low-power mode code 1 is 1.6 Hz and codes 7-9 deliver only 200 Hz.',
             kind: 'bit',
             layoutKey: 'idxConfigSetupByte0',
             shift: 4,
@@ -18157,7 +18157,7 @@
         {
             key: 'wrAccelLpm',
             label: 'WR Accel Low-Power Mode',
-            desc: 'ConfigSetupByte0 bit 1 (bitShiftLSM303DLHCAccelLPM=1, FW wrAccelLpModeLsb).',
+            desc: 'ConfigSetupByte0 bit 1 (bitShiftLSM303DLHCAccelLPM=1, FW wrAccelLpModeLsb). On a Shimmer3R (LIS2DW12) it only picks WHICH low-power mode the part uses while High-Performance Mode is off; with that off the part is in a low-power mode whatever this says. Consensys always sets it to the opposite of High-Performance Mode (SensorLIS2DW12.setLowPowerAccelWR).',
             kind: 'bit',
             layoutKey: 'idxConfigSetupByte0',
             shift: 1,
@@ -18170,14 +18170,30 @@
         {
             key: 'wrAccelHrm',
             label: 'WR Accel High-Resolution Mode',
-            desc: 'ConfigSetupByte0 bit 0 (bitShiftLSM303DLHCAccelHRM=0, FW wrAccelHrMode).',
+            desc: 'LSM303 (Shimmer3) high-resolution mode — ConfigSetupByte0 bit 0 (bitShiftLSM303DLHCAccelHRM=0, FW wrAccelHrMode).',
             kind: 'bit',
             layoutKey: 'idxConfigSetupByte0',
             shift: 0,
             width: 1,
             options: ON_OFF,
             group: 'wrAccel',
-            appliesTo: ALL,
+            appliesTo: SHIMMER3_ONLY,
+            configKey: 'imu.wrAccelHrm',
+        },
+        {
+            // The same bit as `wrAccelHrm`, under the name it has on this chip. Labelled
+            // "High-Resolution" here it read as a resolution setting, and turning it off
+            // put a Shimmer3R's LIS2DW12 into low-power mode at 256 Hz (DEV-1563).
+            key: 'wrAccelHrm.lis2dw12',
+            label: 'WR Accel High-Performance Mode',
+            desc: 'LIS2DW12 (Shimmer3R) high-performance mode — ConfigSetupByte0 bit 0 (FW wrAccelHrMode; Java mHighPerModeAccelWR). The firmware gives the part (this bit << 2) | low-power mode, so this bit alone decides high performance against low power. On: every rate up to 1600 Hz. Off: a low-power mode, which cannot deliver more than 200 Hz, so a sampling rate above that leaves packets with no new wide-range reading. Consensys turns it on whenever the sensor is enabled (SensorLIS2DW12.setDefaultLIS2DW12AccelSensorConfig).',
+            kind: 'bit',
+            layoutKey: 'idxConfigSetupByte0',
+            shift: 0,
+            width: 1,
+            options: ON_OFF,
+            group: 'wrAccel',
+            appliesTo: S3R_ONLY,
             configKey: 'imu.wrAccelHrm',
         },
         // ---- Gyroscope
@@ -19093,115 +19109,6 @@
     }
 
     /**
-     * Does the configured sensor output rate keep up with the configured packet
-     * rate?
-     *
-     * These are two independent InfoMem fields and nothing in the firmware relates
-     * them. The packet rate (`samplingRate`, bytes 0-1) decides how often a frame
-     * is assembled; the IMU's ODR (`ConfigSetupByte1`) decides how often the
-     * LSM6DSV actually produces a new sample. Set the packet rate above the ODR and
-     * the firmware dutifully packages the same sample several times over, with a
-     * fresh timestamp on each - so the stream looks perfect (regular timestamps, no
-     * loss, valid CRCs) while the plotted signal is a staircase of repeats.
-     *
-     * That the two are meant to agree is not an inference. The firmware's own
-     * Shimmer3R defaults pair a 51.2 Hz packet rate with the ODR immediately above
-     * it, and say so:
-     *
-     *     // LSM6DSV Gyro sampling rate, next highest to 51.2Hz
-     *     ShimConfig_gyroRateSet(LSM6DSV_ODR_AT_60Hz);
-     *     -- log-and-stream-common Configuration/shimmer_config.c:183-184
-     *
-     * Consensys maintains the invariant by deriving sensor ODRs from the trial
-     * rate, which is why reconfiguring there makes the staircase disappear. A host
-     * that edits the fields independently has to check it instead, and this is that
-     * check.
-     *
-     * Deliberately scoped to the LSM6DSV accel/gyro pair. The same trap exists for
-     * the wide-range accelerometer and the magnetometers, but each has its own
-     * enable bits and its own ODR table, and a warning that fires on a sensor the
-     * user has not enabled is worse than no warning at all.
-     */
-    /** A rate option label parsed to Hz, or null when it names no rate. */
-    function labelToHz(label) {
-        // "60.0Hz" / "1.875Hz" / "Power-down". Parsed from the option table rather
-        // than duplicated as numbers, so the two cannot drift apart.
-        const m = /^([\d.]+)\s*Hz$/i.exec(label.trim());
-        if (!m)
-            return null;
-        const hz = Number(m[1]);
-        return Number.isFinite(hz) && hz > 0 ? hz : null;
-    }
-    /**
-     * Output rate of an LSM6DSV accel/gyro ODR code, in Hz.
-     *
-     * @param code the value stored in `ConfigSetupByte1`
-     * @returns the rate in Hz, or null for power-down and for codes with no rate
-     *   (the Java table carries one writable value it does not name)
-     */
-    function lsm6dsvAccelGyroRateHz(code) {
-        const hit = SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS.find(([value]) => value === code);
-        return hit ? labelToHz(hit[1]) : null;
-    }
-    /** Packet rate in Hz from the stored `samplingRate` divider. */
-    function samplingRateHzFromDivider(divider) {
-        if (!Number.isFinite(divider) || divider <= 0)
-            return null;
-        return INFOMEM_SAMPLING_CLOCK_FREQ / divider;
-    }
-    /**
-     * Check the LSM6DSV ODR against the packet rate.
-     *
-     * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
-     * @param opts.imuRateCode stored `ConfigSetupByte1`
-     * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
-     *   low-noise accelerometer or the gyroscope is actually enabled, since the ODR
-     *   is irrelevant to a stream that carries neither
-     */
-    function checkImuRateCoversPacketRate(opts) {
-        const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
-        const imuRateHz = lsm6dsvAccelGyroRateHz(opts.imuRateCode);
-        const usesImu = (opts.enabledSensors &
-            (SensorBitmapShimmer3.SENSOR_A_ACCEL | SensorBitmapShimmer3.SENSOR_GYRO)) !==
-            0;
-        const none = {
-            packetRateHz,
-            imuRateHz,
-            repeatsPerSample: null,
-            short: false,
-            problem: null,
-        };
-        if (!usesImu || packetRateHz === null)
-            return none;
-        if (imuRateHz === null) {
-            // Power-down with the IMU enabled is its own fault, and a worse one: the
-            // sample never changes at all.
-            return {
-                ...none,
-                short: true,
-                problem: `The accelerometer/gyroscope output rate is set to "power-down" while those ` +
-                    `sensors are enabled, so every frame will carry the same reading. Raise it to ` +
-                    `at least ${packetRateHz.toFixed(1)} Hz.`,
-            };
-        }
-        if (imuRateHz >= packetRateHz)
-            return { ...none, short: false, problem: null };
-        const repeats = packetRateHz / imuRateHz;
-        return {
-            packetRateHz,
-            imuRateHz,
-            repeatsPerSample: repeats,
-            short: true,
-            problem: `The accelerometer/gyroscope output rate (${imuRateHz} Hz) is below the sampling ` +
-                `rate (${packetRateHz.toFixed(1)} Hz), so the sensor will repeat each reading about ` +
-                `${repeats < 10 ? repeats.toFixed(1) : Math.round(repeats)} times instead of ` +
-                `producing new data. Timestamps and packet loss will still look correct while the ` +
-                `signal is a staircase. Raise "Gyro/Accel Rate" to the next value at or above ` +
-                `${packetRateHz.toFixed(1)} Hz.`,
-        };
-    }
-
-    /**
      * Derive a sensor's output rate from the configured packet rate, the way the
      * Java driver does.
      *
@@ -19215,7 +19122,8 @@
      *
      * Ported from `SensorLSM6DSV.getGyroRateFromFreq` (`SensorLSM6DSV.java:676`)
      * and `setDefaultLSM6DSVGyroSensorConfig`, against the checkouts in
-     * `eclipse-java-workspace_2024`.
+     * `eclipse-java-workspace_2024`, and from `SensorLIS2DW12` for the wide-range
+     * accelerometer (below), against `Shimmer-Java-Android-API` master.
      */
     /** ODR codes with a meaning beyond "this many Hz". */
     const LSM6DSV_ODR = Object.freeze({
@@ -19301,6 +19209,350 @@
                 lowPower: false,
             })
             : LSM6DSV_ODR.LOW_POWER;
+    }
+    // ---------------------------------------------------------------------------
+    // LIS2DW12 — Shimmer3R wide-range accelerometer
+    // ---------------------------------------------------------------------------
+    //
+    // Ported from `SensorLIS2DW12.getAccelRateFromFreq` and
+    // `setDefaultLIS2DW12AccelSensorConfig` (Shimmer-Java-Android-API
+    // `ShimmerDriver/.../sensors/lis2dw12/SensorLIS2DW12.java`, master).
+    //
+    // Unlike the LSM6DSV, the LIS2DW12's low-power state is NOT read back from its
+    // rate. It is two bits of ConfigSetupByte0 beside the rate:
+    //
+    //   bit 1  `wrAccelLpModeLsb` — Java's `mLowPowerAccelWR`
+    //   bit 0  `wrAccelHrMode`    — Java's `mHighPerModeAccelWR`
+    //
+    // and the firmware hands the part `(wrAccelHrMode << 2) | lpMode` as its power
+    // mode (`ShimConfig_wrAccelModeGet`, log-and-stream-common
+    // `Configuration/shimmer_config.c`). `LIS2DW12_HIGH_PERFORMANCE` is 0x04, so
+    // **bit 0 alone decides high performance against low power**: with it clear
+    // the part runs in one of its continuous low-power modes whatever bit 1 says,
+    // and no low-power mode goes faster than 200 Hz. Java never lets the two
+    // disagree — `setLowPowerAccelWR(enable)` sets bit 1 to `enable` and bit 0 to
+    // `!enable` — which is why the defaults below always return them as a pair.
+    /** LIS2DW12 ODR codes with a meaning beyond "this many Hz". */
+    const LIS2DW12_ODR = Object.freeze({
+        /** Sensor off. What the driver writes for a disabled wide-range accelerometer. */
+        POWER_DOWN: 0,
+        /**
+         * `LIS2DW12_XL_ODR_1Hz6_LP_ONLY`: 1.6 Hz in a low-power mode, 12.5 Hz in high
+         * performance. Java's ladder gives it for `freq <= 12.5` (high performance,
+         * where it really is 12.5 Hz) and for every rate when low-power is asked for
+         * (where it is 1.6 Hz).
+         */
+        LOW_POWER: 1,
+    });
+    /**
+     * The fastest output rate the LIS2DW12 delivers in any low-power mode. ODR
+     * codes 7-9 saturate here (`SensorLIS2DW12.ListofLIS2DW12AccelRateLpm`, and the
+     * firmware's `ShimConfig_lis2dw12OdrToHz`).
+     */
+    const LIS2DW12_LOW_POWER_MAX_HZ = 200;
+    /**
+     * The ladder from `getAccelRateFromFreq`'s high-performance branch, as
+     * `[maxFreqHz, code]` pairs in the order Java tests them. Code 2 is absent
+     * because Java gives code 1 for `freq <= 12.5` — 12.5 Hz in high performance,
+     * the only mode this branch is ever paired with.
+     */
+    const LIS2DW12_LADDER = Object.freeze([
+        [12.5, 1],
+        [25, 3],
+        [50, 4],
+        [100, 5],
+        [200, 6],
+        [400, 7],
+        [800, 8],
+    ]);
+    /** The fastest ODR code, 1600 Hz in high performance. */
+    const LIS2DW12_TOP_CODE$1 = 9;
+    /**
+     * The LIS2DW12 ODR code for a packet rate — `getAccelRateFromFreq(isEnabled,
+     * freq, isLowPowerMode)`, same inputs, same results.
+     *
+     * @param opts.enabled whether the wide-range accelerometer is enabled
+     * @param opts.samplingRateHz the configured packet rate
+     * @param opts.lowPower Java's `mLowPowerAccelWR`. When set, Java answers code 1
+     *   (1.6 Hz in a low-power mode) whatever the packet rate. A host that never
+     *   wants a rate below its packet rate passes false
+     * @returns the ODR code to store in ConfigSetupByte0 bits 4-7. A non-finite or
+     *   non-positive packet rate gives power-down, as
+     *   {@link deriveLsm6dsvAccelGyroRate} does, rather than Java's fall-through
+     */
+    function deriveLis2dw12AccelRate(opts) {
+        if (!opts.enabled)
+            return LIS2DW12_ODR.POWER_DOWN;
+        if (opts.lowPower)
+            return LIS2DW12_ODR.LOW_POWER;
+        const hz = opts.samplingRateHz;
+        if (!Number.isFinite(hz) || hz <= 0)
+            return LIS2DW12_ODR.POWER_DOWN;
+        for (const [maxHz, code] of LIS2DW12_LADDER) {
+            if (hz <= maxHz)
+                return code;
+        }
+        return LIS2DW12_TOP_CODE$1;
+    }
+    /**
+     * What to store when the wide-range accelerometer's enabled state has just
+     * changed — `setDefaultLIS2DW12AccelSensorConfig(isSensorEnabled)`.
+     *
+     * - **Enabled:** `setLowPowerAccelWR(false)` — low-power off, high-performance
+     *   on, and the rate re-derived from the packet rate. The range is kept.
+     * - **Disabled:** `setLIS2DW12AccelRange(0)` then `setLowPowerAccelWR(true)` —
+     *   ±2 g, low-power on, high-performance off, and the rate re-derived. Java
+     *   sets the enabled state before it applies these defaults
+     *   (`ShimmerDevice.setSensorEnabledState`), so that re-derivation sees a
+     *   disabled sensor and gives power-down. ConfigSetupByte0 ends up `0x02`.
+     *
+     * The disabled default is the state that stranded a Shimmer3R: a host that
+     * later enables the channel without applying the enabled default leaves bit 0
+     * clear, and the part in a low-power mode that cannot pass 200 Hz.
+     *
+     * @param opts.enabled the state being applied
+     * @param opts.samplingRateHz the configured packet rate
+     */
+    function deriveLis2dw12ConfigOnEnableChange(opts) {
+        if (opts.enabled) {
+            return {
+                rate: deriveLis2dw12AccelRate({
+                    enabled: true,
+                    samplingRateHz: opts.samplingRateHz,
+                    lowPower: false,
+                }),
+                range: null,
+                lowPower: false,
+                highPerformance: true,
+            };
+        }
+        return {
+            rate: LIS2DW12_ODR.POWER_DOWN,
+            range: 0,
+            lowPower: true,
+            highPerformance: false,
+        };
+    }
+
+    /**
+     * Does the configured sensor output rate keep up with the configured packet
+     * rate?
+     *
+     * These are two independent InfoMem fields and nothing in the firmware relates
+     * them. The packet rate (`samplingRate`, bytes 0-1) decides how often a frame
+     * is assembled; the IMU's ODR (`ConfigSetupByte1`) decides how often the
+     * LSM6DSV actually produces a new sample. Set the packet rate above the ODR and
+     * the firmware dutifully packages the same sample several times over, with a
+     * fresh timestamp on each - so the stream looks perfect (regular timestamps, no
+     * loss, valid CRCs) while the plotted signal is a staircase of repeats.
+     *
+     * That the two are meant to agree is not an inference. The firmware's own
+     * Shimmer3R defaults pair a 51.2 Hz packet rate with the ODR immediately above
+     * it, and say so:
+     *
+     *     // LSM6DSV Gyro sampling rate, next highest to 51.2Hz
+     *     ShimConfig_gyroRateSet(LSM6DSV_ODR_AT_60Hz);
+     *     -- log-and-stream-common Configuration/shimmer_config.c:183-184
+     *
+     * Consensys maintains the invariant by deriving sensor ODRs from the trial
+     * rate, which is why reconfiguring there makes the staircase disappear. A host
+     * that edits the fields independently has to check it instead, and this is that
+     * check.
+     *
+     * Each check covers one chip, with its own enable bits and its own ODR table,
+     * and stays silent unless that sensor is enabled: a warning that fires on a
+     * sensor the user has not enabled is worse than no warning at all. There are
+     * two: the LSM6DSV accel/gyro pair ({@link checkImuRateCoversPacketRate}) and
+     * the Shimmer3R's LIS2DW12 wide-range accelerometer
+     * ({@link checkWrAccelRateCoversPacketRate}). The magnetometers have the same
+     * trap and no check yet.
+     */
+    /** A rate option label parsed to Hz, or null when it names no rate. */
+    function labelToHz(label) {
+        // "60.0Hz" / "1.875Hz" / "Power-down". Parsed from the option table rather
+        // than duplicated as numbers, so the two cannot drift apart.
+        const m = /^([\d.]+)\s*Hz$/i.exec(label.trim());
+        if (!m)
+            return null;
+        const hz = Number(m[1]);
+        return Number.isFinite(hz) && hz > 0 ? hz : null;
+    }
+    /**
+     * Output rate of an LSM6DSV accel/gyro ODR code, in Hz.
+     *
+     * @param code the value stored in `ConfigSetupByte1`
+     * @returns the rate in Hz, or null for power-down and for codes with no rate
+     *   (the Java table carries one writable value it does not name)
+     */
+    function lsm6dsvAccelGyroRateHz(code) {
+        const hit = SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS.find(([value]) => value === code);
+        return hit ? labelToHz(hit[1]) : null;
+    }
+    /** Packet rate in Hz from the stored `samplingRate` divider. */
+    function samplingRateHzFromDivider(divider) {
+        if (!Number.isFinite(divider) || divider <= 0)
+            return null;
+        return INFOMEM_SAMPLING_CLOCK_FREQ / divider;
+    }
+    /**
+     * Check the LSM6DSV ODR against the packet rate.
+     *
+     * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
+     * @param opts.imuRateCode stored `ConfigSetupByte1`
+     * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
+     *   low-noise accelerometer or the gyroscope is actually enabled, since the ODR
+     *   is irrelevant to a stream that carries neither
+     */
+    function checkImuRateCoversPacketRate(opts) {
+        const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
+        const imuRateHz = lsm6dsvAccelGyroRateHz(opts.imuRateCode);
+        const usesImu = (opts.enabledSensors &
+            (SensorBitmapShimmer3.SENSOR_A_ACCEL | SensorBitmapShimmer3.SENSOR_GYRO)) !==
+            0;
+        const none = {
+            packetRateHz,
+            imuRateHz,
+            repeatsPerSample: null,
+            short: false,
+            problem: null,
+        };
+        if (!usesImu || packetRateHz === null)
+            return none;
+        if (imuRateHz === null) {
+            // Power-down with the IMU enabled is its own fault, and a worse one: the
+            // sample never changes at all.
+            return {
+                ...none,
+                short: true,
+                problem: `The accelerometer/gyroscope output rate is set to "power-down" while those ` +
+                    `sensors are enabled, so every frame will carry the same reading. Raise it to ` +
+                    `at least ${packetRateHz.toFixed(1)} Hz.`,
+            };
+        }
+        if (imuRateHz >= packetRateHz)
+            return { ...none, short: false, problem: null };
+        const repeats = packetRateHz / imuRateHz;
+        return {
+            packetRateHz,
+            imuRateHz,
+            repeatsPerSample: repeats,
+            short: true,
+            problem: `The accelerometer/gyroscope output rate (${imuRateHz} Hz) is below the sampling ` +
+                `rate (${packetRateHz.toFixed(1)} Hz), so the sensor will repeat each reading about ` +
+                `${repeats < 10 ? repeats.toFixed(1) : Math.round(repeats)} times instead of ` +
+                `producing new data. Timestamps and packet loss will still look correct while the ` +
+                `signal is a staircase. Raise "Gyro/Accel Rate" to the next value at or above ` +
+                `${packetRateHz.toFixed(1)} Hz.`,
+        };
+    }
+    // ---------------------------------------------------------------------------
+    // LIS2DW12 — Shimmer3R wide-range accelerometer
+    // ---------------------------------------------------------------------------
+    /** The LIS2DW12's fastest ODR code: 1600 Hz in high performance. */
+    const LIS2DW12_TOP_CODE = 9;
+    /**
+     * Output rate of a LIS2DW12 ODR code, in Hz, as the part delivers it.
+     *
+     * Mode-dependent, unlike the LSM6DSV's: code 1 is 12.5 Hz in high performance
+     * but 1.6 Hz in a low-power mode, and codes 7-9 deliver only 200 Hz in a
+     * low-power mode. Read from the Java driver's two lists
+     * (`SensorLIS2DW12.ListofLIS2DW12AccelRateHpm` / `...Lpm`), which agree with
+     * the firmware's `ShimConfig_lis2dw12OdrToHz`.
+     *
+     * @param code ConfigSetupByte0 bits 4-7
+     * @param highPerformance ConfigSetupByte0 bit 0 (`wrAccelHrMode`). With it
+     *   clear the part is in a low-power mode, whatever bit 1 says
+     * @returns the rate in Hz, or null for power-down and for codes with no rate
+     */
+    function lis2dw12AccelRateHz(code, highPerformance) {
+        const table = highPerformance
+            ? SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS
+            : SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS;
+        const hit = table.find(([value]) => value === code);
+        return hit ? labelToHz(hit[1]) : null;
+    }
+    /**
+     * Check the Shimmer3R wide-range accelerometer (LIS2DW12) against the packet
+     * rate, and above all flag a low-power mode above 200 Hz.
+     *
+     * That combination is what a Shimmer3R configured in Shimmer Capture at 256 Hz
+     * was found holding: ConfigSetupByte0 `0x62`, high performance off. No
+     * low-power mode passes 200 Hz, so the firmware lowers the rate to that cap,
+     * and on the ticks the part has no new sample the slot goes out unfilled -
+     * about one packet in five at 256 Hz, zero at first and a stale reading after
+     * that. Consensys never writes it: enabling the sensor turns high performance
+     * on (`SensorLIS2DW12.setDefaultLIS2DW12AccelSensorConfig`).
+     *
+     * Shimmer3R only. On a Shimmer3 the same bits drive an LSM303, whose modes and
+     * rates are different.
+     *
+     * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
+     * @param opts.wrAccelRateCode ConfigSetupByte0 bits 4-7
+     * @param opts.highPerformance ConfigSetupByte0 bit 0
+     * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
+     *   wide-range accelerometer (`SENSOR_D_ACCEL`) is enabled
+     */
+    function checkWrAccelRateCoversPacketRate(opts) {
+        const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
+        const lowPower = !opts.highPerformance;
+        const wrAccelRateHz = lis2dw12AccelRateHz(opts.wrAccelRateCode, opts.highPerformance);
+        const enabled = (opts.enabledSensors & SensorBitmapShimmer3.SENSOR_D_ACCEL) !== 0;
+        const none = {
+            packetRateHz,
+            wrAccelRateHz,
+            lowPower,
+            lowPowerTooSlow: false,
+            unfilledFraction: null,
+            short: false,
+            problem: null,
+        };
+        if (!enabled || packetRateHz === null)
+            return none;
+        const hz = packetRateHz.toFixed(1);
+        if (lowPower && packetRateHz > LIS2DW12_LOW_POWER_MAX_HZ) {
+            const unfilled = 1 - LIS2DW12_LOW_POWER_MAX_HZ / packetRateHz;
+            return {
+                ...none,
+                lowPowerTooSlow: true,
+                unfilledFraction: unfilled,
+                short: true,
+                problem: `The wide-range accelerometer is in low-power mode, which cannot deliver more than ` +
+                    `${LIS2DW12_LOW_POWER_MAX_HZ} Hz, and the sampling rate is ${hz} Hz. About ` +
+                    `${Math.round(unfilled * 100)}% of packets will carry no new wide-range reading, ` +
+                    `while timestamps and packet loss still look correct. Turn on "WR Accel ` +
+                    `High-Performance Mode", as Consensys does whenever the sensor is enabled, or lower ` +
+                    `the sampling rate to ${LIS2DW12_LOW_POWER_MAX_HZ} Hz or below.`,
+            };
+        }
+        if (wrAccelRateHz === null) {
+            return {
+                ...none,
+                unfilledFraction: 1,
+                short: true,
+                problem: `The wide-range accelerometer output rate is set to "power-down" while the sensor ` +
+                    `is enabled, so it will produce no new readings. Raise "WR Accel Rate" to at least ` +
+                    `${hz} Hz.`,
+            };
+        }
+        if (wrAccelRateHz >= packetRateHz)
+            return none;
+        // Below the packet rate the firmware gates the read on the part's data-ready
+        // line, so the slots it has nothing for go out unfilled rather than repeated
+        // (shimmer3r-firmware `hal_lis2dw12.c`, `lis2dw12_is_shimmer_freq_higher`).
+        const unfilled = 1 - wrAccelRateHz / packetRateHz;
+        const fastestHz = lis2dw12AccelRateHz(LIS2DW12_TOP_CODE, true) ?? 0;
+        const advice = packetRateHz > fastestHz
+            ? `The part has no faster rate, so lower the sampling rate to ${fastestHz} Hz or below.`
+            : `Raise "WR Accel Rate" to the next value at or above ${hz} Hz.`;
+        return {
+            ...none,
+            unfilledFraction: unfilled,
+            short: true,
+            problem: `The wide-range accelerometer output rate (${wrAccelRateHz} Hz` +
+                `${lowPower ? ' in low-power mode' : ''}) is below the sampling rate (${hz} Hz), so ` +
+                `about ${Math.round(unfilled * 100)}% of packets will carry no new wide-range reading. ` +
+                advice,
+        };
     }
 
     // ---------------------------------------------------------------------------
@@ -30265,7 +30517,8 @@
      * and com.shimmerresearch.managers.dockManager.AbstractDock:
      * - `SLOT_CHANGEOVER_DELAY_WITHOUT_SD_CARD` = 1500 ms (AbstractDock.java:96) —
      *   settle delay after a without-SD slot change before talking to the Shimmer.
-     * - `CMD_RETRY_ATTEMPTS` = 2 (SmartDockUart.java:30).
+     *
+     * The two retry values are not the Java's: see `CMD_RETRY_ATTEMPTS` below.
      */
     const SMARTDOCK_DEFAULTS = Object.freeze({
         RESPONSE_TIMEOUT_MS: 1000,
@@ -30291,7 +30544,38 @@
         SLOT_CHANGEOVER_DELAY_WITH_SD_WIN_MS: 5000,
         /** As above on macOS/Linux (AbstractDock.java:95, selected by `getSDMountDelay()`). */
         SLOT_CHANGEOVER_DELAY_WITH_SD_UNIX_MS: 6000,
-        CMD_RETRY_ATTEMPTS: 2,
+        /**
+         * How many times in all a base command is sent while each try fails: on an
+         * `E`, on no answer in time, or, for a slot change, on an answer naming
+         * another slot (a slot, for `SDD$`).
+         *
+         * The Java has 2 (`CMD_RETRY_ATTEMPTS`, SmartDockUart.java:30), but
+         * `waitForSmartDockResponse` throws on the first `E` and the first timeout,
+         * so Consensys sends each command once. That is not enough. On 24 Nov 2026 a
+         * Base6 (`V,2,1,0,1,0`) answered most `SDC,NN$`, `SDP,NN$` and `SDD$` with an
+         * `E` within 20 ms and others not at all, through a power cycle; sent again
+         * every 2 s, each got through within 6 tries.
+         *
+         * The base firmware loses bytes (smartdock-firmware `CBase6/main.c` at
+         * 66532f8). Its UART interrupt (`USCI_A0_ISR`) keeps only the last byte
+         * received, and the main loop decodes one byte per pass, so a byte that
+         * arrives while the loop is busy is lost. A command short a byte is answered
+         * `E` at its `$`; one that loses its `$` is not answered at all.
+         *
+         * 15, not the 8 first chosen: the same Base6 later refused one select 8
+         * times in a row, so the HIL harness's Base6 driver went to 15
+         * (log-and-stream-common DEV-1533), and shimmer-host-core sends 15 too.
+         *
+         * The cost is time when the base will not answer: a query refused on every
+         * try ends after 28 s, and unanswered after 43 s; a slot change unanswered,
+         * after 178 s.
+         */
+        CMD_RETRY_ATTEMPTS: 15,
+        /**
+         * How long after a try fails the command is sent again: the 2 s that got
+         * every command through on that Base6.
+         */
+        CMD_RETRY_INTERVAL_MS: 2000,
         /**
          * Attempts at the FIRST per-Shimmer read after a slot change
          * (`READ_MAC_RETRY_ATTEMPTS`, AbstractDock.java:92, used by
@@ -30326,8 +30610,10 @@
      * Map a base hardware-version byte to a family + slot count
      * (HwDriverShimmerDeviceDetails.java:313-321: BASE15→15 slots, BASE6→6 slots,
      * BASICDOCK→1). NB: in the Java driver the slot count actually comes from the
-     * USB device descriptor, not the version byte — see the SmartDock README
-     * hardware-verify note.
+     * USB device descriptor, not the version byte. The version byte alone was
+     * right on a Base6 and a Base15, both firmware 0.1.0 (25 Nov 2026); other
+     * firmware versions and board revisions are unconfirmed — see the SmartDock
+     * README hardware-verify note.
      */
     function baseHardwareType(hardwareVersion) {
         switch (hardwareVersion) {
@@ -30446,7 +30732,8 @@
      *
      * NB: the Java `remapSlotsSmartDockToUi` remap for the BASE15U *prototype*
      * board (firmware 1.0.0.≤5) is deliberately NOT applied here — it only affects
-     * pre-production hardware; see the README hardware-verify note.
+     * pre-production hardware. A Base15 on 1.0.1.0 (identifier 1, firmware 0.1.0)
+     * needed none (25 Nov 2026); see the README hardware-verify note.
      */
     function parseSlotOccupancy(line) {
         if (classifyBaseResponse(line) !== 'occupancy')
@@ -30489,17 +30776,23 @@
         return null;
     }
 
-    /**
-     * Thrown by {@link SmartDockClient} when a base command reply does not arrive
-     * within the timeout. Distinguished from an explicit `E` error response so the
-     * retry logic re-sends on timeout only (SmartDockUart.java:526-537: a timeout
-     * from `waitForSmartDockResponse` triggers a re-send, whereas an error response
-     * throws immediately).
-     */
+    /** What answers a slot change (`SDP,NN$`, `SDC,NN$`) or `SDD$`: `P,NN`, `C,NN`, or `C` / `D` for none. */
+    const ACTIVE_SLOT_KINDS = ['slotWithoutSd', 'slotWithSd', 'disconnected'];
+    /** The last try of a base command had no answer within its time. */
     class SmartDockTimeoutError extends Error {
         constructor(message) {
             super(message);
             this.name = 'SmartDockTimeoutError';
+        }
+    }
+    /** The last try of a slot change was answered with another slot (or, for `SDD$`, with a slot). */
+    class SmartDockOtherSlotError extends Error {
+        constructor(message, 
+        /** What the base said it routes. */
+        reported) {
+            super(message);
+            this.reported = reported;
+            this.name = 'SmartDockOtherSlotError';
         }
     }
     // ---------------------------------------------------------------------------
@@ -30532,6 +30825,11 @@
      * which naturally resyncs after garbage. Per-op timeouts are ported from Java
      * (normal 1000 ms; slot change 10000 ms).
      *
+     * A base can refuse commands at random, so a command that is refused (`E`),
+     * unanswered, or, for a slot change, answered with another slot is sent again,
+     * up to {@link SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS} (15) tries 2 s apart; see
+     * {@link _sendWithRetry}. Each call still ends with one result.
+     *
      * Transport injection is mandatory — `connect()` with no base transport throws.
      *
      * @example
@@ -30563,11 +30861,19 @@
             this._queue = Promise.resolve();
             this._wired = null;
             this._wiredConnected = false;
+            /** Ends the base command in progress, saying why; it sends nothing more. */
+            this._aborts = new Set();
+            /** The base transport reported a disconnect; cleared by {@link connect}. */
+            this._linkLost = false;
             /** Cached dock info (from the last {@link getDockInfo}). */
             this.dockInfo = null;
             /** The last active slot confirmed by {@link selectSlot} (1-based; -1 when disconnected). */
             this.activeSlot = -1;
             this._handleTransportDisconnect = () => {
+                // A command waiting for its answer, or to be sent again, ends now rather
+                // than writing to a link that has gone; so does every call queued behind it.
+                this._linkLost = true;
+                this._abortCommands('the link was lost');
                 this._emitStatus('SmartDock disconnected');
             };
             // ---------------------------------------------------------------------------
@@ -30588,6 +30894,9 @@
                 opts.timeouts?.slotChangeTimeoutMs ?? SMARTDOCK_DEFAULTS.SLOT_CHANGE_TIMEOUT_MS;
             this._slotChangeoverDelayMs =
                 opts.timeouts?.slotChangeoverDelayMs ?? SMARTDOCK_DEFAULTS.SLOT_CHANGEOVER_DELAY_MS;
+            this._retryIntervalMs =
+                opts.timeouts?.retryIntervalMs ?? SMARTDOCK_DEFAULTS.CMD_RETRY_INTERVAL_MS;
+            this._commandTries = Math.max(1, Math.floor(opts.commandTries ?? SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS));
         }
         _log(...args) {
             if (this.debug)
@@ -30627,9 +30936,11 @@
             this._emitStatus('Opening SmartDock base UART connection…');
             await t.connect();
             this._rxBuf = new Uint8Array(0);
+            this._linkLost = false;
             this._emitStatus(`Connected: ${this._reportedDeviceName() ?? unnamedLink(t.kind)}`);
         }
         async disconnect() {
+            this._abortCommands('disconnected');
             try {
                 if (this._wired && this._wiredConnected) {
                     await this._wired.disconnect().catch(() => undefined);
@@ -30650,6 +30961,11 @@
                 this._temps.clear();
                 this._emitStatus('Disconnected');
             }
+        }
+        /** End the base command in progress, if any: it rejects, and sends nothing more. */
+        _abortCommands(why) {
+            for (const abort of [...this._aborts])
+                abort(why);
         }
         /** Streaming is not part of the SmartDock protocol. */
         async startStreaming() {
@@ -30700,12 +31016,17 @@
         /**
          * Select the active slot (WITHOUT SD access — the read path). Sends
          * `SDP,NN$`, awaits the `P,NN` confirmation with the ported ~10 s slot-change
-         * timeout, verifies the returned slot matches the request (Java throws
-         * `DOCK_CMD_ERR_FAIL_SET` on mismatch, SmartDockUart.java:233-241), then waits
+         * timeout, verifies the returned slot matches the request, then waits
          * the ported settle delay (1500 ms) before the per-Shimmer UART is usable
          * (SmartDock.java:674-691). Finally resyncs the per-Shimmer byte stream (the
          * slot re-route may leave stale bytes) — reusing D1's
          * {@link WiredShimmerClient.resyncStream}.
+         *
+         * An answer naming another slot fails that try, and the command is sent
+         * again: it may be a late answer to an earlier command. Only after the last
+         * try does the call fail (`DOCK_CMD_ERR_FAIL_SET`, as the Java does at once,
+         * SmartDockUart.java:233-241), and then {@link activeSlot} is what that last
+         * answer named.
          *
          * @param slotNumber 1-based slot (1..slotCount).
          */
@@ -30717,7 +31038,11 @@
             return this._serialize(() => this._disconnectAllSlotsImpl());
         }
         async _disconnectAllSlotsImpl() {
-            await this._command(SMARTDOCK_BASE_CMD.DISCONNECT_ALL, 'disconnected', this._slotChangeTimeoutMs);
+            const cmd = SMARTDOCK_BASE_CMD.DISCONNECT_ALL;
+            const line = await this._changeSlot(buildBaseCommand(cmd), -1, cmd);
+            if (parseActiveSlot(line)?.slot !== -1) {
+                throw new Error(`SmartDock disconnect all slots failed: got "${line}"`);
+            }
             this.activeSlot = -1;
             this._emitStatus('All slots disconnected');
         }
@@ -30725,9 +31050,9 @@
             if (!this._transport)
                 throw new Error('Not connected');
             const cmd = buildSelectSlotCommand(slotNumber, connectionType);
-            // The reply is `P,NN` (without SD) or `C,NN` (with SD).
-            const wantKind = connectionType === SMARTDOCK_CONNECTION_TYPE.WITH_SD_CARD ? 'slotWithSd' : 'slotWithoutSd';
-            const line = await this._sendWithRetry(cmd, [wantKind, 'disconnected'], this._slotChangeTimeoutMs, `select slot ${slotNumber}`);
+            // The reply is `P,NN` (without SD) or `C,NN` (with SD). Like the Java, only
+            // the slot is compared, not whether it was routed with its SD card.
+            const line = await this._changeSlot(cmd, slotNumber, `select slot ${slotNumber}`);
             const active = parseActiveSlot(line);
             if (!active || active.slot !== slotNumber) {
                 throw new Error(`SmartDock slot select failed: requested ${slotNumber}, got "${line}" (DOCK_CMD_ERR_FAIL_SET)`);
@@ -30816,67 +31141,165 @@
         // ---------------------------------------------------------------------------
         // Request/response core (base ASCII channel)
         // ---------------------------------------------------------------------------
-        /** Send an ASCII base command and await a response of one of `kinds`. */
+        /**
+         * Send a query (`SDV$`, `SDQ$`) and await its answer of `kind`. A malformed
+         * answer ends the call; the caller says why.
+         */
         async _command(cmd, kind, timeoutMs) {
-            return this._sendWithRetry(buildBaseCommand(cmd), [kind], timeoutMs, cmd);
+            const holds = kind === 'version' ? parseSmartDockVersion : parseSlotOccupancy;
+            return this._sendWithRetry(buildBaseCommand(cmd), [kind], timeoutMs, cmd, (line) => holds(line) ? 'take' : 'malformed');
         }
         /**
-         * Write `cmdBytes` and await a matching response, re-sending the command on a
-         * missed reply for a total of `SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS` (= 2)
-         * attempts before failing — mirroring SmartDockUart.java:526-537
-         * (`txBytesAndWaitForReply`). Retries on TIMEOUT ONLY; an explicit `E` error
-         * response ({@link SmartDockTimeoutError} is not thrown for it) propagates
-         * immediately, matching the Java path where `waitForSmartDockResponse` throws
-         * on an error instead of returning false.
+         * Send a slot change, or `SDD$` (`slot` -1), and await the answer naming
+         * `slot` (-1: none). An answer naming another slot fails that try. If the
+         * last try's does, the call fails, and {@link activeSlot} is what it named:
+         * only the last try's answer is taken as what the base routes.
          */
-        async _sendWithRetry(cmdBytes, kinds, timeoutMs, label) {
-            if (!this._transport)
-                throw new Error('Not connected');
-            let lastErr;
-            for (let attempt = 0; attempt < SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS; attempt++) {
-                await this._transport.write(cmdBytes);
-                try {
-                    return await this._waitForResponse(kinds, timeoutMs, label);
-                }
-                catch (err) {
-                    // Only a timeout is retryable; an error response fails fast.
-                    if (err instanceof SmartDockTimeoutError) {
-                        lastErr = err;
-                        this._log(`command "${label}" timed out (attempt ${attempt + 1}); re-sending`);
-                        continue;
-                    }
-                    throw err;
-                }
+        async _changeSlot(cmdBytes, slot, label) {
+            try {
+                return await this._sendWithRetry(cmdBytes, ACTIVE_SLOT_KINDS, this._slotChangeTimeoutMs, label, (line) => {
+                    const active = parseActiveSlot(line);
+                    if (!active)
+                        return 'malformed';
+                    return active.slot === slot ? 'take' : 'otherSlot';
+                });
             }
-            throw lastErr instanceof Error ? lastErr : new SmartDockTimeoutError(`timeout (${label})`);
+            catch (err) {
+                if (err instanceof SmartDockOtherSlotError)
+                    this.activeSlot = err.reported.slot;
+                throw err;
+            }
         }
         /**
-         * Resolve with the first response line whose classification is in `kinds`;
-         * reject on an `E` error line or timeout. Lines of any other kind (including
-         * `unknown`/garbage) are ignored — this is the resync discipline.
+         * Write `cmdBytes` and await the base's answer of one of `kinds` that
+         * `judge` takes, sending the command again while it is refused or
+         * unanswered. A base can refuse commands at random: it loses bytes that
+         * arrive while its main loop is busy (see
+         * {@link SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS}). So:
+         *
+         * - The command is sent up to `commandTries` (15) times, `retryIntervalMs`
+         *   (2 s) after each try that fails.
+         * - A try fails on an `E`, on no answer within `timeoutMs`, or on an answer
+         *   `judge` calls `otherSlot`. That answer may be a late one to an earlier
+         *   command, so it is not taken.
+         * - An answer `judge` takes that arrives between tries is still taken, and
+         *   the command is not sent again. Anything else between tries, an `E`
+         *   included, is dropped: it is not this try's.
+         * - A `malformed` answer to a try in flight ends the call at once, with that
+         *   line; the caller says why. It is not a refusal.
+         * - Lines of other kinds (garbage, partial lines) are ignored: the resync
+         *   discipline.
+         * - The call ends with one result: the answer, or the last try's failure.
+         *   It also ends, sending nothing more, when the link is lost or
+         *   {@link disconnect} is called.
+         *
+         * The rule is the one that got every command through on a Base6 refusing
+         * them at random (24 Nov 2026), sent from the HIL harness. This client ran
+         * it from Node on 25 Nov 2026, at commit afc58f6, on that Base6 and on a
+         * Base15 (both firmware 0.1.0), three runs on each: getDockInfo,
+         * getSlotOccupancy, an identify, status and InfoMem read of each docked
+         * Shimmer3 (four on the Base6; six on the Base15, slots 14 and 15
+         * included), and disconnectAllSlots, all passing. In each run the first try
+         * of `SDQ$`, `SDP,01$` and `SDD$` was cut short a byte and refused with
+         * `E`, and the first `SDV$` was sent without its `$` and left unanswered;
+         * each was taken on try 2.
+         *
+         * HARDWARE-VERIFY: not yet seen on a base: two or more failed tries in a
+         * row, and `SDC,NN$` (a select with the SD card).
          */
-        _waitForResponse(kinds, timeoutMs, label) {
+        _sendWithRetry(cmdBytes, kinds, timeoutMs, label, judge) {
+            const transport = this._transport;
+            if (!transport)
+                return Promise.reject(new Error('Not connected'));
+            if (this._linkLost) {
+                return Promise.reject(new Error(`SmartDock link lost (${label}): not sent`));
+            }
+            const tries = this._commandTries;
+            const retryMs = this._retryIntervalMs;
             return new Promise((resolve, reject) => {
-                const t = setTimeout(() => {
-                    this._offTemp(handler);
-                    reject(new SmartDockTimeoutError(`SmartDock response timeout (${label})`));
-                }, timeoutMs);
-                const handler = (line) => {
-                    const k = classifyBaseResponse(line);
-                    if (k === 'error') {
-                        clearTimeout(t);
-                        this._offTemp(handler);
-                        reject(new Error(`SmartDock error response (${label})`));
+                let attempt = 0;
+                /** A try has been written and has neither been answered nor failed. */
+                let inFlight = false;
+                let ended = false;
+                /** The try's answer timeout, or the wait before the next try. */
+                let timer;
+                const onTry = () => (tries > 1 ? `, try ${attempt} of ${tries}` : '');
+                const end = (err, line = '') => {
+                    if (ended)
+                        return;
+                    ended = true;
+                    inFlight = false;
+                    clearTimeout(timer);
+                    this._offTemp(onLine);
+                    this._aborts.delete(abort);
+                    if (err)
+                        reject(err);
+                    else
+                        resolve(line);
+                };
+                const tryFailed = (err) => {
+                    inFlight = false;
+                    clearTimeout(timer);
+                    if (attempt >= tries) {
+                        end(err);
                         return;
                     }
-                    if (kinds.includes(k)) {
-                        clearTimeout(t);
-                        this._offTemp(handler);
-                        resolve(line);
-                    }
-                    // else: ignore (unrelated line / garbage) and keep waiting.
+                    // Scheduled before the status goes out, so a host's onStatus that
+                    // throws cannot leave the call waiting for a try that never comes.
+                    timer = setTimeout(send, retryMs);
+                    const why = `${err.message}; sending again in ${retryMs} ms`;
+                    this._log(why);
+                    this._emitStatus(why);
                 };
-                this._onTemp(handler);
+                const send = () => {
+                    if (ended)
+                        return;
+                    attempt += 1;
+                    const thisTry = attempt;
+                    inFlight = true;
+                    transport.write(cmdBytes).then(() => {
+                        // Already answered, refused or ended while the write was pending.
+                        if (ended || !inFlight || attempt !== thisTry)
+                            return;
+                        timer = setTimeout(() => tryFailed(new SmartDockTimeoutError(`SmartDock response timeout (${label}): no answer within ${timeoutMs} ms${onTry()}`)), timeoutMs);
+                    }, (err) => end(err instanceof Error ? err : new Error(String(err))));
+                };
+                const onLine = (line) => {
+                    if (ended)
+                        return;
+                    const kind = classifyBaseResponse(line);
+                    if (kind === 'error') {
+                        if (inFlight)
+                            tryFailed(new Error(`SmartDock error response (${label}): refused (E)${onTry()}`));
+                        else
+                            this._log(`"${line}" dropped while "${label}" waits to be sent again`);
+                        return;
+                    }
+                    if (!kinds.includes(kind))
+                        return;
+                    const verdict = judge(line);
+                    if (verdict === 'take') {
+                        end(null, line);
+                        return;
+                    }
+                    if (!inFlight) {
+                        this._log(`"${line}" dropped while "${label}" waits to be sent again`);
+                        return;
+                    }
+                    if (verdict === 'malformed') {
+                        end(null, line);
+                        return;
+                    }
+                    // `otherSlot`: only a slot judge says it, of a line that parsed.
+                    const reported = parseActiveSlot(line);
+                    const said = reported.slot === -1 ? 'no slot' : `slot ${reported.slot}`;
+                    tryFailed(new SmartDockOtherSlotError(`SmartDock ${label} failed: the base routes ${said} ("${line}")${onTry()} ` +
+                        '(DOCK_CMD_ERR_FAIL_SET)', reported));
+                };
+                const abort = (why) => end(new Error(`SmartDock command "${label}" not finished: ${why}`));
+                this._onTemp(onLine);
+                this._aborts.add(abort);
+                send();
             });
         }
         _delay(ms) {
@@ -40929,6 +41352,8 @@
     exports.LEAD_OFF_DETECTION_LABELS = LEAD_OFF_DETECTION_LABELS;
     exports.LEAD_OFF_DETECTION_OPTIONS = LEAD_OFF_DETECTION_OPTIONS;
     exports.LEAD_OFF_FREQUENCY_LABELS = LEAD_OFF_FREQUENCY_LABELS;
+    exports.LIS2DW12_LOW_POWER_MAX_HZ = LIS2DW12_LOW_POWER_MAX_HZ;
+    exports.LIS2DW12_ODR = LIS2DW12_ODR;
     exports.LOG_TRIGGERS = LOG_TRIGGERS;
     exports.LOG_TRIGGER_OPTIONS = LOG_TRIGGER_OPTIONS;
     exports.LSM6DSV_ODR = LSM6DSV_ODR;
@@ -41234,6 +41659,7 @@
     exports.checkConfigBytesValid = checkConfigBytesValid;
     exports.checkImuRateCoversPacketRate = checkImuRateCoversPacketRate;
     exports.checkSensorRules = checkSensorRules;
+    exports.checkWrAccelRateCoversPacketRate = checkWrAccelRateCoversPacketRate;
     exports.classifyBaseResponse = classifyBaseResponse;
     exports.classifyFactoryTestAckPacket = classifyFactoryTestAckPacket;
     exports.classifyLiteProtocolAck = classifyLiteProtocolAck;
@@ -41274,6 +41700,8 @@
     exports.defaultVerisensePasskeyForId = defaultVerisensePasskeyForId;
     exports.deleteDownloadedFromCard = deleteDownloadedFromCard;
     exports.deriveExpPower = deriveExpPower;
+    exports.deriveLis2dw12AccelRate = deriveLis2dw12AccelRate;
+    exports.deriveLis2dw12ConfigOnEnableChange = deriveLis2dw12ConfigOnEnableChange;
     exports.deriveLsm6dsvAccelGyroRate = deriveLsm6dsvAccelGyroRate;
     exports.deriveLsm6dsvRateOnEnableChange = deriveLsm6dsvRateOnEnableChange;
     exports.deriveShimmer3FirmwareVersionCode = deriveShimmer3FirmwareVersionCode;
@@ -41401,6 +41829,7 @@
     exports.joinAudioMode = joinAudioMode;
     exports.joinButtonMode = joinButtonMode;
     exports.keepsLinkCrcWhenSensingStops = keepsLinkCrcWhenSensingStops;
+    exports.lis2dw12AccelRateHz = lis2dw12AccelRateHz;
     exports.listShimmerSrBoards = listShimmerSrBoards;
     exports.localCivilUnixSecondsNow = localCivilUnixSecondsNow;
     exports.logTriggersOf = logTriggersOf;
